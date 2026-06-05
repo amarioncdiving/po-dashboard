@@ -1,6 +1,7 @@
 import os
 import sys
 import site
+import pyodbc
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PACKAGES_DIR = os.path.join(BASE_DIR, ".python_packages", "lib", "site-packages")
@@ -106,7 +107,33 @@ def home():
         allowed_domain=ALLOWED_EMAIL_DOMAIN,
         sql_connection_found="Yes" if SQL_CONNECTION else "No"
     )
+@app.route("/db-test")
+def db_test():
+    if not SQL_CONNECTION:
+        return {
+            "status": "error",
+            "message": "SQL connection string was not found."
+        }, 500
 
+    try:
+        conn = pyodbc.connect(SQL_CONNECTION, timeout=10)
+        cursor = conn.cursor()
+        cursor.execute("SELECT DB_NAME() AS DatabaseName, GETUTCDATE() AS ServerTime")
+        row = cursor.fetchone()
+        conn.close()
+
+        return {
+            "status": "success",
+            "database": row.DatabaseName,
+            "server_time_utc": str(row.ServerTime)
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }, 500
+        
 @app.route("/health")
 def health():
     return {
