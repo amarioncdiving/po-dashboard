@@ -17,7 +17,12 @@ APP_ENVIRONMENT = os.getenv("APP_ENVIRONMENT", "Not set")
 SQL_SERVER_NAME = os.getenv("SQL_SERVER_NAME", "Not set")
 SQL_DATABASE_NAME = os.getenv("SQL_DATABASE_NAME", "Not set")
 ALLOWED_EMAIL_DOMAIN = os.getenv("ALLOWED_EMAIL_DOMAIN", "Not set")
-SQL_CONNECTION = os.getenv("CUSTOMCONNSTR_PODASHBOARD_SQL", "")
+SQL_CONNECTION = (
+    os.getenv("SQLAZURECONNSTR_PODASHBOARD_SQL")
+    or os.getenv("CUSTOMCONNSTR_PODASHBOARD_SQL")
+    or os.getenv("PODASHBOARD_SQL")
+    or ""
+)
 
 HOME_PAGE = """
 <!DOCTYPE html>
