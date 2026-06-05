@@ -1,4 +1,14 @@
 import os
+import sys
+import site
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PACKAGES_DIR = os.path.join(BASE_DIR, ".python_packages", "lib", "site-packages")
+
+if os.path.isdir(PACKAGES_DIR):
+    site.addsitedir(PACKAGES_DIR)
+    sys.path.append(PACKAGES_DIR)
+
 from flask import Flask, render_template_string
 
 app = Flask(__name__)
