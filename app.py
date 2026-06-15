@@ -1,8 +1,9 @@
 import os
 import sys
 import site
-import pyodbc
+from flask import Flask, render_template_string, jsonify
 
+# Add local package path for Azure App Service deployments
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PACKAGES_DIR = os.path.join(BASE_DIR, ".python_packages", "lib", "site-packages")
 
@@ -10,14 +11,17 @@ if os.path.isdir(PACKAGES_DIR):
     site.addsitedir(PACKAGES_DIR)
     sys.path.append(PACKAGES_DIR)
 
-from flask import Flask, render_template_string
-
 app = Flask(__name__)
 
+# Azure App Settings
 APP_ENVIRONMENT = os.getenv("APP_ENVIRONMENT", "Not set")
 SQL_SERVER_NAME = os.getenv("SQL_SERVER_NAME", "Not set")
 SQL_DATABASE_NAME = os.getenv("SQL_DATABASE_NAME", "Not set")
 ALLOWED_EMAIL_DOMAIN = os.getenv("ALLOWED_EMAIL_DOMAIN", "Not set")
+
+# Azure exposes connection strings differently depending on type.
+# SQLAzure type becomes SQLAZURECONNSTR_<name>.
+# Custom type becomes CUSTOMCONNSTR_<name>.
 SQL_CONNECTION = (
     os.getenv("SQLAZURECONNSTR_PODASHBOARD_SQL")
     or os.getenv("CUSTOMCONNSTR_PODASHBOARD_SQL")
@@ -63,6 +67,9 @@ HOME_PAGE = """
             padding: 2px 5px;
             border-radius: 4px;
         }
+        ul {
+            line-height: 1.6;
+        }
     </style>
 </head>
 <body>
@@ -97,6 +104,7 @@ HOME_PAGE = """
 </html>
 """
 
+
 @app.route("/")
 def home():
     return render_template_string(
@@ -105,43 +113,85 @@ def home():
         sql_server=SQL_SERVER_NAME,
         sql_database=SQL_DATABASE_NAME,
         allowed_domain=ALLOWED_EMAIL_DOMAIN,
-        sql_connection_found="Yes" if SQL_CONNECTION else "No"
+        sql_connection_found="Yes" if SQL_CONNECTION else "No",
     )
+
+
+@app.route("/health")
+def health():
+    return jsonify(
+        {
+            "status": "ok",
+            "environment": APP_ENVIRONMENT,
+            "sql_server": SQL_SERVER_NAME,
+            "database": SQL_DATABASE_NAME,
+            "connection_string_found": bool(SQL_CONNECTION),
+        }
+    )
+
+
 @app.route("/db-test")
 def db_test():
+    """
+    Safe database test route.
+
+    This imports pyodbc inside the route instead of at startup.
+    That way, if pyodbc or the SQL driver is missing, the homepage still works.
+    """
     if not SQL_CONNECTION:
-        return {
-            "status": "error",
-            "message": "SQL connection string was not found."
-        }, 500
+        return jsonify(
+            {
+                "status": "error",
+                "step": "connection_string",
+                "message": "SQL connection string was not found.",
+            }
+        ), 500
 
     try:
-        conn = pyodbc.connect(SQL_CONNECTION, timeout=10)
+        import pyodbc
+    except Exception as e:
+        return jsonify(
+            {
+                "status": "error",
+                "step": "import_pyodbc",
+                "message": str(e),
+            }
+        ), 500
+
+    try:
+        connection_string = SQL_CONNECTION
+
+        # Azure SQL connection strings from the portal often omit the ODBC driver.
+        if "Driver=" not in connection_string and "DRIVER=" not in connection_string:
+            connection_string = (
+                "Driver={ODBC Driver 18 for SQL Server};"
+                + connection_string
+            )
+
+        conn = pyodbc.connect(connection_string, timeout=10)
         cursor = conn.cursor()
         cursor.execute("SELECT DB_NAME() AS DatabaseName, GETUTCDATE() AS ServerTime")
         row = cursor.fetchone()
         conn.close()
 
-        return {
-            "status": "success",
-            "database": row.DatabaseName,
-            "server_time_utc": str(row.ServerTime)
-        }
+        return jsonify(
+            {
+                "status": "success",
+                "database": row.DatabaseName,
+                "server_time_utc": str(row.ServerTime),
+            }
+        )
 
     except Exception as e:
-        return {
-            "status": "error",
-            "message": str(e)
-        }, 500
-        
-@app.route("/health")
-def health():
-    return {
-        "status": "ok",
-        "environment": APP_ENVIRONMENT,
-        "database": SQL_DATABASE_NAME
-    }
+        return jsonify(
+            {
+                "status": "error",
+                "step": "connect_to_sql",
+                "message": str(e),
+            }
+        ), 500
+
 
 if __name__ == "__main__":
-    port = int(os.environ.get("HTTP_PLATFORM_PORT", os.environ.get("PORT", 8000)))
+    port = int(os.environ.get("PORT", os.environ.get("HTTP_PLATFORM_PORT", 8000)))
     app.run(host="0.0.0.0", port=port)
