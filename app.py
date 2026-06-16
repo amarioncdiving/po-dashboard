@@ -75,9 +75,9 @@ PAGE_ACCESS = {
     "New Purchase Request": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "Purchase Requests": ["Admin", "Executive", "Accounting"],
     "Approver Queue": ["Admin", "Executive", "Accounting"],
-    "Approval Workflow": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "POs & Balances": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "Forecasting": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
+    "Project PO Setup": ["Admin", "Executive", "Accounting", "Project Manager"],
     "Missing PO Review": ["Admin", "Executive", "Accounting"],
     "PO Summary": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "PO List": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
@@ -933,7 +933,7 @@ def purchase_request_status_badge(status):
     status_lower = status.lower()
     badge_class = "blue"
 
-    if status_lower in ["submitted", "under review", "project manager review", "project accountant review", "executive approval", "needs information"]:
+    if status_lower in ["submitted", "under review", "needs more info"]:
         badge_class = "amber"
     elif status_lower in ["approved", "converted to po", "auto approved"]:
         badge_class = "green"
@@ -945,175 +945,6 @@ def purchase_request_status_badge(status):
 
 def can_review_purchase_requests(role):
     return role in ["Admin", "Executive", "Accounting"]
-
-
-APPROVAL_OPEN_STATUSES = [
-    "Needs Information",
-    "Project Manager Review",
-    "Project Accountant Review",
-    "Executive Approval",
-    "Submitted",
-    "Under Review",
-]
-
-APPROVAL_FINAL_STATUSES = [
-    "Auto Approved",
-    "Approved",
-    "Rejected",
-    "Converted to PO",
-]
-
-
-def approval_status_options(current_status=None):
-    statuses = [
-        "Needs Information",
-        "Project Manager Review",
-        "Project Accountant Review",
-        "Executive Approval",
-        "Auto Approved",
-        "Approved",
-        "Rejected",
-        "Converted to PO",
-    ]
-    options = ""
-    for status in statuses:
-        selected = " selected" if status == current_status else ""
-        options += f'<option value="{h(status)}"{selected}>{h(status)}</option>'
-    return options
-
-
-def load_po_match_snapshot(project_name, vendor_name, estimated_amount):
-    """Return a conservative PO/vendor match snapshot for approval routing."""
-    project_name = clean_text(project_name)
-    vendor_name = clean_text(vendor_name)
-    estimated_amount = float(estimated_amount or 0)
-    empty = {
-        "vendor_exists": False,
-        "open_po_exists": False,
-        "open_balance": 0,
-        "sufficient_balance": False,
-        "po_count": 0,
-        "clean_balance_match": False,
-    }
-    if not project_name or not vendor_name:
-        return empty
-    conn = None
-    try:
-        conn = get_sql_connection()
-        cursor = conn.cursor()
-        project_like = "%" + project_name + "%"
-        vendor_like = "%" + vendor_name + "%"
-        cursor.execute(
-            """
-            WITH UniquePOs AS (
-                SELECT
-                    PONumber,
-                    MAX(VendorName) AS VendorName,
-                    MAX(ProjectName) AS ProjectName,
-                    MAX(POStatus) AS POStatus,
-                    MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
-                FROM dbo.IssuedPOLines
-                WHERE
-                    (ProjectName LIKE ? OR ? LIKE '%' + ProjectName + '%')
-                    AND (VendorName LIKE ? OR ? LIKE '%' + VendorName + '%')
-                GROUP BY PONumber
-            )
-            SELECT
-                COUNT(*) AS POCount,
-                SUM(CASE WHEN UPPER(COALESCE(POStatus, '')) = 'OPEN' THEN 1 ELSE 0 END) AS OpenPOCount,
-                SUM(CASE WHEN UPPER(COALESCE(POStatus, '')) = 'OPEN' THEN COALESCE(RemainingAmount, 0) ELSE 0 END) AS OpenBalance
-            FROM UniquePOs;
-            """,
-            project_like,
-            project_name,
-            vendor_like,
-            vendor_name,
-        )
-        row = cursor.fetchone()
-        po_count = row.POCount or 0
-        open_count = row.OpenPOCount or 0
-        open_balance = float(row.OpenBalance or 0)
-        sufficient = open_balance >= estimated_amount if estimated_amount else open_balance > 0
-        return {
-            "vendor_exists": po_count > 0,
-            "open_po_exists": open_count > 0,
-            "open_balance": open_balance,
-            "sufficient_balance": sufficient,
-            "po_count": po_count,
-            "clean_balance_match": po_count > 0 and open_count > 0 and sufficient,
-        }
-    except Exception:
-        return empty
-    finally:
-        if conn:
-            conn.close()
-
-
-def determine_purchase_request_workflow(project_name, vendor_name, estimated_amount, priority=None, has_other_items=False):
-    amount = float(estimated_amount or 0)
-    project_name = clean_text(project_name)
-    vendor_name = clean_text(vendor_name)
-    priority = clean_text(priority)
-    snapshot = load_po_match_snapshot(project_name, vendor_name, amount)
-    exceptions = []
-    if not project_name or not vendor_name:
-        exceptions.append("Missing project or vendor")
-    if vendor_name and not snapshot["vendor_exists"]:
-        exceptions.append("New vendor or no issued PO match")
-    if snapshot["vendor_exists"] and not snapshot["open_po_exists"]:
-        exceptions.append("No open PO balance")
-    if snapshot["open_po_exists"] and not snapshot["sufficient_balance"]:
-        exceptions.append("Insufficient PO balance")
-    if has_other_items:
-        exceptions.append("Other items included")
-    if priority and priority.lower() == "critical":
-        exceptions.append("Critical priority flag - urgency only")
-
-    clean_balance_match = snapshot["clean_balance_match"] and not has_other_items
-    if not project_name or not vendor_name:
-        return {"status":"Needs Information", "next_approver":"Requester", "route":["Requester"], "summary":"Returned to requester for missing required information.", "exceptions":exceptions, "snapshot":snapshot}
-    if amount <= 499.99:
-        if clean_balance_match:
-            return {"status":"Auto Approved", "next_approver":"Complete", "route":["Auto Approved", "Use Existing PO"], "summary":"Auto approved because the request is under $500 and has an existing open PO balance match.", "exceptions":exceptions, "snapshot":snapshot}
-        return {"status":"Project Manager Review", "next_approver":"Project Manager", "route":["Project Manager", "Project Accountant"], "summary":"Auto approval is blocked, so the request routes to PM then Project Accountant.", "exceptions":exceptions, "snapshot":snapshot}
-    if amount <= 2999.99:
-        if clean_balance_match:
-            return {"status":"Project Accountant Review", "next_approver":"Project Accountant", "route":["Project Accountant"], "summary":"Request routes directly to Project Accountant based on amount and PO balance match.", "exceptions":exceptions, "snapshot":snapshot}
-        return {"status":"Project Manager Review", "next_approver":"Project Manager", "route":["Project Manager", "Project Accountant"], "summary":"Request routes to PM then Project Accountant because it does not have a clean PO balance match.", "exceptions":exceptions, "snapshot":snapshot}
-    if amount <= 9999.99:
-        return {"status":"Project Manager Review", "next_approver":"Project Manager", "route":["Project Manager", "Project Accountant"], "summary":"Request routes to PM then Project Accountant based on the $3,000 to $9,999.99 threshold.", "exceptions":exceptions, "snapshot":snapshot}
-    return {"status":"Project Manager Review", "next_approver":"Project Manager", "route":["Project Manager", "Project Accountant", "Executive"], "summary":"Request routes to PM, Project Accountant, then Executive based on the $10,000+ threshold.", "exceptions":exceptions, "snapshot":snapshot}
-
-
-def workflow_note_text(workflow):
-    exceptions = workflow.get("exceptions") or []
-    route = " -> ".join(workflow.get("route") or [])
-    notes = [
-        "Approval Workflow: " + workflow.get("summary", ""),
-        "Initial Route: " + route,
-        "Next Approver: " + workflow.get("next_approver", ""),
-    ]
-    snapshot = workflow.get("snapshot") or {}
-    if snapshot:
-        notes.append("PO Match Snapshot: open balance " + currency(snapshot.get("open_balance", 0)) + " across " + str(snapshot.get("po_count", 0)) + " matching issued PO(s).")
-    if exceptions:
-        notes.append("Routing Flags: " + "; ".join(exceptions))
-    return "\n".join(notes)
-
-
-def approval_route_html(workflow):
-    steps = workflow.get("route") or []
-    if not steps:
-        return ""
-    html = '<div class="approval-route-summary">'
-    for idx, step in enumerate(steps, start=1):
-        state = "done" if idx == 1 and workflow.get("status") in APPROVAL_FINAL_STATUSES else ("active" if idx == 1 else "future")
-        label = "Current step" if idx == 1 else "Next step"
-        html += f'<div class="workflow-step {state}"><div class="workflow-circle">{idx}</div><div class="workflow-text"><strong>{h(step)}</strong><span>{h(label)}</span></div></div>'
-        if idx < len(steps):
-            html += '<div class="workflow-line"></div>'
-    html += '</div>'
-    return html
 
 
 def generate_purchase_request_number(cursor):
@@ -1143,8 +974,9 @@ def load_purchase_request_stats():
         SELECT
             COUNT(*) AS TotalRequests,
             SUM(CASE WHEN RequestStatus = 'Submitted' THEN 1 ELSE 0 END) AS SubmittedRequests,
-            SUM(CASE WHEN RequestStatus IN ('Under Review','Project Manager Review','Project Accountant Review','Executive Approval','Needs Information') THEN 1 ELSE 0 END) AS UnderReviewRequests,
-            SUM(CASE WHEN RequestStatus IN ('Approved','Auto Approved') THEN 1 ELSE 0 END) AS ApprovedRequests,
+            SUM(CASE WHEN RequestStatus = 'Under Review' THEN 1 ELSE 0 END) AS UnderReviewRequests,
+            SUM(CASE WHEN RequestStatus = 'Needs More Info' THEN 1 ELSE 0 END) AS NeedsMoreInfoRequests,
+            SUM(CASE WHEN RequestStatus = 'Approved' THEN 1 ELSE 0 END) AS ApprovedRequests,
             SUM(CASE WHEN RequestStatus = 'Rejected' THEN 1 ELSE 0 END) AS RejectedRequests,
             SUM(CASE WHEN RequestStatus = 'Converted to PO' THEN 1 ELSE 0 END) AS ConvertedRequests,
             SUM(COALESCE(EstimatedAmount, 0)) AS TotalEstimatedAmount
@@ -1159,6 +991,7 @@ def load_purchase_request_stats():
         "total_requests": row.TotalRequests or 0,
         "submitted_requests": row.SubmittedRequests or 0,
         "under_review_requests": row.UnderReviewRequests or 0,
+        "needs_more_info_requests": row.NeedsMoreInfoRequests or 0,
         "approved_requests": row.ApprovedRequests or 0,
         "rejected_requests": row.RejectedRequests or 0,
         "converted_requests": row.ConvertedRequests or 0,
@@ -1246,9 +1079,6 @@ def create_purchase_request(form):
     request_description = "\n\n".join(detail_parts) if detail_parts else request_description
 
     requested_by_name = requested_by or access["display_name"] or user["email"]
-    workflow = determine_purchase_request_workflow(project_name, vendor_name, estimated_amount, priority)
-    initial_status = workflow["status"]
-    workflow_review_notes = workflow_note_text(workflow)
 
     conn = get_sql_connection()
     cursor = conn.cursor()
@@ -1271,12 +1101,10 @@ def create_purchase_request(form):
                     RequestDescription,
                     EstimatedAmount,
                     Priority,
-                    RequestStatus,
-                    ReviewerEmail,
-                    ReviewNotes
+                    RequestStatus
                 )
             OUTPUT INSERTED.PurchaseRequestId
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Submitted');
             """,
             request_number,
             user["email"],
@@ -1289,9 +1117,6 @@ def create_purchase_request(form):
             request_description,
             estimated_amount,
             priority,
-            initial_status,
-            workflow["next_approver"],
-            workflow_review_notes,
         )
 
         purchase_request_id = cursor.fetchone().PurchaseRequestId
@@ -1300,7 +1125,6 @@ def create_purchase_request(form):
         return {
             "purchase_request_id": purchase_request_id,
             "request_number": request_number,
-            "workflow": workflow,
         }
 
     except Exception:
@@ -1320,13 +1144,9 @@ def update_purchase_request_status(form):
     converted_po_number = clean_text(form.get("converted_po_number"))
 
     valid_statuses = [
-        "Needs Information",
-        "Project Manager Review",
-        "Project Accountant Review",
-        "Executive Approval",
         "Submitted",
         "Under Review",
-        "Auto Approved",
+        "Needs More Info",
         "Approved",
         "Rejected",
         "Converted to PO",
@@ -1942,19 +1762,58 @@ code { background:#f1f5f9; padding:8px 10px; display:block; border-radius:12px; 
 }
 
 
-
-.approval-route-summary { display:grid; gap:10px; }
-.route-pill { display:inline-flex; align-items:center; gap:8px; border-radius:999px; padding:7px 11px; font-size:12px; font-weight:900; background:#eef2ff; color:#3730a3; }
-.approval-rule-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
-.approval-rule-card { border:1px solid var(--line); background:#f8fafc; border-radius:14px; padding:14px; }
-.approval-rule-card strong { display:block; margin-bottom:6px; }
-.approval-rule-card span { color:var(--muted); font-size:12px; }
-.workflow-note { background:#eff6ff; border:1px solid #bfdbfe; color:#1e3a8a; border-radius:13px; padding:12px 14px; font-size:13px; margin:12px 0; }
-.approval-flow-columns { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
-.approval-flow-card { border:1px solid var(--line); border-radius:14px; background:#fff; padding:14px; }
-.approval-flow-card h4 { margin:0 0 8px; }
-.approval-flow-card p { margin:0; color:var(--muted); font-size:13px; }
-@media (max-width: 900px) { .approval-rule-grid, .approval-flow-columns { grid-template-columns:1fr; } }
+/* Feature phase: packets, dashboard cards, timelines, toasts, empty states */
+.app-toast {
+  position:fixed; right:24px; bottom:24px; z-index:2000;
+  background:#020617; color:white; padding:13px 16px; border-radius:14px;
+  box-shadow:0 16px 34px rgba(2,6,23,.25); opacity:0; transform:translateY(10px);
+  pointer-events:none; transition:all .2s ease; font-weight:800; font-size:13px;
+}
+.app-toast.show { opacity:1; transform:translateY(0); }
+.app-toast.error { background:#991b1b; }
+.status-card-grid { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:14px; margin-bottom:18px; }
+.status-card { text-decoration:none; color:inherit; display:block; background:#fff; border:1px solid var(--line); border-radius:16px; padding:16px; box-shadow:var(--shadow); transition:transform .15s ease, border-color .15s ease; }
+.status-card:hover, .status-card.active { transform:translateY(-2px); border-color:#93c5fd; }
+.status-card .label { color:var(--muted); font-size:12px; font-weight:900; }
+.status-card .value { font-size:25px; font-weight:950; letter-spacing:-.04em; margin:6px 0; }
+.status-card .trend { color:var(--muted); font-size:12px; }
+.status-card.amber { border-top:4px solid #f59e0b; }
+.status-card.green { border-top:4px solid #16a34a; }
+.status-card.red { border-top:4px solid #dc2626; }
+.status-card.blue { border-top:4px solid #2563eb; }
+.status-card.purple { border-top:4px solid #7c3aed; }
+.status-card.slate { border-top:4px solid #64748b; }
+.empty-state { border:1px dashed #cbd5e1; background:#f8fafc; border-radius:16px; padding:24px; text-align:center; color:var(--muted); }
+.empty-state strong { display:block; color:var(--text); font-size:16px; margin-bottom:4px; }
+.timeline { border-left:3px solid #dbeafe; padding-left:16px; display:grid; gap:12px; margin-top:14px; }
+.timeline-item { position:relative; background:#fff; border:1px solid var(--line); border-radius:14px; padding:12px; }
+.timeline-item:before { content:''; position:absolute; left:-26px; top:14px; width:14px; height:14px; border-radius:50%; background:#2563eb; border:3px solid white; box-shadow:0 0 0 2px #bfdbfe; }
+.timeline-item strong { display:block; font-size:13px; }
+.timeline-item span { display:block; color:var(--muted); font-size:12px; margin-top:3px; }
+.packet-header { display:flex; justify-content:space-between; gap:20px; align-items:flex-start; border-bottom:2px solid #e2e8f0; padding-bottom:18px; margin-bottom:18px; }
+.packet-logo { width:86px; height:86px; object-fit:contain; }
+.packet-title h1 { margin:0; font-size:30px; letter-spacing:-.04em; }
+.packet-title p { margin:6px 0 0; color:var(--muted); }
+.packet-meta { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:18px 0; }
+.packet-field { background:#f8fafc; border:1px solid var(--line); border-radius:13px; padding:12px; }
+.packet-field span { display:block; color:var(--muted); font-size:11px; font-weight:900; text-transform:uppercase; letter-spacing:.05em; }
+.packet-field strong { display:block; margin-top:5px; font-size:14px; }
+.packet-actions { display:flex; gap:10px; justify-content:flex-end; margin-bottom:14px; }
+.approval-action-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:14px; }
+.approval-action-grid form { margin:0; }
+.approval-action-grid button { width:100%; }
+.setup-card-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; }
+.setup-card { background:#fff; border:1px solid var(--line); border-radius:16px; box-shadow:var(--shadow); padding:16px; display:grid; gap:8px; }
+.setup-card h4 { margin:0; font-size:15px; }
+.setup-card .meta { color:var(--muted); font-size:12px; }
+@media print {
+  .sidebar, .topbar, .packet-actions, .mobile-menu-overlay, .app-toast { display:none !important; }
+  .main { margin:0 !important; width:100% !important; padding:0 !important; }
+  .card { box-shadow:none !important; border:0 !important; }
+  body { background:white !important; }
+}
+@media (max-width:1200px) { .status-card-grid, .setup-card-grid, .packet-meta, .approval-action-grid { grid-template-columns:1fr 1fr; } }
+@media (max-width:820px) { .status-card-grid, .setup-card-grid, .packet-meta, .approval-action-grid { grid-template-columns:1fr; } .packet-header { flex-direction:column; } }
 
 </style>
 """
@@ -1969,9 +1828,9 @@ def shell(title, subtitle, active, content):
         ("New Purchase Request", "/purchase-request", "📝"),
         ("Purchase Requests", "/purchase-requests", "📋"),
         ("Approver Queue", "/approver-queue", "✅"),
-        ("Approval Workflow", "/approval-workflow", "🧭"),
         ("POs & Balances", "/pos-balances", "💳"),
         ("Forecasting", "/forecasting", "📈"),
+        ("Project PO Setup", "/project-po-setup", "🧭"),
     ]
 
     accounting_nav_items = [
@@ -2053,6 +1912,7 @@ def shell(title, subtitle, active, content):
 
         {content}
     </main>
+    <div id="appToast" class="app-toast"></div>
     <script>
         function toggleMobileMenu() {{
             document.body.classList.toggle('mobile-nav-open');
@@ -2076,7 +1936,7 @@ def shell(title, subtitle, active, content):
 def status_chip(value):
     text = value or "Unknown"
     cls = str(text).lower().replace(" ", "-").replace("/", "-")
-    allowed = {"submitted", "under-review", "pending-approval", "approved", "converted-to-po", "rejected"}
+    allowed = {"submitted", "under-review", "needs-more-info", "pending-approval", "approved", "converted-to-po", "rejected", "open", "closed", "needs-pm-info", "needs-forecast-date"}
     if cls not in allowed:
         cls = "default"
     return f'<span class="status-chip {cls}">{h(text)}</span>'
@@ -2406,6 +2266,112 @@ def aggregate_items(items, key_name):
             buckets[key]["next_date"] = fd
     return sorted(buckets.items(), key=lambda x: x[1]["amount"], reverse=True)
 
+
+# ------------------------------------------------------------
+# Feature phase helpers: PO packets and project setup
+# ------------------------------------------------------------
+
+def load_po_packet_data(po_number):
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        WITH UniquePOs AS (
+            SELECT
+                PONumber,
+                MAX(VendorName) AS VendorName,
+                MAX(ProjectName) AS ProjectName,
+                MAX(Department) AS Department,
+                MAX(POStatus) AS POStatus,
+                MAX(PODate) AS PODate,
+                MAX(Requestor) AS Requestor,
+                MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
+                SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount,
+                MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount,
+                COUNT(*) AS LineCount
+            FROM dbo.IssuedPOLines
+            WHERE PONumber = ?
+            GROUP BY PONumber
+        )
+        SELECT * FROM UniquePOs;
+        """,
+        po_number,
+    )
+    po = cursor.fetchone()
+    cursor.execute(
+        """
+        SELECT
+            LineDescription,
+            Unit,
+            UnitCost,
+            Qty,
+            LineAmount,
+            RemainingAmount,
+            CreatedAt
+        FROM dbo.IssuedPOLines
+        WHERE PONumber = ?
+        ORDER BY IssuedPOLineId;
+        """,
+        po_number,
+    )
+    lines = cursor.fetchall()
+    conn.close()
+    return po, lines
+
+
+def load_project_po_setup_items():
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        WITH UniquePOs AS (
+            SELECT
+                PONumber,
+                MAX(VendorName) AS VendorName,
+                MAX(ProjectName) AS ProjectName,
+                MAX(Department) AS Department,
+                MAX(POStatus) AS POStatus,
+                MAX(PODate) AS PODate,
+                MAX(Requestor) AS Requestor,
+                MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
+                SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount,
+                MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount,
+                COUNT(*) AS LineCount
+            FROM dbo.IssuedPOLines
+            GROUP BY PONumber
+        )
+        SELECT TOP 100
+            *,
+            CASE
+                WHEN PODate IS NULL THEN 'Needs Forecast Date'
+                WHEN COALESCE(Requestor, '') = '' THEN 'Needs PM Info'
+                WHEN COALESCE(RemainingAmount, 0) > 0 THEN 'Open / Monitor'
+                ELSE 'Complete'
+            END AS SetupStatus
+        FROM UniquePOs
+        WHERE PODate IS NULL OR COALESCE(Requestor, '') = '' OR COALESCE(RemainingAmount, 0) > 0
+        ORDER BY
+            CASE WHEN PODate IS NULL THEN 0 WHEN COALESCE(Requestor, '') = '' THEN 1 ELSE 2 END,
+            ProjectName,
+            PONumber;
+        """
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+
+def action_form(request_id, status, label, css_class="secondary", extra_fields=""):
+    return f"""
+    <form method="post">
+        <input type="hidden" name="purchase_request_id" value="{h(request_id)}">
+        <input type="hidden" name="request_status" value="{h(status)}">
+        {extra_fields}
+        <input type="hidden" name="review_notes" value="Quick action: {h(label)}">
+        <button class="{h(css_class)}" type="submit">{h(label)}</button>
+    </form>
+    """
+
 # ------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------
@@ -2434,8 +2400,7 @@ def purchase_request():
             message_html = f"""
             <div class="submit-status-box success">
                 <strong>Purchase request submitted successfully.</strong><br>
-                Request Number: {h(result["request_number"])}<br>
-                Initial Route: {h(" -> ".join(result.get("workflow", {}).get("route", [])))}
+                Request Number: {h(result["request_number"])}
             </div>
             """
         except Exception as e:
@@ -2574,10 +2539,10 @@ def purchase_request():
                     <h3>Cost Guidance</h3>
                     <table>
                         <tr><th>Estimated Cost</th><th>Likely Review</th></tr>
-                        <tr><td>Up to $499.99</td><td><span class="badge green">Auto if PO balance match, otherwise PM + PA</span></td></tr>
-                        <tr><td>$500 - $2,999.99</td><td><span class="badge blue">PA if matched, otherwise PM + PA</span></td></tr>
-                        <tr><td>$3,000 - $9,999.99</td><td><span class="badge amber">PM + PA</span></td></tr>
-                        <tr><td>$10,000+</td><td><span class="badge purple">PM + PA + Executive</span></td></tr>
+                        <tr><td>Under $500</td><td><span class="badge green">Quick review</span></td></tr>
+                        <tr><td>$500 - $3,000</td><td><span class="badge blue">PM / Accounting</span></td></tr>
+                        <tr><td>$3,000 - $10,000</td><td><span class="badge amber">PM + Accounting</span></td></tr>
+                        <tr><td>Over $10,000</td><td><span class="badge purple">Executive likely</span></td></tr>
                     </table>
                 </div>
 
@@ -2597,6 +2562,7 @@ def purchase_request():
     return shell("New Purchase Request", "Submit a new purchase request for review before a PO is issued.", "New Purchase Request", content)
 
 
+
 @app.route("/purchase-requests", methods=["GET", "POST"])
 def purchase_requests():
     allowed, reason = require_page_access("Purchase Requests")
@@ -2605,30 +2571,55 @@ def purchase_requests():
 
     access = get_user_access()
     role = access["role"]
-    message_html = ""
 
     if request.method == "POST":
         if not can_review_purchase_requests(role):
-            message_html = '<div class="notice error">You do not have permission to update purchase requests.</div>'
-        else:
-            try:
-                update_purchase_request_status(request.form)
-                message_html = '<div class="notice ok">Purchase request status was updated.</div>'
-            except Exception as e:
-                message_html = f'<div class="notice error">Error updating purchase request: {h(e)}</div>'
+            return redirect("/purchase-requests?toast=You+do+not+have+permission+to+update+purchase+requests&toast_type=error")
+        try:
+            update_purchase_request_status(request.form)
+            return redirect("/purchase-requests?toast=Purchase+request+updated")
+        except Exception as e:
+            return redirect("/purchase-requests?toast=" + quote_plus("Error updating request: " + str(e)) + "&toast_type=error")
 
     try:
         stats = load_purchase_request_stats()
         requests = load_purchase_requests()
+        selected_status = clean_text(request.args.get("status")) or "All"
+
+        def status_card(label, value, status_filter, tone, trend):
+            active = " active" if selected_status == status_filter else ""
+            href = "/purchase-requests" if status_filter == "All" else "/purchase-requests?status=" + quote_plus(status_filter)
+            return f"""
+            <a class="status-card {tone}{active}" href="{href}">
+                <div class="label">{h(label)}</div>
+                <div class="value">{h(value)}</div>
+                <div class="trend">{h(trend)}</div>
+            </a>
+            """
+
+        dashboard_cards = f"""
+        <div class="status-card-grid">
+            {status_card("All Requests", stats["total_requests"], "All", "blue", "Full request queue")}
+            {status_card("Submitted", stats["submitted_requests"], "Submitted", "amber", "Waiting for action")}
+            {status_card("Under Review", stats["under_review_requests"], "Under Review", "purple", "Currently being reviewed")}
+            {status_card("Needs More Info", stats.get("needs_more_info_requests", 0), "Needs More Info", "amber", "Returned for clarification")}
+            {status_card("Approved", stats["approved_requests"], "Approved", "green", "Ready for PO action")}
+            {status_card("Converted", stats["converted_requests"], "Converted to PO", "green", "Linked to issued PO")}
+        </div>
+        """
 
         request_rows = ""
+        visible_requests = requests if selected_status == "All" else [r for r in requests if (r.RequestStatus or "Submitted") == selected_status]
 
-        for row in requests:
+        for row in visible_requests:
             description = row.RequestDescription or ""
             if len(description) > 160:
                 description = description[:160] + "..."
 
-            status_options = approval_status_options(row.RequestStatus)
+            status_options = ""
+            for status in ["Submitted", "Under Review", "Needs More Info", "Approved", "Rejected", "Converted to PO"]:
+                selected = " selected" if status == row.RequestStatus else ""
+                status_options += f'<option value="{h(status)}"{selected}>{h(status)}</option>'
 
             review_form = ""
             if can_review_purchase_requests(role):
@@ -2659,78 +2650,47 @@ def purchase_requests():
             """
 
         if not request_rows:
-            request_rows = '<tr><td colspan="11">No purchase requests found yet.</td></tr>'
+            request_rows = '<tr><td colspan="11"><div class="empty-state"><strong>No requests found for this filter.</strong><span>Use another status card or clear the filter.</span></div></td></tr>'
 
+        total_requests = max(stats["total_requests"], 1)
         content = f"""
-        {message_html}
+        {dashboard_cards}
 
-        <div class="grid kpis">
-            <div class="card kpi"><div class="label">Total Requests</div><div class="value">{stats["total_requests"]}</div><div class="trend">All purchase requests</div></div>
-            <div class="card kpi"><div class="label">Submitted</div><div class="value">{stats["submitted_requests"]}</div><div class="trend">Waiting for review</div></div>
-            <div class="card kpi"><div class="label">Under Review</div><div class="value">{stats["under_review_requests"]}</div><div class="trend">Currently being reviewed</div></div>
-            <div class="card kpi"><div class="label">Approved</div><div class="value">{stats["approved_requests"]}</div><div class="trend">Approved requests</div></div>
-            <div class="card kpi"><div class="label">Estimated Total</div><div class="value">{currency(stats["total_estimated_amount"])}</div><div class="trend">All request estimates</div></div>
-            <div class="card kpi"><div class="label">Converted to PO</div><div class="value">{stats["converted_requests"]}</div><div class="trend">Requests linked to POs</div></div>
+        <div class="grid two visual-chart-row">
+            <div class="mini-chart-card">
+                <h4>Request Status Mix</h4>
+                <div class="mini-bar-row"><span>Submitted</span><div><b style="width:{max(5, stats["submitted_requests"] / total_requests * 100)}%"></b></div><em>{stats["submitted_requests"]}</em></div>
+                <div class="mini-bar-row"><span>Under Review</span><div><b style="width:{max(5, stats["under_review_requests"] / total_requests * 100)}%"></b></div><em>{stats["under_review_requests"]}</em></div>
+                <div class="mini-bar-row"><span>Needs More Info</span><div><b style="width:{max(5, stats.get("needs_more_info_requests",0) / total_requests * 100)}%"></b></div><em>{stats.get("needs_more_info_requests",0)}</em></div>
+                <div class="mini-bar-row"><span>Approved</span><div><b style="width:{max(5, stats["approved_requests"] / total_requests * 100)}%"></b></div><em>{stats["approved_requests"]}</em></div>
+                <div class="mini-bar-row"><span>Converted</span><div><b style="width:{max(5, stats["converted_requests"] / total_requests * 100)}%"></b></div><em>{stats["converted_requests"]}</em></div>
+            </div>
+            <div class="card">
+                <h3>Request Workflow Timeline</h3>
+                <p class="card-subtitle">Simple manual workflow; automatic approval routing is intentionally not included in this version.</p>
+                <div class="timeline">
+                    <div class="timeline-item"><strong>Submitted</strong><span>Requester submits required details.</span></div>
+                    <div class="timeline-item"><strong>Under Review / Needs More Info</strong><span>Accounting or management reviews and follows up.</span></div>
+                    <div class="timeline-item"><strong>Approved</strong><span>Request is ready for PO action.</span></div>
+                    <div class="timeline-item"><strong>Converted to PO</strong><span>PO number is linked when issued.</span></div>
+                </div>
+            </div>
         </div>
 
         <div class="card">
             <h3>Request Dashboard</h3>
-            <p class="card-subtitle">Review submitted purchase requests and update their status. Use the column filters to narrow the queue.</p>
-            <div class="filter-hint">
-                <span>Filter by request number, title, vendor, project, department, status, requester, or other visible text.</span>
-                <button type="button" onclick="clearRequestDashboardFilters()">Clear Filters</button>
-            </div>
-            <div class="table-wrap">
-                <table id="requestDashboardTable">
-                    <thead>
-                        <tr>
-                            <th>Request #</th><th>Title / Description</th><th>Vendor</th><th>Project</th><th>Department</th><th>Needed By</th>
-                            <th class="right">Estimate</th><th>Priority</th><th>Status</th><th>Requested By</th><th>Review</th>
-                        </tr>
-                        <tr class="column-filter-row">
-                            <th><input data-col="0" oninput="filterRequestDashboard()" placeholder="Request"></th>
-                            <th><input data-col="1" oninput="filterRequestDashboard()" placeholder="Title"></th>
-                            <th><input data-col="2" oninput="filterRequestDashboard()" placeholder="Vendor"></th>
-                            <th><input data-col="3" oninput="filterRequestDashboard()" placeholder="Project"></th>
-                            <th><input data-col="4" oninput="filterRequestDashboard()" placeholder="Dept"></th>
-                            <th><input data-col="5" oninput="filterRequestDashboard()" placeholder="Date"></th>
-                            <th><input data-col="6" oninput="filterRequestDashboard()" placeholder="Estimate"></th>
-                            <th><input data-col="7" oninput="filterRequestDashboard()" placeholder="Priority"></th>
-                            <th><input data-col="8" oninput="filterRequestDashboard()" placeholder="Status"></th>
-                            <th><input data-col="9" oninput="filterRequestDashboard()" placeholder="Requester"></th>
-                            <th><input data-col="10" oninput="filterRequestDashboard()" placeholder="Review"></th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {request_rows}
-                    </tbody>
-                </table>
-            </div>
+            <p class="card-subtitle">Current status filter: <strong>{h(selected_status)}</strong>. Click a status card above to filter the queue.</p>
+            <div class="filter-hint"><span>Filter by request number, title, vendor, project, department, status, requester, or other visible text.</span><button type="button" onclick="clearRequestDashboardFilters()">Clear Column Filters</button></div>
+            <div class="table-wrap"><table id="requestDashboardTable"><thead><tr><th>Request #</th><th>Title / Description</th><th>Vendor</th><th>Project</th><th>Department</th><th>Needed By</th><th class="right">Estimate</th><th>Priority</th><th>Status</th><th>Requested By</th><th>Review</th></tr><tr class="column-filter-row"><th><input data-col="0" oninput="filterRequestDashboard()" placeholder="Request"></th><th><input data-col="1" oninput="filterRequestDashboard()" placeholder="Title"></th><th><input data-col="2" oninput="filterRequestDashboard()" placeholder="Vendor"></th><th><input data-col="3" oninput="filterRequestDashboard()" placeholder="Project"></th><th><input data-col="4" oninput="filterRequestDashboard()" placeholder="Dept"></th><th><input data-col="5" oninput="filterRequestDashboard()" placeholder="Date"></th><th><input data-col="6" oninput="filterRequestDashboard()" placeholder="Estimate"></th><th><input data-col="7" oninput="filterRequestDashboard()" placeholder="Priority"></th><th><input data-col="8" oninput="filterRequestDashboard()" placeholder="Status"></th><th><input data-col="9" oninput="filterRequestDashboard()" placeholder="Requester"></th><th><input data-col="10" oninput="filterRequestDashboard()" placeholder="Review"></th></tr></thead><tbody>{request_rows}</tbody></table></div>
         </div>
         <script>
         function filterRequestDashboard() {{
-            const table = document.getElementById('requestDashboardTable');
-            if (!table) return;
-            const filters = Array.from(table.querySelectorAll('.column-filter-row input')).map(input => {{
-                return {{ col: Number(input.dataset.col), value: input.value.trim().toLowerCase() }};
-            }});
+            const table = document.getElementById('requestDashboardTable'); if (!table) return;
+            const filters = Array.from(table.querySelectorAll('.column-filter-row input')).map(input => {{ return {{ col: Number(input.dataset.col), value: input.value.trim().toLowerCase() }}; }});
             const rows = Array.from(table.querySelectorAll('tbody tr'));
-            rows.forEach(row => {{
-                const cells = Array.from(row.children);
-                const show = filters.every(filter => {{
-                    if (!filter.value) return true;
-                    const cell = cells[filter.col];
-                    return cell && cell.textContent.toLowerCase().includes(filter.value);
-                }});
-                row.style.display = show ? '' : 'none';
-            }});
+            rows.forEach(row => {{ const cells = Array.from(row.children); const show = filters.every(filter => {{ if (!filter.value) return true; const cell = cells[filter.col]; return cell && cell.textContent.toLowerCase().includes(filter.value); }}); row.style.display = show ? '' : 'none'; }});
         }}
-        function clearRequestDashboardFilters() {{
-            const table = document.getElementById('requestDashboardTable');
-            if (!table) return;
-            table.querySelectorAll('.column-filter-row input').forEach(input => input.value = '');
-            filterRequestDashboard();
-        }}
+        function clearRequestDashboardFilters() {{ const table = document.getElementById('requestDashboardTable'); if (!table) return; table.querySelectorAll('.column-filter-row input').forEach(input => input.value = ''); filterRequestDashboard(); }}
         </script>
         """
 
@@ -3082,7 +3042,7 @@ def po_list():
             <div class="table-wrap">
                 <table id="issuedPOListTable">
                     <thead>
-                        <tr><th>PO Number</th><th>Vendor</th><th>Project</th><th>Department</th><th>Status</th><th>PO Date</th><th class="right">Lines</th><th class="right">PO Value</th><th class="right">Line Total</th><th class="right">Remaining</th><th>Flag</th></tr>
+                        <tr><th>PO Number</th><th>Vendor</th><th>Project</th><th>Department</th><th>Status</th><th>PO Date</th><th class="right">Lines</th><th class="right">PO Value</th><th class="right">Line Total</th><th class="right">Remaining</th><th>Flag</th><th>Packets</th></tr>
                         <tr class="column-filter-row">
                             <th><input data-col="0" oninput="filterIssuedPOList()" placeholder="Filter PO"></th>
                             <th><input data-col="1" oninput="filterIssuedPOList()" placeholder="Filter vendor"></th>
@@ -3290,6 +3250,8 @@ def pos_balances():
             status_text = row.POStatus or "Unknown"
             flag = '<span class="badge amber">Mismatch</span>' if row.AmountMismatch else '<span class="badge green">OK</span>'
             po_url = "/po-detail?po_number=" + quote_plus(str(row.PONumber or ""))
+            internal_packet_url = "/po-packet/" + quote_plus(str(row.PONumber or "")) + "?type=internal"
+            vendor_packet_url = "/po-packet/" + quote_plus(str(row.PONumber or "")) + "?type=vendor"
             po_rows += f"""
             <tr>
                 <td><a href="{po_url}">{h(row.PONumber)}</a></td>
@@ -3303,10 +3265,11 @@ def pos_balances():
                 <td class="right">{currency(row.TotalLineAmount)}</td>
                 <td class="right">{currency(row.RemainingAmount)}</td>
                 <td>{flag}</td>
+                <td><a class="secondary" href="{internal_packet_url}">Internal</a><br><a class="secondary" href="{vendor_packet_url}">Vendor</a></td>
             </tr>
             """
         if not po_rows:
-            po_rows = '<tr><td colspan="11">No issued POs found.</td></tr>'
+            po_rows = '<tr><td colspan="12">No issued POs found.</td></tr>'
 
         line_rows = ""
         for row in data["lines"]:
@@ -3328,11 +3291,11 @@ def pos_balances():
 
         content = f"""
         <div class="grid kpis">
-            <div class="card kpi"><div class="label">Issued PO Count</div><div class="value">{overall['total_pos']}</div><div class="trend">Unique issued POs</div></div>
-            <div class="card kpi"><div class="label">Open POs</div><div class="value">{overall['open_pos']}</div><div class="trend">Currently open</div></div>
+            <a class="card kpi action-card blue" href="#posBalancesPOListTable"><div class="label">Issued PO Count</div><div class="value">{overall['total_pos']}</div><div class="trend">Unique issued POs</div></a>
+            <a class="card kpi action-card green" href="#posBalancesPOListTable"><div class="label">Open POs</div><div class="value">{overall['open_pos']}</div><div class="trend">Currently open</div></a>
             <div class="card kpi"><div class="label">Issued PO Amount</div><div class="value">{currency(overall['total_po_value'])}</div><div class="trend">Revised/original value</div></div>
             <div class="card kpi"><div class="label">Line Item Total</div><div class="value">{currency(overall['total_line_amount'])}</div><div class="trend">Imported line total</div></div>
-            <div class="card kpi"><div class="label">Open PO Balance</div><div class="value">{currency(overall['total_remaining_amount'])}</div><div class="trend">Remaining amount</div></div>
+            <a class="card kpi action-card amber" href="/project-po-setup"><div class="label">Open PO Balance</div><div class="value">{currency(overall['total_remaining_amount'])}</div><div class="trend">Remaining amount</div></a>
             <div class="card kpi"><div class="label">Review Flags</div><div class="value">{overall['amount_mismatch_count']}</div><div class="trend">PO value vs. line total</div></div>
         </div>
 
@@ -3361,7 +3324,7 @@ def pos_balances():
             <div class="table-wrap">
                 <table id="posBalancesPOListTable">
                     <thead>
-                        <tr><th>PO Number</th><th>Vendor</th><th>Project</th><th>Department</th><th>Status</th><th>PO Date</th><th class="right">Lines</th><th class="right">PO Value</th><th class="right">Line Total</th><th class="right">Remaining</th><th>Flag</th></tr>
+                        <tr><th>PO Number</th><th>Vendor</th><th>Project</th><th>Department</th><th>Status</th><th>PO Date</th><th class="right">Lines</th><th class="right">PO Value</th><th class="right">Line Total</th><th class="right">Remaining</th><th>Flag</th><th>Packets</th></tr>
                         <tr class="column-filter-row">
                             <th><input data-col="0" oninput="filterPOListTable('posBalancesPOListTable')" placeholder="Filter PO"></th>
                             <th><input data-col="1" oninput="filterPOListTable('posBalancesPOListTable')" placeholder="Filter vendor"></th>
@@ -3374,6 +3337,7 @@ def pos_balances():
                             <th><input data-col="8" oninput="filterPOListTable('posBalancesPOListTable')" placeholder="Line total"></th>
                             <th><input data-col="9" oninput="filterPOListTable('posBalancesPOListTable')" placeholder="Remaining"></th>
                             <th><input data-col="10" oninput="filterPOListTable('posBalancesPOListTable')" placeholder="Flag"></th>
+                            <th><input data-col="11" oninput="filterPOListTable('posBalancesPOListTable')" placeholder="Packets"></th>
                         </tr>
                     </thead>
                     <tbody>{po_rows}</tbody>
@@ -3518,6 +3482,7 @@ def forecasting():
         return shell("Forecasting", "Unable to load forecasting.", "Forecasting", content), 500
 
 
+
 @app.route("/approver-queue", methods=["GET", "POST"])
 def approver_queue():
     allowed, reason = require_page_access("Approver Queue")
@@ -3526,20 +3491,18 @@ def approver_queue():
 
     access = get_user_access()
     role = access["role"]
-    message_html = ""
 
     if request.method == "POST":
         if not can_review_purchase_requests(role):
-            message_html = '<div class="notice error">You do not have permission to update approval items.</div>'
-        else:
-            try:
-                update_purchase_request_status(request.form)
-                message_html = '<div class="notice ok">Approval item was updated.</div>'
-            except Exception as e:
-                message_html = f'<div class="notice error">Error updating approval item: {h(e)}</div>'
+            return redirect("/approver-queue?toast=You+do+not+have+permission+to+update+approval+items&toast_type=error")
+        try:
+            update_purchase_request_status(request.form)
+            return redirect("/approver-queue?toast=Approver+queue+updated")
+        except Exception as e:
+            return redirect("/approver-queue?toast=" + quote_plus("Error updating approval item: " + str(e)) + "&toast_type=error")
 
     try:
-        rows = [row for row in load_purchase_requests(200) if (row.RequestStatus or "Submitted") in APPROVAL_OPEN_STATUSES]
+        rows = [row for row in load_purchase_requests(200) if (row.RequestStatus or "Submitted") in ["Submitted", "Under Review", "Needs More Info"]]
         selected_id = clean_text(request.args.get("request_id"))
         selected = None
         if selected_id:
@@ -3551,21 +3514,30 @@ def approver_queue():
             selected = rows[0]
 
         list_items = ""
+        total_open_amount = Decimal("0")
         for row in rows:
+            total_open_amount += Decimal(str(row.EstimatedAmount or 0))
             active_class = " active" if selected and row.PurchaseRequestId == selected.PurchaseRequestId else ""
             list_items += f"""
             <a class="approval-item{active_class}" href="/approver-queue?request_id={row.PurchaseRequestId}">
                 <strong>{h(row.RequestNumber)}</strong>
-                <span>{h(row.RequestTitle)}<br>{h(row.ProjectName)} / {h(row.VendorName)}</span>
+                <span>{h(row.RequestTitle)}<br>{h(row.ProjectName)} / {h(row.VendorName)}<br>{purchase_request_status_badge(row.RequestStatus)}</span>
                 <em>{currency(row.EstimatedAmount)}</em>
             </a>
             """
         if not list_items:
-            list_items = '<div class="detail-panel-lite"><strong>No open approval items.</strong><p>Submitted and Under Review requests will appear here.</p></div>'
+            list_items = '<div class="empty-state"><strong>No open approval items.</strong><span>Submitted, Under Review, and Needs More Info requests will appear here.</span></div>'
 
         detail_html = ""
         if selected:
-            status_options = approval_status_options(selected.RequestStatus)
+            status_options = ""
+            for status in ["Submitted", "Under Review", "Needs More Info", "Approved", "Rejected", "Converted to PO"]:
+                selected_option = " selected" if status == selected.RequestStatus else ""
+                status_options += f'<option value="{h(status)}"{selected_option}>{h(status)}</option>'
+            approve_form = action_form(selected.PurchaseRequestId, "Approved", "Approve", "primary")
+            reject_form = action_form(selected.PurchaseRequestId, "Rejected", "Reject", "secondary")
+            more_info_form = action_form(selected.PurchaseRequestId, "Needs More Info", "Request Info", "secondary")
+            review_form = action_form(selected.PurchaseRequestId, "Under Review", "Mark Reviewing", "secondary")
             detail_html = f"""
             <div class="card">
                 <h3>Approval Detail</h3>
@@ -3578,22 +3550,33 @@ def approver_queue():
                     <div><span>Estimate</span><strong>{currency(selected.EstimatedAmount)}</strong></div>
                 </div>
                 <p class="card-subtitle" style="margin-top:14px;">{h(selected.RequestDescription)}</p>
-                <form method="post" action="/approver-queue">
+                <div class="approval-action-grid">{review_form}{more_info_form}{approve_form}{reject_form}</div>
+                <div class="timeline">
+                    <div class="timeline-item"><strong>Submitted</strong><span>{h(selected.RequestedByName or selected.RequestedByEmail)} submitted this request.</span></div>
+                    <div class="timeline-item"><strong>Current Status</strong><span>{h(selected.RequestStatus or 'Submitted')}</span></div>
+                    <div class="timeline-item"><strong>Last Review Note</strong><span>{h(selected.ReviewNotes or 'No review notes yet.')}</span></div>
+                </div>
+                <form method="post" action="/approver-queue" style="margin-top:16px;">
                     <input type="hidden" name="purchase_request_id" value="{h(selected.PurchaseRequestId)}">
                     <div class="form-grid">
                         <div class="form-field"><label>Status</label><select name="request_status">{status_options}</select></div>
                         <div class="form-field"><label>Converted PO Number</label><input type="text" name="converted_po_number" value="{h(selected.ConvertedPONumber)}" placeholder="PO number if converted"></div>
                         <div class="form-field full"><label>Review Notes</label><textarea name="review_notes" placeholder="Review notes">{h(selected.ReviewNotes)}</textarea></div>
                     </div>
-                    <div class="request-actions"><button class="primary" type="submit">Update Approval</button></div>
+                    <div class="request-actions"><button class="primary" type="submit">Save Detailed Update</button></div>
                 </form>
             </div>
             """
         else:
-            detail_html = '<div class="card"><h3>Approval Detail</h3><p class="card-subtitle">Select an approval item to view details.</p></div>'
+            detail_html = '<div class="card"><h3>Approval Detail</h3><div class="empty-state"><strong>No request selected.</strong><span>Open approval items will appear when requests are submitted.</span></div></div>'
 
         content = f"""
-        {message_html}
+        <div class="grid kpis">
+            <div class="card kpi"><div class="label">Open Approval Items</div><div class="value">{len(rows)}</div><div class="trend">Submitted / under review / needs info</div></div>
+            <div class="card kpi"><div class="label">Open Approval Value</div><div class="value">{currency(total_open_amount)}</div><div class="trend">Estimated request value</div></div>
+            <a class="card kpi action-card blue" href="/purchase-requests?status=Submitted"><div class="label">Submitted</div><div class="value">View</div><div class="trend">Filter request dashboard</div></a>
+            <a class="card kpi action-card amber" href="/purchase-requests?status=Needs+More+Info"><div class="label">Needs Info</div><div class="value">View</div><div class="trend">Follow-up requests</div></a>
+        </div>
         <div class="grid two">
             <div class="card"><h3>Open Approver Queue</h3><p class="card-subtitle">Requests waiting for review or currently under review.</p><div class="approval-list">{list_items}</div></div>
             {detail_html}
@@ -3607,53 +3590,168 @@ def approver_queue():
 
 
 
-@app.route("/approval-workflow")
-def approval_workflow():
-    allowed, reason = require_page_access("Approval Workflow")
+@app.route("/po-packet/<path:po_number>")
+def po_packet(po_number):
+    allowed, reason = require_page_access("POs & Balances")
     if not allowed:
-        return access_denied_response("Approval Workflow", reason)
+        return access_denied_response("POs & Balances", reason)
 
-    content = """
-    <div class="card">
-        <h3>Approval Situations & Routing</h3>
-        <p class="card-subtitle">Critical priority changes urgency only. It does not change approval authority.</p>
-        <div class="workflow-note"><strong>How this is applied in the app:</strong> New purchase requests are assigned an initial approval status based on amount, project/vendor information, and available issued PO balance. The detailed line-item clean-match check can be expanded later when we reintroduce issued PO item selection.</div>
-    </div>
+    packet_type = clean_text(request.args.get("type")) or "internal"
+    if packet_type not in ["internal", "vendor"]:
+        packet_type = "internal"
 
-    <div class="approval-flow-columns">
-        <div class="approval-flow-card"><h4>Up to $499.99</h4><p>Auto Approved only when there is an existing vendor, open PO balance, sufficient balance, and no exception. Otherwise routes to Project Manager then Project Accountant.</p></div>
-        <div class="approval-flow-card"><h4>$500 to $2,999.99</h4><p>Clean PO balance match routes to Project Accountant. If not clean, routes to Project Manager then Project Accountant.</p></div>
-        <div class="approval-flow-card"><h4>$3,000 to $9,999.99</h4><p>Routes to Project Manager then Project Accountant.</p></div>
-        <div class="approval-flow-card"><h4>$10,000+</h4><p>Routes to Project Manager, Project Accountant, then Executive approval.</p></div>
-    </div>
+    try:
+        po, lines = load_po_packet_data(po_number)
+        if not po:
+            content = '<div class="notice error">PO was not found.</div>'
+            return shell("PO Packet", "Unable to find this PO.", "POs & Balances", content), 404
 
-    <div class="grid two">
+        line_rows = ""
+        for line in lines:
+            if packet_type == "vendor":
+                line_rows += f"""
+                <tr>
+                    <td>{h(line.LineDescription)}</td>
+                    <td>{h(line.Unit)}</td>
+                    <td class="right">{h(line.Qty)}</td>
+                    <td class="right">{currency(line.UnitCost)}</td>
+                    <td class="right">{currency(line.LineAmount)}</td>
+                </tr>
+                """
+            else:
+                line_rows += f"""
+                <tr>
+                    <td>{h(line.LineDescription)}</td>
+                    <td>{h(line.Unit)}</td>
+                    <td class="right">{h(line.Qty)}</td>
+                    <td class="right">{currency(line.UnitCost)}</td>
+                    <td class="right">{currency(line.LineAmount)}</td>
+                    <td class="right">{currency(line.RemainingAmount)}</td>
+                </tr>
+                """
+
+        if not line_rows:
+            colspan = 5 if packet_type == "vendor" else 6
+            line_rows = f'<tr><td colspan="{colspan}"><div class="empty-state"><strong>No line items found.</strong><span>This packet has no imported line detail yet.</span></div></td></tr>'
+
+        internal_link = "/po-packet/" + quote_plus(str(po.PONumber or "")) + "?type=internal"
+        vendor_link = "/po-packet/" + quote_plus(str(po.PONumber or "")) + "?type=vendor"
+        subtitle = "Vendor-facing purchase order packet" if packet_type == "vendor" else "Internal purchase order packet with balances and audit context"
+        balance_fields = "" if packet_type == "vendor" else f"""
+            <div class="packet-field"><span>Total Line Amount</span><strong>{currency(po.TotalLineAmount)}</strong></div>
+            <div class="packet-field"><span>Remaining Balance</span><strong>{currency(po.RemainingAmount)}</strong></div>
+            <div class="packet-field"><span>Line Count</span><strong>{h(po.LineCount)}</strong></div>
+        """
+        internal_timeline = "" if packet_type == "vendor" else f"""
         <div class="card">
-            <h3>Exception Rules</h3>
-            <div class="approval-rule-grid">
-                <div class="approval-rule-card"><strong>Missing Project or Vendor</strong><span>Returns to requester for more information.</span></div>
-                <div class="approval-rule-card"><strong>New Vendor</strong><span>Blocks auto approval and routes manually by amount threshold.</span></div>
-                <div class="approval-rule-card"><strong>No Open PO Balance</strong><span>Manual approval is required.</span></div>
-                <div class="approval-rule-card"><strong>Insufficient PO Balance</strong><span>Routes manually by amount threshold.</span></div>
-                <div class="approval-rule-card"><strong>Critical Priority</strong><span>Urgency flag only; authority does not change.</span></div>
-                <div class="approval-rule-card"><strong>Requester = Approver</strong><span>Future rule: route to next approval level to prevent self-approval.</span></div>
+            <h3>Internal Audit Timeline</h3>
+            <div class="timeline">
+                <div class="timeline-item"><strong>Issued PO Imported</strong><span>PO data loaded from the issued PO import file.</span></div>
+                <div class="timeline-item"><strong>Balance Tracking</strong><span>Open balance and line totals are calculated from imported PO rows.</span></div>
+                <div class="timeline-item"><strong>Next Action</strong><span>Use this packet for internal review, backup, and reconciliation.</span></div>
+            </div>
+        </div>
+        """
+
+        line_headers = "<th>Description</th><th>Unit</th><th class=\"right\">Qty</th><th class=\"right\">Unit Cost</th><th class=\"right\">Line Amount</th>"
+        if packet_type == "internal":
+            line_headers += "<th class=\"right\">Remaining</th>"
+
+        content = f"""
+        <div class="packet-actions">
+            <a class="secondary" href="/pos-balances">Back to POs & Balances</a>
+            <a class="secondary" href="{internal_link}">Internal Packet</a>
+            <a class="secondary" href="{vendor_link}">Vendor Packet</a>
+            <button class="primary" onclick="window.print()">Print / Save PDF</button>
+        </div>
+        <div class="card">
+            <div class="packet-header">
+                <div class="packet-title">
+                    <p class="eyebrow">Coastal Engineering Procurement</p>
+                    <h1>{h('Vendor PO Packet' if packet_type == 'vendor' else 'Internal PO Packet')}</h1>
+                    <p>{h(subtitle)}</p>
+                </div>
+                <img class="packet-logo" src="{CE_LOGO_DATA_URI}" alt="Coastal Engineering logo">
+            </div>
+            <div class="packet-meta">
+                <div class="packet-field"><span>PO Number</span><strong>{h(po.PONumber)}</strong></div>
+                <div class="packet-field"><span>Vendor</span><strong>{h(po.VendorName)}</strong></div>
+                <div class="packet-field"><span>Project</span><strong>{h(po.ProjectName)}</strong></div>
+                <div class="packet-field"><span>Department</span><strong>{h(po.Department)}</strong></div>
+                <div class="packet-field"><span>PO Date</span><strong>{h(po.PODate)}</strong></div>
+                <div class="packet-field"><span>Status</span><strong>{status_chip(po.POStatus)}</strong></div>
+                <div class="packet-field"><span>PO Value</span><strong>{currency(po.POValue)}</strong></div>
+                {balance_fields}
             </div>
         </div>
         <div class="card">
-            <h3>Approval Hierarchy</h3>
-            <div class="workflow">
-                <div class="workflow-step done"><div class="workflow-circle">1</div><div class="workflow-text"><strong>Field / Requester</strong><span>Submits purchase request.</span></div></div>
-                <div class="workflow-line"></div>
-                <div class="workflow-step active"><div class="workflow-circle">2</div><div class="workflow-text"><strong>Project Manager</strong><span>Reviews scope, need, and project fit.</span></div></div>
-                <div class="workflow-line"></div>
-                <div class="workflow-step future"><div class="workflow-circle">3</div><div class="workflow-text"><strong>Project Accountant</strong><span>Reviews cost, budget, and PO handling.</span></div></div>
-                <div class="workflow-line"></div>
-                <div class="workflow-step future"><div class="workflow-circle">4</div><div class="workflow-text"><strong>Executive</strong><span>Required for $10,000+ requests.</span></div></div>
+            <h3>PO Line Items</h3>
+            <div class="table-wrap"><table><tr>{line_headers}</tr>{line_rows}</table></div>
+        </div>
+        {internal_timeline}
+        """
+        page_title = "Vendor PO Packet" if packet_type == "vendor" else "Internal PO Packet"
+        return shell(page_title, h(po.PONumber), "POs & Balances", content)
+
+    except Exception as e:
+        content = f'<div class="notice error">Error loading PO packet: {h(e)}</div>'
+        return shell("PO Packet", "Unable to load PO packet.", "POs & Balances", content), 500
+
+
+@app.route("/project-po-setup")
+def project_po_setup():
+    allowed, reason = require_page_access("Project PO Setup")
+    if not allowed:
+        return access_denied_response("Project PO Setup", reason)
+
+    try:
+        rows = load_project_po_setup_items()
+        needs_date = sum(1 for r in rows if r.SetupStatus == "Needs Forecast Date")
+        needs_pm = sum(1 for r in rows if r.SetupStatus == "Needs PM Info")
+        open_monitor = sum(1 for r in rows if r.SetupStatus == "Open / Monitor")
+        total_amount = sum(Decimal(str(r.RemainingAmount or 0)) for r in rows)
+
+        cards = ""
+        for r in rows[:24]:
+            packet_url = "/po-packet/" + quote_plus(str(r.PONumber or "")) + "?type=internal"
+            cards += f"""
+            <div class="setup-card">
+                <div>{status_chip(r.SetupStatus)}</div>
+                <h4>{h(r.PONumber)}</h4>
+                <div class="meta"><strong>{h(r.ProjectName)}</strong><br>{h(r.VendorName)}</div>
+                <div class="bucket-metric"><span>PO Value</span><strong>{currency(r.POValue)}</strong></div>
+                <div class="bucket-metric"><span>Remaining</span><strong>{currency(r.RemainingAmount)}</strong></div>
+                <div class="bucket-metric"><span>PO Date</span><strong>{h(r.PODate or 'Missing')}</strong></div>
+                <a class="secondary" href="{packet_url}">View Packet</a>
+            </div>
+            """
+        if not cards:
+            cards = '<div class="empty-state"><strong>No setup items found.</strong><span>POs that need forecast dates, PM info, or balance monitoring will appear here.</span></div>'
+
+        content = f"""
+        <div class="grid kpis">
+            <div class="card kpi"><div class="label">Setup Items</div><div class="value">{len(rows)}</div><div class="trend">POs needing setup or monitoring</div></div>
+            <div class="card kpi"><div class="label">Needs Forecast Date</div><div class="value">{needs_date}</div><div class="trend">Missing PO date</div></div>
+            <div class="card kpi"><div class="label">Needs PM Info</div><div class="value">{needs_pm}</div><div class="trend">Requester / PM info missing</div></div>
+            <div class="card kpi"><div class="label">Open Monitor</div><div class="value">{open_monitor}</div><div class="trend">Open balances to monitor</div></div>
+            <div class="card kpi"><div class="label">Remaining Exposure</div><div class="value">{currency(total_amount)}</div><div class="trend">From setup queue</div></div>
+        </div>
+        <div class="card">
+            <h3>Project PO Setup Queue</h3>
+            <p class="card-subtitle">Use this page to identify POs that need PM/accounting cleanup, forecast dates, or monitoring. This version is read-only and does not require a new SQL table.</p>
+            <div class="timeline">
+                <div class="timeline-item"><strong>Accounting imports issued POs</strong><span>Rows are loaded through Upload Issued POs.</span></div>
+                <div class="timeline-item"><strong>PM/accounting fills gaps</strong><span>Missing dates, requestor details, or forecast timing can be reviewed here.</span></div>
+                <div class="timeline-item"><strong>PO becomes forecast-ready</strong><span>Packets and forecasting pages use cleaner setup data.</span></div>
             </div>
         </div>
-    </div>
-    """
-    return shell("Approval Workflow", "Visual routing logic for purchase requests and exception handling.", "Approval Workflow", content)
+        <div class="setup-card-grid">{cards}</div>
+        """
+        return shell("Project PO Setup", "Review issued POs that need PM information, forecast dates, or setup cleanup.", "Project PO Setup", content)
+
+    except Exception as e:
+        content = f'<div class="notice error">Error loading Project PO Setup: {h(e)}</div>'
+        return shell("Project PO Setup", "Unable to load setup queue.", "Project PO Setup", content), 500
 
 
 @app.route("/missing-po-review")
