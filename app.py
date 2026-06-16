@@ -74,6 +74,10 @@ PAGE_ACCESS = {
     "My Dashboard": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "New Purchase Request": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "Purchase Requests": ["Admin", "Executive", "Accounting"],
+    "Approver Queue": ["Admin", "Executive", "Accounting"],
+    "POs & Balances": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
+    "Forecasting": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
+    "Missing PO Review": ["Admin", "Executive", "Accounting"],
     "PO Summary": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "PO List": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "PO Detail": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
@@ -1402,6 +1406,70 @@ code { background:#f1f5f9; padding:8px 10px; display:block; border-radius:12px; 
 .submit-status-box.error { background:#fee2e2; border:1px solid #fecaca; color:#991b1b; }
 @media (max-width:820px) { .form-grid, .issued-item-option, .other-items-header, .other-item-row { grid-template-columns:1fr; } }
 
+
+/* Consolidated dashboard and forecasting additions */
+.action-card {
+  display:block;
+  text-decoration:none;
+  color:inherit;
+  border:1px solid var(--line);
+  border-radius:16px;
+  background:linear-gradient(180deg,#ffffff,#f8fafc);
+  padding:16px;
+  box-shadow:var(--shadow);
+  transition:transform .15s ease, box-shadow .15s ease, border-color .15s ease;
+}
+.action-card:hover { transform:translateY(-2px); border-color:#93c5fd; box-shadow:0 18px 38px rgba(15,23,42,.12); }
+.action-card .icon { width:42px; height:42px; border-radius:14px; display:grid; place-items:center; color:white; font-size:21px; margin-bottom:12px; }
+.action-card.blue .icon { background:linear-gradient(135deg,#38bdf8,#2563eb); }
+.action-card.green .icon { background:linear-gradient(135deg,#22c55e,#16a34a); }
+.action-card.amber .icon { background:linear-gradient(135deg,#fbbf24,#f59e0b); }
+.action-card.purple .icon { background:linear-gradient(135deg,#a78bfa,#7c3aed); }
+.action-card.red .icon { background:linear-gradient(135deg,#fb7185,#dc2626); }
+.action-card strong { display:block; font-size:15px; margin-bottom:4px; }
+.action-card span { color:var(--muted); font-size:12px; line-height:1.35; }
+.visual-chart-row { align-items:start; }
+.mini-chart-card { background:white; border:1px solid var(--line); border-radius:var(--radius); box-shadow:var(--shadow); padding:18px; }
+.mini-chart-card h4 { margin:0 0 14px; font-size:15px; }
+.mini-bar-row { display:grid; grid-template-columns:155px 1fr 105px; gap:10px; align-items:center; margin:10px 0; font-size:12px; }
+.mini-bar-row span { color:var(--text); font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.mini-bar-row div { height:12px; background:#e2e8f0; border-radius:99px; overflow:hidden; }
+.mini-bar-row b { display:block; height:100%; border-radius:99px; background:linear-gradient(90deg,#93c5fd,#2563eb); }
+.mini-bar-row em { font-style:normal; color:var(--muted); font-weight:800; text-align:right; }
+.project-bucket-grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; }
+.project-bucket-item { background:#fff; border:1px solid var(--line); border-radius:16px; padding:14px; text-align:center; }
+.project-bucket-item .bucket-label { font-size:12px; font-weight:900; margin-bottom:8px; }
+.project-bucket-item.red .bucket-label { color:#dc2626; }
+.project-bucket-item.orange .bucket-label { color:#f97316; }
+.project-bucket-item.amber .bucket-label { color:#f59e0b; }
+.project-bucket-item.lime .bucket-label { color:#65a30d; }
+.project-bucket-item.green .bucket-label { color:#16a34a; }
+.project-bucket-item .donut { width:96px; height:96px; margin:8px auto; border-radius:50%; display:grid; place-items:center; background:conic-gradient(#2563eb calc(var(--pct,0) * 1%), #e5e7eb 0); }
+.project-bucket-item .donut > div { width:64px; height:64px; background:white; border-radius:50%; display:grid; place-items:center; line-height:1.05; }
+.project-bucket-item .donut strong { display:block; font-size:20px; }
+.project-bucket-item .donut span { display:block; font-size:10px; color:var(--muted); font-weight:800; }
+.bucket-metric { display:flex; justify-content:space-between; gap:8px; border-top:1px solid var(--line); padding-top:8px; margin-top:8px; font-size:11px; color:var(--muted); }
+.bucket-metric strong { color:var(--text); font-size:12px; }
+.forecast-row { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); border:1px solid var(--line); border-radius:16px; overflow:hidden; }
+.forecast-bucket { padding:14px; border-right:1px solid var(--line); min-height:145px; background:white; }
+.forecast-bucket:last-child { border-right:none; }
+.forecast-bucket strong { display:block; font-size:12px; }
+.forecast-bucket .amount { color:#1d4ed8; font-size:19px; font-weight:900; margin-top:8px; }
+.forecast-bucket .bucket-note { color:var(--muted); font-size:11px; margin-top:4px; }
+.forecast-bucket .bars { display:flex; align-items:flex-end; height:54px; margin-top:14px; }
+.forecast-bucket .bar { width:100%; min-height:7px; border-radius:6px 6px 0 0; background:linear-gradient(180deg,#93c5fd,#2563eb); }
+.clickable-kpi { cursor:pointer; }
+.filter-chip-row { display:flex; gap:8px; flex-wrap:wrap; margin:10px 0 14px; }
+.filter-chip { border:1px solid var(--line); background:white; color:var(--text); border-radius:999px; padding:7px 10px; font-size:12px; font-weight:800; text-decoration:none; }
+.filter-chip:hover { border-color:#93c5fd; }
+.status-chip { border-radius:999px; padding:4px 8px; font-size:11px; font-weight:900; display:inline-flex; }
+.status-chip.submitted, .status-chip.under-review, .status-chip.pending-approval { background:#fef3c7; color:#92400e; }
+.status-chip.approved, .status-chip.converted-to-po { background:#dcfce7; color:#166534; }
+.status-chip.rejected { background:#fee2e2; color:#991b1b; }
+.status-chip.default { background:#dbeafe; color:#1e40af; }
+@media (max-width:1200px) { .project-bucket-grid, .forecast-row { grid-template-columns:1fr 1fr; } .mini-bar-row { grid-template-columns:1fr; } }
+@media (max-width:820px) { .project-bucket-grid, .forecast-row { grid-template-columns:1fr; } }
+
 </style>
 """
 
@@ -1413,16 +1481,17 @@ def shell(title, subtitle, active, content):
     procurement_nav_items = [
         ("My Dashboard", "/my-dashboard", "🏠"),
         ("New Purchase Request", "/purchase-request", "📝"),
-        ("Purchase Requests", "/purchase-requests", "✅"),
-        ("PO Summary", "/po-summary", "📋"),
-        ("PO List", "/po-list", "📄"),
-        ("PO Detail", "/po-detail", "🔎"),
+        ("Purchase Requests", "/purchase-requests", "📋"),
+        ("Approver Queue", "/approver-queue", "✅"),
+        ("POs & Balances", "/pos-balances", "💳"),
+        ("Forecasting", "/forecasting", "📈"),
     ]
 
     accounting_nav_items = [
         ("Upload Issued POs", "/upload-po", "⬆️"),
         ("Import History", "/import-history", "🕘"),
-        ("Exceptions", "/exceptions", "⚠️"),
+        ("Missing PO Review", "/missing-po-review", "⚠️"),
+        ("Exceptions", "/exceptions", "🚩"),
         ("Exports", "/exports", "⬇️"),
     ]
 
@@ -1498,6 +1567,340 @@ def shell(title, subtitle, active, content):
 </html>
 """
 
+
+
+def status_chip(value):
+    text = value or "Unknown"
+    cls = str(text).lower().replace(" ", "-").replace("/", "-")
+    allowed = {"submitted", "under-review", "pending-approval", "approved", "converted-to-po", "rejected"}
+    if cls not in allowed:
+        cls = "default"
+    return f'<span class="status-chip {cls}">{h(text)}</span>'
+
+
+def percent(value):
+    try:
+        return "{:.1f}%".format(float(value or 0) * 100)
+    except Exception:
+        return "0.0%"
+
+
+def load_pos_balances_data():
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        WITH UniquePOs AS (
+            SELECT
+                PONumber,
+                MAX(VendorName) AS VendorName,
+                MAX(ProjectName) AS ProjectName,
+                MAX(Department) AS Department,
+                MAX(POStatus) AS POStatus,
+                MAX(PODate) AS PODate,
+                MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
+                SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount,
+                MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount,
+                COUNT(*) AS LineCount
+            FROM dbo.IssuedPOLines
+            GROUP BY PONumber
+        )
+        SELECT
+            COUNT(*) AS TotalPOs,
+            SUM(CASE WHEN UPPER(COALESCE(POStatus, '')) = 'OPEN' THEN 1 ELSE 0 END) AS OpenPOs,
+            SUM(POValue) AS TotalPOValue,
+            SUM(TotalLineAmount) AS TotalLineAmount,
+            SUM(RemainingAmount) AS TotalRemainingAmount,
+            SUM(CASE WHEN ABS(COALESCE(POValue, 0) - COALESCE(TotalLineAmount, 0)) > 0.01 THEN 1 ELSE 0 END) AS AmountMismatchCount
+        FROM UniquePOs;
+        """
+    )
+    row = cursor.fetchone()
+    overall = {
+        "total_pos": row.TotalPOs or 0,
+        "open_pos": row.OpenPOs or 0,
+        "total_po_value": row.TotalPOValue or 0,
+        "total_line_amount": row.TotalLineAmount or 0,
+        "total_remaining_amount": row.TotalRemainingAmount or 0,
+        "amount_mismatch_count": row.AmountMismatchCount or 0,
+    }
+
+    cursor.execute(
+        """
+        WITH UniquePOs AS (
+            SELECT
+                PONumber,
+                MAX(ProjectName) AS ProjectName,
+                MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
+                SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount,
+                MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
+            FROM dbo.IssuedPOLines
+            GROUP BY PONumber
+        )
+        SELECT
+            ProjectName,
+            COUNT(*) AS POCount,
+            SUM(POValue) AS POValue,
+            SUM(TotalLineAmount) AS TotalLineAmount,
+            SUM(RemainingAmount) AS RemainingAmount,
+            CASE WHEN SUM(POValue) = 0 THEN 0 ELSE SUM(RemainingAmount) / SUM(POValue) END AS PercentOpen
+        FROM UniquePOs
+        GROUP BY ProjectName
+        ORDER BY POValue DESC;
+        """
+    )
+    projects = cursor.fetchall()
+
+    cursor.execute(
+        """
+        WITH UniquePOs AS (
+            SELECT
+                PONumber,
+                MAX(VendorName) AS VendorName,
+                MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
+                SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount,
+                MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
+            FROM dbo.IssuedPOLines
+            GROUP BY PONumber
+        )
+        SELECT TOP 10
+            VendorName,
+            COUNT(*) AS POCount,
+            SUM(POValue) AS POValue,
+            SUM(TotalLineAmount) AS TotalLineAmount,
+            SUM(RemainingAmount) AS RemainingAmount
+        FROM UniquePOs
+        GROUP BY VendorName
+        ORDER BY POValue DESC;
+        """
+    )
+    vendors = cursor.fetchall()
+
+    cursor.execute(
+        """
+        WITH UniquePOs AS (
+            SELECT
+                PONumber,
+                MAX(VendorName) AS VendorName,
+                MAX(ProjectName) AS ProjectName,
+                MAX(Department) AS Department,
+                MAX(POStatus) AS POStatus,
+                MAX(PODate) AS PODate,
+                MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
+                SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount,
+                MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount,
+                COUNT(*) AS LineCount
+            FROM dbo.IssuedPOLines
+            GROUP BY PONumber
+        )
+        SELECT
+            PONumber,
+            VendorName,
+            ProjectName,
+            Department,
+            POStatus,
+            PODate,
+            LineCount,
+            POValue,
+            TotalLineAmount,
+            RemainingAmount,
+            CASE WHEN ABS(COALESCE(POValue, 0) - COALESCE(TotalLineAmount, 0)) > 0.01 THEN 1 ELSE 0 END AS AmountMismatch
+        FROM UniquePOs
+        ORDER BY PODate DESC, PONumber DESC;
+        """
+    )
+    pos = cursor.fetchall()
+
+    cursor.execute(
+        """
+        SELECT TOP 200
+            PONumber,
+            VendorName,
+            ProjectName,
+            Department,
+            LineDescription,
+            Unit,
+            UnitCost,
+            Qty,
+            LineAmount,
+            RemainingAmount
+        FROM dbo.IssuedPOLines
+        ORDER BY CreatedAt DESC, IssuedPOLineId DESC;
+        """
+    )
+    lines = cursor.fetchall()
+    conn.close()
+
+    return {
+        "overall": overall,
+        "projects": projects,
+        "vendors": vendors,
+        "pos": pos,
+        "lines": lines,
+    }
+
+
+def open_balance_bucket_rows(projects):
+    definitions = [
+        ("Less than 20%", float("-inf"), 0.20, "red"),
+        ("20% - 40%", 0.20, 0.40, "orange"),
+        ("40% - 60%", 0.40, 0.60, "amber"),
+        ("60% - 80%", 0.60, 0.80, "lime"),
+        ("80% - 100%", 0.80, float("inf"), "green"),
+    ]
+    rows = []
+    for label, min_value, max_value, tone in definitions:
+        rows.append({"label": label, "min": min_value, "max": max_value, "tone": tone, "projects": 0, "open": Decimal("0"), "issued": Decimal("0")})
+
+    for p in projects:
+        pct_open = float(p.PercentOpen or 0)
+        for bucket in rows:
+            if pct_open >= bucket["min"] and pct_open < bucket["max"]:
+                bucket["projects"] += 1
+                bucket["open"] += Decimal(str(p.RemainingAmount or 0))
+                bucket["issued"] += Decimal(str(p.POValue or 0))
+                break
+    return rows
+
+
+def render_open_balance_buckets(projects):
+    buckets = open_balance_bucket_rows(projects)
+    total_projects = sum(b["projects"] for b in buckets) or 1
+    html_parts = []
+    for bucket in buckets:
+        pct_value = min(100, max(0, (bucket["projects"] / total_projects) * 100))
+        html_parts.append(f"""
+        <div class="project-bucket-item {h(bucket['tone'])}">
+            <div class="bucket-label">{h(bucket['label'])}</div>
+            <div class="donut" style="--pct:{pct_value};"><div><strong>{bucket['projects']}</strong><span>Projects</span></div></div>
+            <div class="bucket-metric"><span>Open Balance</span><strong>{currency(bucket['open'])}</strong></div>
+            <div class="bucket-metric"><span>Issued PO</span><strong>{currency(bucket['issued'])}</strong></div>
+        </div>
+        """)
+    return "".join(html_parts)
+
+
+def load_forecast_data():
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT
+            RequestNumber AS SourceId,
+            'Purchase Request' AS SourceType,
+            ProjectName,
+            VendorName,
+            NeededByDate AS ForecastDate,
+            RequestStatus AS Status,
+            Priority,
+            EstimatedAmount AS Amount,
+            RequestTitle AS Description
+        FROM dbo.PurchaseRequests
+        WHERE EstimatedAmount IS NOT NULL
+        ORDER BY NeededByDate ASC, RequestedAt DESC;
+        """
+    )
+    request_rows = cursor.fetchall()
+
+    cursor.execute(
+        """
+        WITH UniquePOs AS (
+            SELECT
+                PONumber,
+                MAX(ProjectName) AS ProjectName,
+                MAX(VendorName) AS VendorName,
+                MAX(POStatus) AS Status,
+                MAX(PODate) AS PODate,
+                MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
+            FROM dbo.IssuedPOLines
+            GROUP BY PONumber
+        )
+        SELECT
+            PONumber AS SourceId,
+            'Open PO Balance' AS SourceType,
+            ProjectName,
+            VendorName,
+            NULL AS ForecastDate,
+            Status,
+            NULL AS Priority,
+            RemainingAmount AS Amount,
+            'Open PO balance without expected payment date' AS Description
+        FROM UniquePOs
+        WHERE COALESCE(RemainingAmount, 0) > 0
+        ORDER BY RemainingAmount DESC;
+        """
+    )
+    po_rows = cursor.fetchall()
+    conn.close()
+
+    items = []
+    for row in list(request_rows) + list(po_rows):
+        forecast_date = getattr(row, "ForecastDate", None)
+        bucket = forecast_bucket(forecast_date)
+        items.append({
+            "source_id": row.SourceId,
+            "source_type": row.SourceType,
+            "project": row.ProjectName,
+            "vendor": row.VendorName,
+            "forecast_date": forecast_date,
+            "status": row.Status,
+            "priority": row.Priority,
+            "amount": row.Amount or 0,
+            "description": row.Description,
+            "bucket": bucket,
+        })
+
+    return items
+
+
+def forecast_bucket(forecast_date):
+    if not forecast_date:
+        return "Unscheduled"
+    if isinstance(forecast_date, datetime):
+        forecast_date = forecast_date.date()
+    today = date.today()
+    delta = (forecast_date - today).days
+    if delta < 0:
+        return "Past Due"
+    if delta <= 7:
+        return "Next 7 Days"
+    if delta <= 14:
+        return "8-14 Days"
+    if delta <= 30:
+        return "15-30 Days"
+    if delta <= 60:
+        return "31-60 Days"
+    if delta <= 90:
+        return "61-90 Days"
+    return "90+ Days"
+
+
+def forecast_bucket_summary(items):
+    labels = ["Past Due", "Next 7 Days", "8-14 Days", "15-30 Days", "31-60 Days", "61-90 Days", "90+ Days", "Unscheduled"]
+    summary = {label: {"count": 0, "amount": Decimal("0")} for label in labels}
+    for item in items:
+        label = item["bucket"]
+        if label not in summary:
+            summary[label] = {"count": 0, "amount": Decimal("0")}
+        summary[label]["count"] += 1
+        summary[label]["amount"] += Decimal(str(item["amount"] or 0))
+    return [(label, summary[label]["count"], summary[label]["amount"]) for label in labels]
+
+
+def aggregate_items(items, key_name):
+    buckets = {}
+    for item in items:
+        key = item.get(key_name) or "Unassigned"
+        if key not in buckets:
+            buckets[key] = {"count": 0, "amount": Decimal("0"), "next_date": None}
+        buckets[key]["count"] += 1
+        buckets[key]["amount"] += Decimal(str(item["amount"] or 0))
+        fd = item.get("forecast_date")
+        if fd and (buckets[key]["next_date"] is None or fd < buckets[key]["next_date"]):
+            buckets[key]["next_date"] = fd
+    return sorted(buckets.items(), key=lambda x: x[1]["amount"], reverse=True)
 
 # ------------------------------------------------------------
 # Routes
@@ -1715,18 +2118,64 @@ def purchase_requests():
         </div>
 
         <div class="card">
-            <h3>Purchase Requests</h3>
-            <p class="card-subtitle">Review submitted purchase requests and update their status.</p>
+            <h3>Request Dashboard</h3>
+            <p class="card-subtitle">Review submitted purchase requests and update their status. Use the column filters to narrow the queue.</p>
+            <div class="filter-hint">
+                <span>Filter by request number, title, vendor, project, department, status, requester, or other visible text.</span>
+                <button type="button" onclick="clearRequestDashboardFilters()">Clear Filters</button>
+            </div>
             <div class="table-wrap">
-                <table>
-                    <tr>
-                        <th>Request #</th><th>Title / Description</th><th>Vendor</th><th>Project</th><th>Department</th><th>Needed By</th>
-                        <th class="right">Estimate</th><th>Priority</th><th>Status</th><th>Requested By</th><th>Review</th>
-                    </tr>
-                    {request_rows}
+                <table id="requestDashboardTable">
+                    <thead>
+                        <tr>
+                            <th>Request #</th><th>Title / Description</th><th>Vendor</th><th>Project</th><th>Department</th><th>Needed By</th>
+                            <th class="right">Estimate</th><th>Priority</th><th>Status</th><th>Requested By</th><th>Review</th>
+                        </tr>
+                        <tr class="column-filter-row">
+                            <th><input data-col="0" oninput="filterRequestDashboard()" placeholder="Request"></th>
+                            <th><input data-col="1" oninput="filterRequestDashboard()" placeholder="Title"></th>
+                            <th><input data-col="2" oninput="filterRequestDashboard()" placeholder="Vendor"></th>
+                            <th><input data-col="3" oninput="filterRequestDashboard()" placeholder="Project"></th>
+                            <th><input data-col="4" oninput="filterRequestDashboard()" placeholder="Dept"></th>
+                            <th><input data-col="5" oninput="filterRequestDashboard()" placeholder="Date"></th>
+                            <th><input data-col="6" oninput="filterRequestDashboard()" placeholder="Estimate"></th>
+                            <th><input data-col="7" oninput="filterRequestDashboard()" placeholder="Priority"></th>
+                            <th><input data-col="8" oninput="filterRequestDashboard()" placeholder="Status"></th>
+                            <th><input data-col="9" oninput="filterRequestDashboard()" placeholder="Requester"></th>
+                            <th><input data-col="10" oninput="filterRequestDashboard()" placeholder="Review"></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {request_rows}
+                    </tbody>
                 </table>
             </div>
         </div>
+        <script>
+        function filterRequestDashboard() {{
+            const table = document.getElementById('requestDashboardTable');
+            if (!table) return;
+            const filters = Array.from(table.querySelectorAll('.column-filter-row input')).map(input => {{
+                return {{ col: Number(input.dataset.col), value: input.value.trim().toLowerCase() }};
+            }});
+            const rows = Array.from(table.querySelectorAll('tbody tr'));
+            rows.forEach(row => {{
+                const cells = Array.from(row.children);
+                const show = filters.every(filter => {{
+                    if (!filter.value) return true;
+                    const cell = cells[filter.col];
+                    return cell && cell.textContent.toLowerCase().includes(filter.value);
+                }});
+                row.style.display = show ? '' : 'none';
+            }});
+        }}
+        function clearRequestDashboardFilters() {{
+            const table = document.getElementById('requestDashboardTable');
+            if (!table) return;
+            table.querySelectorAll('.column-filter-row input').forEach(input => input.value = '');
+            filterRequestDashboard();
+        }}
+        </script>
         """
 
         return shell("Purchase Requests", "Review submitted purchase requests before they become issued POs.", "Purchase Requests", content)
@@ -2240,6 +2689,376 @@ def po_detail():
         content = search_form + f'<div class="notice error">Error loading PO detail: {h(e)}</div>'
         return shell("PO Detail", "Unable to load PO detail.", "PO Detail", content), 500
 
+
+
+@app.route("/pos-balances")
+def pos_balances():
+    allowed, reason = require_page_access("POs & Balances")
+    if not allowed:
+        return access_denied_response("POs & Balances", reason)
+
+    try:
+        data = load_pos_balances_data()
+        overall = data["overall"]
+
+        project_rows = ""
+        max_project_value = max([float(row.POValue or 0) for row in data["projects"]] or [1])
+        for row in data["projects"]:
+            bar_width = 0 if max_project_value == 0 else max(5, float(row.POValue or 0) / max_project_value * 100)
+            project_rows += f"""
+            <tr>
+                <td><strong>{h(row.ProjectName)}</strong></td>
+                <td class="right">{row.POCount}</td>
+                <td class="right">{currency(row.POValue)}</td>
+                <td class="right">{currency(row.TotalLineAmount)}</td>
+                <td class="right">{currency(row.RemainingAmount)}</td>
+                <td class="right">{percent(row.PercentOpen)}</td>
+                <td><div class="bar-track"><div class="bar-fill" style="width:{bar_width}%"></div></div></td>
+            </tr>
+            """
+        if not project_rows:
+            project_rows = '<tr><td colspan="7">No project PO data found.</td></tr>'
+
+        vendor_bar_rows = ""
+        max_vendor_value = max([float(row.POValue or 0) for row in data["vendors"]] or [1])
+        for row in data["vendors"]:
+            bar_width = 0 if max_vendor_value == 0 else max(5, float(row.POValue or 0) / max_vendor_value * 100)
+            vendor_bar_rows += f"""
+            <div class="mini-bar-row"><span>{h(row.VendorName)}</span><div><b style="width:{bar_width}%"></b></div><em>{currency(row.POValue)}</em></div>
+            """
+        if not vendor_bar_rows:
+            vendor_bar_rows = '<p class="card-subtitle">No vendor data found.</p>'
+
+        po_rows = ""
+        for row in data["pos"]:
+            status_text = row.POStatus or "Unknown"
+            flag = '<span class="badge amber">Mismatch</span>' if row.AmountMismatch else '<span class="badge green">OK</span>'
+            po_url = "/po-detail?po_number=" + quote_plus(str(row.PONumber or ""))
+            po_rows += f"""
+            <tr>
+                <td><a href="{po_url}">{h(row.PONumber)}</a></td>
+                <td>{h(row.VendorName)}</td>
+                <td>{h(row.ProjectName)}</td>
+                <td>{h(row.Department)}</td>
+                <td>{status_chip(status_text)}</td>
+                <td>{h(row.PODate)}</td>
+                <td class="right">{row.LineCount}</td>
+                <td class="right">{currency(row.POValue)}</td>
+                <td class="right">{currency(row.TotalLineAmount)}</td>
+                <td class="right">{currency(row.RemainingAmount)}</td>
+                <td>{flag}</td>
+            </tr>
+            """
+        if not po_rows:
+            po_rows = '<tr><td colspan="11">No issued POs found.</td></tr>'
+
+        line_rows = ""
+        for row in data["lines"]:
+            line_rows += f"""
+            <tr>
+                <td>{h(row.PONumber)}</td>
+                <td>{h(row.VendorName)}</td>
+                <td>{h(row.ProjectName)}</td>
+                <td>{h(row.Department)}</td>
+                <td>{h(row.LineDescription)}</td>
+                <td>{h(row.Unit)}</td>
+                <td class="right">{currency(row.UnitCost)}</td>
+                <td class="right">{h(row.Qty)}</td>
+                <td class="right">{currency(row.LineAmount)}</td>
+            </tr>
+            """
+        if not line_rows:
+            line_rows = '<tr><td colspan="9">No line items found.</td></tr>'
+
+        content = f"""
+        <div class="grid kpis">
+            <div class="card kpi"><div class="label">Issued PO Count</div><div class="value">{overall['total_pos']}</div><div class="trend">Unique issued POs</div></div>
+            <div class="card kpi"><div class="label">Open POs</div><div class="value">{overall['open_pos']}</div><div class="trend">Currently open</div></div>
+            <div class="card kpi"><div class="label">Issued PO Amount</div><div class="value">{currency(overall['total_po_value'])}</div><div class="trend">Revised/original value</div></div>
+            <div class="card kpi"><div class="label">Line Item Total</div><div class="value">{currency(overall['total_line_amount'])}</div><div class="trend">Imported line total</div></div>
+            <div class="card kpi"><div class="label">Open PO Balance</div><div class="value">{currency(overall['total_remaining_amount'])}</div><div class="trend">Remaining amount</div></div>
+            <div class="card kpi"><div class="label">Review Flags</div><div class="value">{overall['amount_mismatch_count']}</div><div class="trend">PO value vs. line total</div></div>
+        </div>
+
+        <div class="card project-bucket-card">
+            <h3>Project Open Balance Buckets</h3>
+            <p class="card-subtitle">Projects grouped by remaining open PO balance percentage. Green means stronger remaining balance; red means lower remaining balance.</p>
+            <div class="project-bucket-grid">{render_open_balance_buckets(data['projects'])}</div>
+        </div>
+
+        <div class="grid two visual-chart-row">
+            <div class="card">
+                <h3>PO Exposure by Project</h3>
+                <p class="card-subtitle">Issued value, line totals, and remaining balances by project.</p>
+                <div class="table-wrap"><table><tr><th>Project</th><th class="right">POs</th><th class="right">Issued</th><th class="right">Line Total</th><th class="right">Remaining</th><th class="right">% Open</th><th>Scale</th></tr>{project_rows}</table></div>
+            </div>
+            <div class="mini-chart-card">
+                <h4>Top Vendors by Issued PO Amount</h4>
+                {vendor_bar_rows}
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>Issued PO List</h3>
+            <p class="card-subtitle">Consolidated list formerly shown on the separate PO List page. Click a PO number for full PO detail.</p>
+            <div class="filter-hint"><span>Use the filters below each column heading to narrow the PO list.</span><button type="button" onclick="clearPOListFilters('posBalancesPOListTable')">Clear Filters</button></div>
+            <div class="table-wrap">
+                <table id="posBalancesPOListTable">
+                    <thead>
+                        <tr><th>PO Number</th><th>Vendor</th><th>Project</th><th>Department</th><th>Status</th><th>PO Date</th><th class="right">Lines</th><th class="right">PO Value</th><th class="right">Line Total</th><th class="right">Remaining</th><th>Flag</th></tr>
+                        <tr class="column-filter-row">
+                            <th><input data-col="0" oninput="filterPOListTable('posBalancesPOListTable')" placeholder="Filter PO"></th>
+                            <th><input data-col="1" oninput="filterPOListTable('posBalancesPOListTable')" placeholder="Filter vendor"></th>
+                            <th><input data-col="2" oninput="filterPOListTable('posBalancesPOListTable')" placeholder="Filter project"></th>
+                            <th><input data-col="3" oninput="filterPOListTable('posBalancesPOListTable')" placeholder="Filter dept"></th>
+                            <th><input data-col="4" oninput="filterPOListTable('posBalancesPOListTable')" placeholder="Filter status"></th>
+                            <th><input data-col="5" oninput="filterPOListTable('posBalancesPOListTable')" placeholder="Filter date"></th>
+                            <th><input data-col="6" oninput="filterPOListTable('posBalancesPOListTable')" placeholder="Lines"></th>
+                            <th><input data-col="7" oninput="filterPOListTable('posBalancesPOListTable')" placeholder="PO value"></th>
+                            <th><input data-col="8" oninput="filterPOListTable('posBalancesPOListTable')" placeholder="Line total"></th>
+                            <th><input data-col="9" oninput="filterPOListTable('posBalancesPOListTable')" placeholder="Remaining"></th>
+                            <th><input data-col="10" oninput="filterPOListTable('posBalancesPOListTable')" placeholder="Flag"></th>
+                        </tr>
+                    </thead>
+                    <tbody>{po_rows}</tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>Recent PO Line Items</h3>
+            <p class="card-subtitle">Line-level detail from issued PO imports. This brings PO Detail visibility into the combined page.</p>
+            <div class="table-wrap"><table><tr><th>PO</th><th>Vendor</th><th>Project</th><th>Department</th><th>Description</th><th>Unit</th><th class="right">Unit Cost</th><th class="right">Qty</th><th class="right">Line Amount</th></tr>{line_rows}</table></div>
+        </div>
+
+        <script>
+        function filterPOListTable(tableId) {{
+            const table = document.getElementById(tableId);
+            if (!table) return;
+            const filters = Array.from(table.querySelectorAll('.column-filter-row input')).map(input => {{ return {{ col: Number(input.dataset.col), value: input.value.trim().toLowerCase() }}; }});
+            const rows = Array.from(table.querySelectorAll('tbody tr'));
+            rows.forEach(row => {{
+                const cells = Array.from(row.children);
+                const show = filters.every(filter => {{
+                    if (!filter.value) return true;
+                    const cell = cells[filter.col];
+                    return cell && cell.textContent.toLowerCase().includes(filter.value);
+                }});
+                row.style.display = show ? '' : 'none';
+            }});
+        }}
+        function clearPOListFilters(tableId) {{
+            const table = document.getElementById(tableId);
+            if (!table) return;
+            table.querySelectorAll('.column-filter-row input').forEach(input => input.value = '');
+            filterPOListTable(tableId);
+        }}
+        </script>
+        """
+
+        return shell("POs & Balances", "Issued PO value, open balances, project buckets, vendor exposure, and line details in one view.", "POs & Balances", content)
+
+    except Exception as e:
+        content = f'<div class="notice error">Error loading POs & Balances: {h(e)}</div>'
+        return shell("POs & Balances", "Unable to load consolidated PO view.", "POs & Balances", content), 500
+
+
+@app.route("/forecasting")
+def forecasting():
+    allowed, reason = require_page_access("Forecasting")
+    if not allowed:
+        return access_denied_response("Forecasting", reason)
+
+    try:
+        items = load_forecast_data()
+        selected_bucket = clean_text(request.args.get("bucket")) or "All Buckets"
+        visible_items = items if selected_bucket == "All Buckets" else [item for item in items if item["bucket"] == selected_bucket]
+        bucket_summary = forecast_bucket_summary(items)
+        total_forecast = sum(Decimal(str(item["amount"] or 0)) for item in items)
+        scheduled_total = sum(Decimal(str(item["amount"] or 0)) for item in items if item["bucket"] != "Unscheduled")
+        unscheduled_total = total_forecast - scheduled_total
+        past_due_count = len([item for item in items if item["bucket"] == "Past Due"])
+        next_30_total = sum(Decimal(str(item["amount"] or 0)) for item in items if item["bucket"] in ["Past Due", "Next 7 Days", "8-14 Days", "15-30 Days"])
+
+        max_bucket = max([float(amount or 0) for _, _, amount in bucket_summary] or [1])
+        forecast_bucket_cards = ""
+        for label, count, amount in bucket_summary:
+            bar_height = 8 if max_bucket == 0 else max(8, float(amount or 0) / max_bucket * 100)
+            forecast_bucket_cards += f"""
+            <a class="forecast-bucket" href="/forecasting?bucket={quote_plus(label)}" style="text-decoration:none;color:inherit;">
+                <strong>{h(label)}</strong>
+                <div class="amount">{currency(amount)}</div>
+                <div class="bucket-note">{count} item(s)</div>
+                <div class="bars"><span class="bar" style="height:{bar_height}%"></span></div>
+            </a>
+            """
+
+        project_rows = ""
+        for project, values in aggregate_items(items, "project")[:8]:
+            project_rows += f"<tr><td>{h(project)}</td><td class='right'>{values['count']}</td><td>{h(values['next_date'])}</td><td class='right'>{currency(values['amount'])}</td></tr>"
+        if not project_rows:
+            project_rows = '<tr><td colspan="4">No forecast project data found.</td></tr>'
+
+        vendor_rows = ""
+        for vendor, values in aggregate_items(items, "vendor")[:8]:
+            vendor_rows += f"<tr><td>{h(vendor)}</td><td class='right'>{values['count']}</td><td>{h(values['next_date'])}</td><td class='right'>{currency(values['amount'])}</td></tr>"
+        if not vendor_rows:
+            vendor_rows = '<tr><td colspan="4">No forecast vendor data found.</td></tr>'
+
+        detail_rows = ""
+        for item in visible_items:
+            detail_rows += f"""
+            <tr>
+                <td>{h(item['source_type'])}</td>
+                <td>{h(item['source_id'])}</td>
+                <td>{h(item['project'])}</td>
+                <td>{h(item['vendor'])}</td>
+                <td>{h(item['forecast_date'])}</td>
+                <td>{status_chip(item['status'])}</td>
+                <td>{h(item['bucket'])}</td>
+                <td>{h(item['description'])}</td>
+                <td class="right">{currency(item['amount'])}</td>
+            </tr>
+            """
+        if not detail_rows:
+            detail_rows = '<tr><td colspan="9">No forecast detail found for this filter.</td></tr>'
+
+        content = f"""
+        <div class="grid kpis">
+            <a class="card kpi action-card blue" href="/forecasting?bucket=All+Buckets"><div class="label">Total Forecast Exposure</div><div class="value">{currency(total_forecast)}</div><div class="trend">Requests + open PO balances</div></a>
+            <a class="card kpi action-card green" href="/forecasting?bucket=Next+7+Days"><div class="label">Scheduled Forecast</div><div class="value">{currency(scheduled_total)}</div><div class="trend">Items with dates</div></a>
+            <a class="card kpi action-card amber" href="/forecasting?bucket=Unscheduled"><div class="label">Unscheduled</div><div class="value">{currency(unscheduled_total)}</div><div class="trend">Needs forecast date</div></a>
+            <a class="card kpi action-card red" href="/forecasting?bucket=Past+Due"><div class="label">Past Due Items</div><div class="value">{past_due_count}</div><div class="trend">Needed-by date has passed</div></a>
+            <a class="card kpi action-card purple" href="/forecasting?bucket=15-30+Days"><div class="label">Next 30 Days</div><div class="value">{currency(next_30_total)}</div><div class="trend">Past due through 30 days</div></a>
+            <div class="card kpi"><div class="label">Detail Items</div><div class="value">{len(items)}</div><div class="trend">Forecast rows</div></div>
+        </div>
+
+        <div class="card">
+            <h3>Forecast Buckets</h3>
+            <p class="card-subtitle">Expected purchase/payment timing from purchase requests and currently open PO balances. Click a bucket to filter the detail list.</p>
+            <div class="forecast-row">{forecast_bucket_cards}</div>
+        </div>
+
+        <div class="grid two">
+            <div class="card"><h3>Forecast by Project</h3><div class="table-wrap"><table><tr><th>Project</th><th class="right">Items</th><th>Next Date</th><th class="right">Amount</th></tr>{project_rows}</table></div></div>
+            <div class="card"><h3>Top Vendors by Forecast Amount</h3><div class="table-wrap"><table><tr><th>Vendor</th><th class="right">Items</th><th>Next Date</th><th class="right">Amount</th></tr>{vendor_rows}</table></div></div>
+        </div>
+
+        <div class="card" id="forecast-detail-section">
+            <h3>Forecast Detail</h3>
+            <p class="card-subtitle">Current filter: <strong>{h(selected_bucket)}</strong>. Add expected payment or due dates later to make the forecast stronger.</p>
+            <div class="filter-chip-row">
+                <a class="filter-chip" href="/forecasting?bucket=All+Buckets">All Buckets</a>
+                {''.join(f'<a class="filter-chip" href="/forecasting?bucket={quote_plus(label)}">{h(label)}</a>' for label, _, _ in bucket_summary)}
+            </div>
+            <div class="table-wrap"><table><tr><th>Source</th><th>ID</th><th>Project</th><th>Vendor</th><th>Forecast Date</th><th>Status</th><th>Bucket</th><th>Description</th><th class="right">Amount</th></tr>{detail_rows}</table></div>
+        </div>
+        """
+
+        return shell("Forecasting", "Upcoming purchase request needs, open PO exposure, and unscheduled forecast gaps.", "Forecasting", content)
+
+    except Exception as e:
+        content = f'<div class="notice error">Error loading forecasting page: {h(e)}</div>'
+        return shell("Forecasting", "Unable to load forecasting.", "Forecasting", content), 500
+
+
+@app.route("/approver-queue", methods=["GET", "POST"])
+def approver_queue():
+    allowed, reason = require_page_access("Approver Queue")
+    if not allowed:
+        return access_denied_response("Approver Queue", reason)
+
+    access = get_user_access()
+    role = access["role"]
+    message_html = ""
+
+    if request.method == "POST":
+        if not can_review_purchase_requests(role):
+            message_html = '<div class="notice error">You do not have permission to update approval items.</div>'
+        else:
+            try:
+                update_purchase_request_status(request.form)
+                message_html = '<div class="notice ok">Approval item was updated.</div>'
+            except Exception as e:
+                message_html = f'<div class="notice error">Error updating approval item: {h(e)}</div>'
+
+    try:
+        rows = [row for row in load_purchase_requests(200) if (row.RequestStatus or "Submitted") in ["Submitted", "Under Review"]]
+        selected_id = clean_text(request.args.get("request_id"))
+        selected = None
+        if selected_id:
+            for row in rows:
+                if str(row.PurchaseRequestId) == selected_id:
+                    selected = row
+                    break
+        if selected is None and rows:
+            selected = rows[0]
+
+        list_items = ""
+        for row in rows:
+            active_class = " active" if selected and row.PurchaseRequestId == selected.PurchaseRequestId else ""
+            list_items += f"""
+            <a class="approval-item{active_class}" href="/approver-queue?request_id={row.PurchaseRequestId}">
+                <strong>{h(row.RequestNumber)}</strong>
+                <span>{h(row.RequestTitle)}<br>{h(row.ProjectName)} / {h(row.VendorName)}</span>
+                <em>{currency(row.EstimatedAmount)}</em>
+            </a>
+            """
+        if not list_items:
+            list_items = '<div class="detail-panel-lite"><strong>No open approval items.</strong><p>Submitted and Under Review requests will appear here.</p></div>'
+
+        detail_html = ""
+        if selected:
+            status_options = ""
+            for status in ["Submitted", "Under Review", "Approved", "Rejected", "Converted to PO"]:
+                selected_option = " selected" if status == selected.RequestStatus else ""
+                status_options += f'<option value="{h(status)}"{selected_option}>{h(status)}</option>'
+            detail_html = f"""
+            <div class="card">
+                <h3>Approval Detail</h3>
+                <div class="detail-grid">
+                    <div><span>Request</span><strong>{h(selected.RequestNumber)}</strong></div>
+                    <div><span>Status</span><strong>{status_chip(selected.RequestStatus)}</strong></div>
+                    <div><span>Project</span><strong>{h(selected.ProjectName)}</strong></div>
+                    <div><span>Vendor</span><strong>{h(selected.VendorName)}</strong></div>
+                    <div><span>Needed By</span><strong>{h(selected.NeededByDate)}</strong></div>
+                    <div><span>Estimate</span><strong>{currency(selected.EstimatedAmount)}</strong></div>
+                </div>
+                <p class="card-subtitle" style="margin-top:14px;">{h(selected.RequestDescription)}</p>
+                <form method="post" action="/approver-queue">
+                    <input type="hidden" name="purchase_request_id" value="{h(selected.PurchaseRequestId)}">
+                    <div class="form-grid">
+                        <div class="form-field"><label>Status</label><select name="request_status">{status_options}</select></div>
+                        <div class="form-field"><label>Converted PO Number</label><input type="text" name="converted_po_number" value="{h(selected.ConvertedPONumber)}" placeholder="PO number if converted"></div>
+                        <div class="form-field full"><label>Review Notes</label><textarea name="review_notes" placeholder="Review notes">{h(selected.ReviewNotes)}</textarea></div>
+                    </div>
+                    <div class="request-actions"><button class="primary" type="submit">Update Approval</button></div>
+                </form>
+            </div>
+            """
+        else:
+            detail_html = '<div class="card"><h3>Approval Detail</h3><p class="card-subtitle">Select an approval item to view details.</p></div>'
+
+        content = f"""
+        {message_html}
+        <div class="grid two">
+            <div class="card"><h3>Open Approver Queue</h3><p class="card-subtitle">Requests waiting for review or currently under review.</p><div class="approval-list">{list_items}</div></div>
+            {detail_html}
+        </div>
+        """
+        return shell("Approver Queue", "Approve, reject, or request more information for open purchase requests.", "Approver Queue", content)
+
+    except Exception as e:
+        content = f'<div class="notice error">Error loading approver queue: {h(e)}</div>'
+        return shell("Approver Queue", "Unable to load approval queue.", "Approver Queue", content), 500
+
+
+@app.route("/missing-po-review")
+def missing_po_review():
+    allowed, reason = require_page_access("Missing PO Review")
+    if not allowed:
+        return access_denied_response("Missing PO Review", reason)
+    return redirect("/exceptions")
 
 @app.route("/upload-po", methods=["GET", "POST"])
 def upload_po():
