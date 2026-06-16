@@ -881,6 +881,20 @@ body::before {
 }
 .brand h1 { font-size:18px; line-height:1; margin:0 0 5px; }
 .brand p { margin:0; font-size:12px; color:#bfdbfe; }
+.nav-section {
+  margin: 18px 8px 8px;
+  color: #93c5fd;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+
+.nav-divider {
+  height: 1px;
+  background: rgba(191, 219, 254, 0.18);
+  margin: 16px 8px 10px;
+}
 .nav-item {
   display:flex;
   gap:12px;
@@ -1081,7 +1095,7 @@ def shell(title, subtitle, active, content):
     access = get_user_access()
     role = access["role"]
 
-    all_nav_items = [
+    po_nav_items = [
         ("Dashboard", "/", "📊"),
         ("PO Summary", "/po-summary", "📋"),
         ("PO List", "/po-list", "📄"),
@@ -1090,17 +1104,54 @@ def shell(title, subtitle, active, content):
         ("Import History", "/import-history", "🕘"),
         ("Exceptions", "/exceptions", "⚠️"),
         ("Exports", "/exports", "⬇️"),
+    ]
+
+    admin_nav_items = [
         ("User Access", "/user-access", "🔐"),
         ("Who Am I", "/whoami", "👤"),
     ]
 
-    nav_html = ""
-    for label, href, icon in all_nav_items:
-        if label != "Who Am I" and not role_can_access(role, label):
-            continue
+    account_nav_items = [
+        ("Who Am I", "/whoami", "👤"),
+    ]
 
+    def build_nav_item(label, href, icon):
         active_class = " active" if active == label else ""
-        nav_html += f'<a class="nav-item{active_class}" href="{href}"><span>{icon}</span>{h(label)}</a>'
+        return f'<a class="nav-item{active_class}" href="{href}"><span>{icon}</span>{h(label)}</a>'
+
+    nav_html = ""
+
+    po_nav_html = ""
+    for label, href, icon in po_nav_items:
+        if role_can_access(role, label):
+            po_nav_html += build_nav_item(label, href, icon)
+
+    if po_nav_html:
+        nav_html += '<div class="nav-section">PO Apps</div>'
+        nav_html += po_nav_html
+
+    if role == "Admin":
+        admin_nav_html = ""
+
+        for label, href, icon in admin_nav_items:
+            if label == "Who Am I" or role_can_access(role, label):
+                admin_nav_html += build_nav_item(label, href, icon)
+
+        if admin_nav_html:
+            nav_html += '<div class="nav-divider"></div>'
+            nav_html += '<div class="nav-section">Admin</div>'
+            nav_html += admin_nav_html
+
+    else:
+        account_nav_html = ""
+
+        for label, href, icon in account_nav_items:
+            account_nav_html += build_nav_item(label, href, icon)
+
+        if account_nav_html:
+            nav_html += '<div class="nav-divider"></div>'
+            nav_html += '<div class="nav-section">Account</div>'
+            nav_html += account_nav_html
 
     return f"""
 <!DOCTYPE html>
