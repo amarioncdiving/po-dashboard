@@ -911,17 +911,18 @@ code {
 
 def shell(title, subtitle, active, content):
     nav_items = [
-        ("Dashboard", "/", "📊"),
-        ("PO Summary", "/po-summary", "📋"),
-        ("PO List", "/po-list", "📄"),
-        ("PO Detail", "/po-detail", "🔎"),
-        ("Upload Issued POs", "/upload-po", "⬆️"),
-        ("Import History", "/import-history", "🕘"),
-        ("Exceptions", "/exceptions", "⚠️"),
-        ("Exports", "/exports", "⬇️"),
-        ("Health", "/health", "🟢"),
-        ("DB Test", "/db-test", "🧪"),
-    ]
+    ("Dashboard", "/", "📊"),
+    ("PO Summary", "/po-summary", "📋"),
+    ("PO List", "/po-list", "📄"),
+    ("PO Detail", "/po-detail", "🔎"),
+    ("Upload Issued POs", "/upload-po", "⬆️"),
+    ("Import History", "/import-history", "🕘"),
+    ("Exceptions", "/exceptions", "⚠️"),
+    ("Exports", "/exports", "⬇️"),
+    ("Who Am I", "/whoami", "👤"),
+    ("Health", "/health", "🟢"),
+    ("DB Test", "/db-test", "🧪"),
+]
 
     nav_html = ""
     for label, href, icon in nav_items:
@@ -2151,7 +2152,124 @@ def export_issued_lines_csv():
         headers={"Content-Disposition": "attachment; filename=issued_po_lines_export.csv"},
     )
 
+@app.route("/whoami")
+def whoami():
+    user_email = request.headers.get("X-MS-CLIENT-PRINCIPAL-NAME", "")
+    user_id = request.headers.get("X-MS-CLIENT-PRINCIPAL-ID", "")
+    identity_provider = request.headers.get("X-MS-CLIENT-PRINCIPAL-IDP", "")
+    principal = request.headers.get("X-MS-CLIENT-PRINCIPAL", "")
 
+    is_authenticated = bool(user_email)
+    allowed_domain = ALLOWED_EMAIL_DOMAIN or ""
+    email_domain = ""
+
+    if "@" in user_email:
+        email_domain = user_email.split("@")[-1].lower()
+
+    is_allowed_domain = (
+        bool(email_domain)
+        and bool(allowed_domain)
+        and email_domain == allowed_domain.lower()
+    )
+
+    auth_status_badge = '<span class="badge green">Authenticated</span>' if is_authenticated else '<span class="badge amber">Not Detected</span>'
+    domain_status_badge = '<span class="badge green">Allowed Domain</span>' if is_allowed_domain else '<span class="badge amber">Domain Not Confirmed</span>'
+
+    content = f"""
+    <div class="grid two">
+        <div class="card">
+            <h3>Signed-In User</h3>
+            <p class="card-subtitle">
+                This page reads the Microsoft login headers provided by Azure App Service Authentication.
+            </p>
+
+            <table>
+                <tr>
+                    <th>Authentication Status</th>
+                    <td>{auth_status_badge}</td>
+                </tr>
+                <tr>
+                    <th>Email / User Principal Name</th>
+                    <td>{h(user_email)}</td>
+                </tr>
+                <tr>
+                    <th>Email Domain</th>
+                    <td>{h(email_domain)}</td>
+                </tr>
+                <tr>
+                    <th>Allowed Domain Setting</th>
+                    <td>{h(allowed_domain)}</td>
+                </tr>
+                <tr>
+                    <th>Domain Check</th>
+                    <td>{domain_status_badge}</td>
+                </tr>
+                <tr>
+                    <th>Identity Provider</th>
+                    <td>{h(identity_provider)}</td>
+                </tr>
+                <tr>
+                    <th>Azure User ID</th>
+                    <td>{h(user_id)}</td>
+                </tr>
+            </table>
+        </div>
+
+        <div class="card">
+            <h3>Role-Based Access Prep</h3>
+            <p class="card-subtitle">
+                This is the foundation for future dashboard permissions.
+            </p>
+
+            <table>
+                <tr><th>Future Role</th><th>Example Access</th></tr>
+                <tr><td>Admin</td><td>All pages, uploads, exports, user management</td></tr>
+                <tr><td>Executive</td><td>Summary, exceptions, exports</td></tr>
+                <tr><td>Project Manager</td><td>Assigned projects or departments</td></tr>
+                <tr><td>Accounting / AP</td><td>Uploads, import history, exports</td></tr>
+                <tr><td>Viewer</td><td>Read-only dashboard access</td></tr>
+            </table>
+        </div>
+    </div>
+
+    <div class="card">
+        <h3>Raw Azure Authentication Headers</h3>
+        <p class="card-subtitle">
+            Useful for troubleshooting. If Microsoft login is enabled, these should be populated after sign-in.
+        </p>
+
+        <table>
+            <tr>
+                <th>Header</th>
+                <th>Value</th>
+            </tr>
+            <tr>
+                <td>X-MS-CLIENT-PRINCIPAL-NAME</td>
+                <td>{h(user_email)}</td>
+            </tr>
+            <tr>
+                <td>X-MS-CLIENT-PRINCIPAL-ID</td>
+                <td>{h(user_id)}</td>
+            </tr>
+            <tr>
+                <td>X-MS-CLIENT-PRINCIPAL-IDP</td>
+                <td>{h(identity_provider)}</td>
+            </tr>
+            <tr>
+                <td>X-MS-CLIENT-PRINCIPAL</td>
+                <td>{h(principal[:500])}{"..." if len(principal) > 500 else ""}</td>
+            </tr>
+        </table>
+    </div>
+    """
+
+    return shell(
+        title="Who Am I",
+        subtitle="View the signed-in Microsoft user passed from Azure App Service Authentication.",
+        active="Who Am I",
+        content=content,
+    )
+    
 @app.route("/health")
 def health():
     return jsonify(
