@@ -877,11 +877,12 @@ def shell(title, subtitle, active, content):
     nav_items = [
     ("Dashboard", "/", "📊"),
     ("PO Summary", "/po-summary", "📋"),
+    ("PO Detail", "/po-detail", "🔎"),
     ("Upload Issued POs", "/upload-po", "⬆️"),
     ("Import History", "/import-history", "🕘"),
     ("Health", "/health", "🟢"),
     ("DB Test", "/db-test", "🧪"),
-    ]
+]
 
     nav_html = ""
     for label, href, icon in nav_items:
@@ -1213,7 +1214,218 @@ def upload_po():
         active="Upload Issued POs",
         content=content,
     )
+@app.route("/po-detail", methods=["GET"])
+def po_detail():
+    po_number = clean_text(request.args.get("po_number"))
 
+    search_form = f"""
+    <div class="card">
+        <h3>Search Purchase Order</h3>
+        <p class="card-subtitle">Enter a PO number to view its line items and totals.</p>
+        <form method="get" action="/po-detail">
+            <p>
+                <input 
+                    type="text" 
+                    name="po_number" 
+                    value="{po_number or ""}" 
+                    placeholder="Example: 26-204-002"
+                    style="padding:12px;border:1px solid var(--line);border-radius:12px;width:100%;max-width:420px;"
+                    required
+                >
+            </p>
+            <p>
+                <button class="primary" type="submit">Search PO</button>
+            </p>
+        </form>
+    </div>
+    """
+
+    if not po_number:
+        content = search_form + """
+        <div class="card">
+            <h3>PO Detail</h3>
+            <p class="card-subtitle">Search for a PO number to see vendor, project, totals, and line items.</p>
+        </div>
+        """
+
+        return shell(
+            title="PO Detail",
+            subtitle="Search and review issued PO line items.",
+            active="PO Detail",
+            content=content,
+        )
+
+    try:
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT TOP 1
+                PONumber,
+                VendorName,
+                ProjectName,
+                Department,
+                PODate,
+                POStatus,
+                OriginalAmount,
+                RevisedAmount,
+                RemainingAmount,
+                Requestor
+            FROM dbo.IssuedPOLines
+            WHERE PONumber = ?
+            ORDER BY CreatedAt DESC;
+            """,
+            po_number,
+        )
+
+        header = cursor.fetchone()
+
+        if not header:
+            conn.close()
+
+            content = search_form + f"""
+            <div class="notice error">
+                No PO found for PO number: {po_number}
+            </div>
+            """
+
+            return shell(
+                title="PO Detail",
+                subtitle="PO number was not found.",
+                active="PO Detail",
+                content=content,
+            )
+
+        cursor.execute(
+            """
+            SELECT
+                LineDescription,
+                Unit,
+                UnitCost,
+                Qty,
+                LineAmount,
+                PODate,
+                POStatus,
+                Requestor
+            FROM dbo.IssuedPOLines
+            WHERE PONumber = ?
+            ORDER BY IssuedPOLineId;
+            """,
+            po_number,
+        )
+
+        lines = cursor.fetchall()
+
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) AS LineCount,
+                SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount,
+                MAX(COALESCE(OriginalAmount, 0)) AS OriginalAmount,
+                MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS RevisedAmount,
+                MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
+            FROM dbo.IssuedPOLines
+            WHERE PONumber = ?;
+            """,
+            po_number,
+        )
+
+        totals = cursor.fetchone()
+
+        conn.close()
+
+        line_rows = ""
+        for row in lines:
+            line_rows += f"""
+            <tr>
+                <td>{row.LineDescription or ""}</td>
+                <td>{row.Unit or ""}</td>
+                <td class="right">{currency(row.UnitCost)}</td>
+                <td class="right">{row.Qty or ""}</td>
+                <td class="right">{currency(row.LineAmount)}</td>
+            </tr>
+            """
+
+        content = search_form + f"""
+        <div class="grid kpis">
+            <div class="card kpi">
+                <div class="label">PO Number</div>
+                <div class="value" style="font-size:22px;">{header.PONumber}</div>
+                <div class="trend">{header.POStatus or ""}</div>
+            </div>
+            <div class="card kpi">
+                <div class="label">Original Amount</div>
+                <div class="value">{currency(totals.OriginalAmount)}</div>
+                <div class="trend">Original issued value</div>
+            </div>
+            <div class="card kpi">
+                <div class="label">Revised Amount</div>
+                <div class="value">{currency(totals.RevisedAmount)}</div>
+                <div class="trend">Current approved value</div>
+            </div>
+            <div class="card kpi">
+                <div class="label">Line Item Total</div>
+                <div class="value">{currency(totals.TotalLineAmount)}</div>
+                <div class="trend">{totals.LineCount} line item(s)</div>
+            </div>
+            <div class="card kpi">
+                <div class="label">Remaining</div>
+                <div class="value">{currency(totals.RemainingAmount)}</div>
+                <div class="trend">Current PO balance</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>PO Header</h3>
+            <table>
+                <tr><th>Vendor</th><td>{header.VendorName or ""}</td></tr>
+                <tr><th>Project</th><td>{header.ProjectName or ""}</td></tr>
+                <tr><th>Department</th><td>{header.Department or ""}</td></tr>
+                <tr><th>PO Date</th><td>{header.PODate or ""}</td></tr>
+                <tr><th>Status</th><td>{header.POStatus or ""}</td></tr>
+                <tr><th>Requestor</th><td>{header.Requestor or ""}</td></tr>
+            </table>
+        </div>
+
+        <div class="card">
+            <h3>Line Items</h3>
+            <p class="card-subtitle">Issued PO line items imported from the upload document.</p>
+            <div class="table-wrap">
+                <table>
+                    <tr>
+                        <th>Description</th>
+                        <th>Unit</th>
+                        <th class="right">Unit Cost</th>
+                        <th class="right">Qty</th>
+                        <th class="right">Line Amount</th>
+                    </tr>
+                    {line_rows}
+                </table>
+            </div>
+        </div>
+        """
+
+        return shell(
+            title="PO Detail",
+            subtitle=f"Line item detail for PO {po_number}.",
+            active="PO Detail",
+            content=content,
+        )
+
+    except Exception as e:
+        content = search_form + f"""
+        <div class="notice error">
+            Error loading PO detail: {str(e)}
+        </div>
+        """
+
+        return shell(
+            title="PO Detail",
+            subtitle="Unable to load PO detail.",
+            active="PO Detail",
+            content=content,
+        ), 500
 @app.route("/import-history")
 def import_history():
     try:
