@@ -1943,96 +1943,150 @@ def purchase_request():
     content = f"""
     {message_html}
 
-    <div class="grid two">
-        <div class="card">
-            <h3>Request Details</h3>
-            <p class="card-subtitle">Complete the fields below. Required fields are marked with an asterisk.</p>
-
-            <form method="post" action="/purchase-request">
-                <div class="form-grid">
-                    <div class="form-field full">
-                        <label>Request Title *</label>
-                        <input type="text" name="request_title" placeholder="Example: Dive equipment rental for project 26-204" required>
-                    </div>
-                    <div class="form-field"><label>Project</label><input type="text" name="project_name" placeholder="Project name or number"></div>
-                    <div class="form-field">
-                        <label>Department</label>
-                        <select name="department" required>
-                            <option value="">Select department</option>
-                            <option value="Engineering">Engineering</option>
-                            <option value="Marine Construction">Marine Construction</option>
-                            <option value="Commercial Diving">Commercial Diving</option>
-                            <option value="Dredging">Dredging</option>
-                            <option value="Marine Services">Marine Services</option>
-                        </select>
-                    </div>
-                    <div class="form-field"><label>Vendor</label><input type="text" name="vendor_name" placeholder="Vendor or supplier name"></div>
-                    <div class="form-field"><label>Estimated Amount</label><input type="number" name="estimated_amount" step="0.01" min="0" placeholder="0.00"></div>
-                    <div class="form-field"><label>Estimated Purchase Date</label><input type="date" name="estimated_purchase_date"></div>
-                    <div class="form-field"><label>Needed By Date</label><input type="date" name="needed_by_date"></div>
-                    <div class="form-field">
-                        <label>Priority</label>
-                        <select name="priority">
-                            <option value="Normal">Normal</option><option value="Low">Low</option><option value="High">High</option><option value="Urgent">Urgent</option><option value="Critical">Critical</option>
-                        </select>
-                    </div>
-                    <div class="form-field"><label>Requested By</label><input type="text" name="requested_by" value="{h(display_name)}"></div>
-                    <div class="form-field full"><label>Description *</label><textarea name="request_description" placeholder="Describe what is needed." required></textarea></div>
-                    <div class="form-field full"><label>Business Justification</label><textarea name="business_justification" placeholder="Why is this needed? Include project impact, urgency, or operational reason."></textarea></div>
-                    <div class="form-field">
-                        <label>Payment Type</label>
-                        <select name="payment_type"><option value="Single Payment">Single Payment</option><option value="Split Payment">Split Payment</option><option value="Progress Payment">Progress Payment</option></select>
-                    </div>
-                    <div class="form-field">
-                        <label>Quote / Backup File Name</label>
-                        <input type="text" name="quote_backup" placeholder="Example: vendor_quote.pdf">
-                        <p class="field-help">File upload will be added later. For now, enter the backup file name or note.</p>
-                    </div>
-                    <div class="form-field full">
-                        <label>Selected Issued PO Items</label>
-                        <div class="issued-items-box"><div class="empty-issued-items">Future phase: after project/vendor selection, matching issued PO line items can appear here for selection.</div></div>
-                        <textarea name="selected_issued_items" placeholder="Optional: list any existing PO items this request relates to."></textarea>
-                    </div>
-                    <div class="form-field full">
-                        <label>Other Items</label>
-                        <div class="other-items-header"><span>Description</span><span>Qty</span><span>Unit Cost</span><span>Total</span></div>
-                        <div class="other-items-box"><div class="other-item-row"><input type="text" name="other_item_description" placeholder="Item description"><input type="number" name="other_item_qty" min="0" step="1" placeholder="1"><input type="number" name="other_item_unit_cost" min="0" step="0.01" placeholder="0.00"><input type="text" placeholder="Auto later" disabled></div></div>
-                        <textarea name="other_items" placeholder="Optional: summarize additional requested items."></textarea>
+    <form method="post" action="/purchase-request">
+        <div class="grid two">
+            <div>
+                <div class="card">
+                    <h3>Request Basics</h3>
+                    <p class="card-subtitle">Start with a clear request name and short scope. These details help reviewers understand what is needed.</p>
+                    <div class="form-grid">
+                        <div class="form-field full">
+                            <label>What are you requesting? *</label>
+                            <input type="text" name="request_title" placeholder="Example: Pump rental extension for Round Valley" required>
+                        </div>
+                        <div class="form-field full">
+                            <label>Description / Scope *</label>
+                            <textarea name="request_description" placeholder="Example: Extend pump rental for two additional weeks due to schedule delay." required></textarea>
+                        </div>
                     </div>
                 </div>
-                <div class="request-actions"><a class="button" href="/my-dashboard">Cancel</a><button class="primary" type="submit">Submit Purchase Request</button></div>
-            </form>
-        </div>
 
-        <div>
-            <div class="card role-card">
-                <h3>Requester Profile</h3>
-                <p class="card-subtitle">This is pulled from Microsoft login and dashboard role access.</p>
-                <div class="role-meta"><span><strong>User:</strong> {h(display_name)}</span><span><strong>Role:</strong> {h(role)}</span><span><strong>Email:</strong> {h(user["email"])}</span></div>
-            </div>
-            <div class="card">
-                <h3>Approval Route Preview</h3>
-                <p class="card-subtitle">Initial routing rules. We can make this smarter after the workflow is tested.</p>
-                <div class="workflow">
-                    <div class="workflow-step done"><div class="workflow-circle">1</div><div class="workflow-text"><strong>Request Submitted</strong><span>User submits request and backup details.</span></div></div>
-                    <div class="workflow-line"></div>
-                    <div class="workflow-step active"><div class="workflow-circle">2</div><div class="workflow-text"><strong>Admin / Accounting Review</strong><span>Validate project, vendor, amount, quote, and need.</span></div></div>
-                    <div class="workflow-line"></div>
-                    <div class="workflow-step warning"><div class="workflow-circle">3</div><div class="workflow-text"><strong>Approval Decision</strong><span>Approve, reject, or request more information.</span></div></div>
-                    <div class="workflow-line"></div>
-                    <div class="workflow-step future"><div class="workflow-circle">4</div><div class="workflow-text"><strong>PO Issued</strong><span>Approved request can later be converted into a PO.</span></div></div>
+                <div class="card">
+                    <h3>Project Details</h3>
+                    <p class="card-subtitle">Tell us which project and department this request belongs to.</p>
+                    <div class="form-grid">
+                        <div class="form-field">
+                            <label>Project *</label>
+                            <input type="text" name="project_name" placeholder="Project name or number" required>
+                        </div>
+                        <div class="form-field">
+                            <label>Department *</label>
+                            <select name="department" required>
+                                <option value="">Select department</option>
+                                <option value="Engineering">Engineering</option>
+                                <option value="Marine Construction">Marine Construction</option>
+                                <option value="Commercial Diving">Commercial Diving</option>
+                                <option value="Dredging">Dredging</option>
+                                <option value="Marine Services">Marine Services</option>
+                            </select>
+                        </div>
+                        <div class="form-field">
+                            <label>Needed By *</label>
+                            <input type="date" name="needed_by_date" required>
+                        </div>
+                        <div class="form-field">
+                            <label>Requested By</label>
+                            <input type="text" name="requested_by" value="{h(display_name)}" readonly>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>Vendor & Cost</h3>
+                    <p class="card-subtitle">Vendor can be left blank if the requester does not know it yet. Estimated cost is required for review routing.</p>
+                    <div class="form-grid">
+                        <div class="form-field">
+                            <label>Vendor</label>
+                            <input type="text" name="vendor_name" placeholder="United Rentals, Grainger, Home Depot, or leave blank if unknown">
+                        </div>
+                        <div class="form-field">
+                            <label>Estimated Cost *</label>
+                            <input type="number" name="estimated_amount" step="0.01" min="0" placeholder="8500" required>
+                        </div>
+                        <div class="form-field">
+                            <label>Priority</label>
+                            <select name="priority">
+                                <option value="Normal">Normal</option>
+                                <option value="Low">Low</option>
+                                <option value="High">High</option>
+                                <option value="Urgent">Urgent</option>
+                                <option value="Critical">Critical</option>
+                            </select>
+                        </div>
+                        <div class="form-field">
+                            <label>Quote / Backup Reference</label>
+                            <input type="text" name="quote_backup" placeholder="Quote #12345, vendor email, or file name">
+                            <p class="field-help">Actual file upload can be added later with Egnyte or Azure Blob Storage.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>Review & Submit</h3>
+                    <p class="card-subtitle">Your request will be saved and routed for review. Accounting or management may update the status or request more information.</p>
+                    <div class="match-summary">
+                        <strong>Required field checklist</strong>
+                        <span>• What are you requesting?</span>
+                        <span>• Description / Scope</span>
+                        <span>• Project</span>
+                        <span>• Department</span>
+                        <span>• Needed By</span>
+                        <span>• Estimated Cost</span>
+                    </div>
+                    <div class="request-actions">
+                        <a class="button" href="/my-dashboard">Cancel</a>
+                        <button class="primary" type="submit">Submit Purchase Request</button>
+                    </div>
                 </div>
             </div>
-            <div class="card">
-                <h3>Readiness Checks</h3>
-                <div class="match-summary"><strong>Before submitting, confirm:</strong><span>• Project and vendor are correct.</span><span>• Estimated amount is realistic.</span><span>• Needed-by date supports the project schedule.</span><span>• Quote / backup is available or noted.</span></div>
-            </div>
-            <div class="card">
-                <h3>What Happens Next?</h3>
-                <table><tr><th>Step</th><th>Status</th></tr><tr><td>Request submitted</td><td><span class="badge green">This page</span></td></tr><tr><td>Review queue</td><td><span class="badge amber">/purchase-requests</span></td></tr><tr><td>Approval decision</td><td><span class="badge blue">Reviewer action</span></td></tr><tr><td>PO conversion</td><td><span class="badge blue">Future workflow</span></td></tr></table>
+
+            <div>
+                <div class="card role-card">
+                    <h3>Requester</h3>
+                    <p class="card-subtitle">Pulled from Microsoft login and dashboard role access.</p>
+                    <div class="role-meta">
+                        <span><strong>User:</strong> {h(display_name)}</span>
+                        <span><strong>Role:</strong> {h(role)}</span>
+                        <span><strong>Email:</strong> {h(user["email"])}</span>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>Estimated Approval Route</h3>
+                    <p class="card-subtitle">Routing can become more detailed later based on dollar amount, department, and project.</p>
+                    <div class="workflow">
+                        <div class="workflow-step done"><div class="workflow-circle">1</div><div class="workflow-text"><strong>Submitted</strong><span>Request is created by the requester.</span></div></div>
+                        <div class="workflow-line"></div>
+                        <div class="workflow-step active"><div class="workflow-circle">2</div><div class="workflow-text"><strong>Review</strong><span>Accounting, Admin, or management validates the request.</span></div></div>
+                        <div class="workflow-line"></div>
+                        <div class="workflow-step warning"><div class="workflow-circle">3</div><div class="workflow-text"><strong>Decision</strong><span>Approve, reject, or request more information.</span></div></div>
+                        <div class="workflow-line"></div>
+                        <div class="workflow-step future"><div class="workflow-circle">4</div><div class="workflow-text"><strong>PO Follow-Up</strong><span>Approved requests can later be converted to a PO.</span></div></div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3>Cost Guidance</h3>
+                    <table>
+                        <tr><th>Estimated Cost</th><th>Likely Review</th></tr>
+                        <tr><td>Under $500</td><td><span class="badge green">Quick review</span></td></tr>
+                        <tr><td>$500 - $3,000</td><td><span class="badge blue">PM / Accounting</span></td></tr>
+                        <tr><td>$3,000 - $10,000</td><td><span class="badge amber">PM + Accounting</span></td></tr>
+                        <tr><td>Over $10,000</td><td><span class="badge purple">Executive likely</span></td></tr>
+                    </table>
+                </div>
+
+                <div class="card">
+                    <h3>Helpful Tips</h3>
+                    <div class="summary-list">
+                        <div class="summary-item"><span>Use a specific request name.</span></div>
+                        <div class="summary-item"><span>Add vendor info when known, but do not delay the request if unknown.</span></div>
+                        <div class="summary-item"><span>Use the quote field to reference backup, email approvals, or vendor quote numbers.</span></div>
+                    </div>
+                </div>
             </div>
         </div>
-    </div>
+    </form>
     """
 
     return shell("New Purchase Request", "Submit a new purchase request for review before a PO is issued.", "New Purchase Request", content)
