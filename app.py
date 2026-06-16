@@ -3418,6 +3418,25 @@ def missing_po_review():
         return access_denied_response("Missing PO Review", reason)
     return redirect("/exceptions")
 
+@app.route("/download-issued-po-template.csv")
+def download_issued_po_template():
+    allowed, reason = require_page_access("Upload Issued POs")
+    if not allowed:
+        return access_denied_response("Upload Issued POs", reason)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(REQUIRED_PO_COLUMNS)
+
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": "attachment; filename=issued_po_upload_template.csv"
+        },
+    )
+
+
 @app.route("/upload-po", methods=["GET", "POST"])
 def upload_po():
     allowed, reason = require_page_access("Upload Issued POs")
@@ -3455,7 +3474,22 @@ def upload_po():
 
     content = f"""
     {message_html}{result_html}{errors_html}
-    <div class="card"><h3>Select Issued PO File</h3><p class="card-subtitle">Upload the cleaned issued PO template as .xlsx or .csv.</p><form method="post" enctype="multipart/form-data"><p><input type="file" name="po_file" accept=".xlsx,.csv" required></p><p><button class="primary" type="submit">Upload Issued POs</button></p></form></div>
+    <div class="grid two">
+        <div class="card">
+            <h3>Select Issued PO File</h3>
+            <p class="card-subtitle">Upload the cleaned issued PO template as .xlsx or .csv.</p>
+            <form method="post" enctype="multipart/form-data">
+                <p><input type="file" name="po_file" accept=".xlsx,.csv" required></p>
+                <p><button class="primary" type="submit">Upload Issued POs</button></p>
+            </form>
+        </div>
+        <div class="card">
+            <h3>CSV Template</h3>
+            <p class="card-subtitle">Download a blank CSV with the required upload headers.</p>
+            <p><a class="button primary" href="/download-issued-po-template.csv">Download CSV Template</a></p>
+            <p class="field-help">Use this template when preparing issued PO uploads from Excel or ERP exports.</p>
+        </div>
+    </div>
     <div class="card"><h3>Expected Columns</h3><p class="card-subtitle">The upload must include these exact headers.</p><code>{h(", ".join(REQUIRED_PO_COLUMNS))}</code></div>
     """
 
