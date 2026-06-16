@@ -9,7 +9,6 @@ from decimal import Decimal, InvalidOperation
 from flask import Flask, render_template_string, jsonify, request
 
 
-# Add local package path for Azure App Service deployments
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PACKAGES_DIR = os.path.join(BASE_DIR, ".python_packages", "lib", "site-packages")
 
@@ -19,18 +18,14 @@ if os.path.isdir(PACKAGES_DIR):
 
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10 MB upload limit
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 
 
-# Azure App Settings
 APP_ENVIRONMENT = os.getenv("APP_ENVIRONMENT", "Not set")
 SQL_SERVER_NAME = os.getenv("SQL_SERVER_NAME", "Not set")
 SQL_DATABASE_NAME = os.getenv("SQL_DATABASE_NAME", "Not set")
 ALLOWED_EMAIL_DOMAIN = os.getenv("ALLOWED_EMAIL_DOMAIN", "Not set")
 
-
-# Prefer the App Setting version first.
-# This should be set in Azure App Service as an App Setting named PODASHBOARD_SQL.
 SQL_CONNECTION = (
     os.getenv("PODASHBOARD_SQL")
     or os.getenv("SQLAZURECONNSTR_PODASHBOARD_SQL")
@@ -75,13 +70,8 @@ def get_sql_connection():
 def clean_text(value):
     if value is None:
         return None
-
     value = str(value).strip()
-
-    if value == "":
-        return None
-
-    return value
+    return value if value else None
 
 
 def clean_decimal(value):
@@ -119,14 +109,7 @@ def clean_date(value):
     if value == "":
         return None
 
-    formats = [
-        "%Y-%m-%d",
-        "%m/%d/%Y",
-        "%m/%d/%y",
-        "%Y/%m/%d",
-    ]
-
-    for fmt in formats:
+    for fmt in ["%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y", "%Y/%m/%d"]:
         try:
             return datetime.strptime(value, fmt).date()
         except ValueError:
@@ -138,8 +121,14 @@ def clean_date(value):
 def normalize_header(header):
     if header is None:
         return ""
-
     return str(header).strip()
+
+
+def currency(value):
+    try:
+        return "${:,.2f}".format(float(value or 0))
+    except Exception:
+        return "$0.00"
 
 
 def read_uploaded_po_file(uploaded_file):
@@ -161,10 +150,7 @@ def read_uploaded_po_file(uploaded_file):
         workbook = load_workbook(uploaded_file, data_only=True)
         sheet = workbook.active
 
-        headers = []
-        for cell in sheet[1]:
-            headers.append(normalize_header(cell.value))
-
+        headers = [normalize_header(cell.value) for cell in sheet[1]]
         rows = []
 
         for row in sheet.iter_rows(min_row=2, values_only=True):
@@ -217,10 +203,7 @@ def validate_po_rows(rows):
 
 
 def get_or_create_vendor(cursor, vendor_name):
-    cursor.execute(
-        "SELECT VendorId FROM dbo.Vendors WHERE VendorName = ?",
-        vendor_name,
-    )
+    cursor.execute("SELECT VendorId FROM dbo.Vendors WHERE VendorName = ?", vendor_name)
     row = cursor.fetchone()
 
     if row:
@@ -239,10 +222,7 @@ def get_or_create_vendor(cursor, vendor_name):
 
 
 def get_or_create_project(cursor, project_name, department):
-    cursor.execute(
-        "SELECT ProjectId FROM dbo.Projects WHERE ProjectName = ?",
-        project_name,
-    )
+    cursor.execute("SELECT ProjectId FROM dbo.Projects WHERE ProjectName = ?", project_name)
     row = cursor.fetchone()
 
     if row:
@@ -380,17 +360,12 @@ def import_po_rows(rows, filename):
         success_count = 0
         error_count = 0
 
-        # Remove prior line rows for POs included in this upload.
-        # This lets a re-upload replace the current line-item detail for those POs.
         po_numbers = sorted(
             set(clean_text(row.get("PONumber")) for row in rows if clean_text(row.get("PONumber")))
         )
 
         for po_number in po_numbers:
-            cursor.execute(
-                "DELETE FROM dbo.IssuedPOLines WHERE PONumber = ?",
-                po_number,
-            )
+            cursor.execute("DELETE FROM dbo.IssuedPOLines WHERE PONumber = ?", po_number)
 
         for index, row in enumerate(rows, start=2):
             try:
@@ -528,289 +503,430 @@ def import_po_rows(rows, filename):
         conn.close()
 
 
-BASE_PAGE_STYLE = """
+def load_summary_data():
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        WITH UniquePOs AS (
+            SELECT
+                PONumber,
+                MAX(VendorName) AS VendorName,
+                MAX(ProjectName) AS ProjectName,
+                MAX(POStatus) AS POStatus,
+                MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
+                MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
+            FROM dbo.IssuedPOLines
+            GROUP BY PONumber
+        ),
+        LineTotals AS (
+            SELECT SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount
+            FROM dbo.IssuedPOLines
+        )
+        SELECT
+            COUNT(*) AS TotalPOs,
+            SUM(CASE WHEN UPPER(COALESCE(POStatus, '')) = 'OPEN' THEN 1 ELSE 0 END) AS OpenPOs,
+            SUM(POValue) AS TotalPOValue,
+            (SELECT TotalLineAmount FROM LineTotals) AS TotalLineAmount,
+            SUM(RemainingAmount) AS TotalRemainingAmount
+        FROM UniquePOs;
+        """
+    )
+    row = cursor.fetchone()
+
+    overall = {
+        "total_pos": row.TotalPOs or 0,
+        "open_pos": row.OpenPOs or 0,
+        "total_po_value": float(row.TotalPOValue or 0),
+        "total_line_amount": float(row.TotalLineAmount or 0),
+        "total_remaining_amount": float(row.TotalRemainingAmount or 0),
+    }
+
+    cursor.execute(
+        """
+        WITH UniquePOs AS (
+            SELECT
+                PONumber,
+                MAX(VendorName) AS VendorName,
+                MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
+                MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
+            FROM dbo.IssuedPOLines
+            GROUP BY PONumber
+        ),
+        VendorLines AS (
+            SELECT VendorName, SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount
+            FROM dbo.IssuedPOLines
+            GROUP BY VendorName
+        )
+        SELECT
+            u.VendorName,
+            COUNT(*) AS POCount,
+            SUM(u.POValue) AS TotalPOValue,
+            COALESCE(MAX(v.TotalLineAmount), 0) AS TotalLineAmount,
+            SUM(u.RemainingAmount) AS TotalRemainingAmount
+        FROM UniquePOs u
+        LEFT JOIN VendorLines v ON u.VendorName = v.VendorName
+        GROUP BY u.VendorName
+        ORDER BY TotalPOValue DESC;
+        """
+    )
+    vendors = cursor.fetchall()
+
+    cursor.execute(
+        """
+        WITH UniquePOs AS (
+            SELECT
+                PONumber,
+                MAX(ProjectName) AS ProjectName,
+                MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
+                MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
+            FROM dbo.IssuedPOLines
+            GROUP BY PONumber
+        ),
+        ProjectLines AS (
+            SELECT ProjectName, SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount
+            FROM dbo.IssuedPOLines
+            GROUP BY ProjectName
+        )
+        SELECT
+            u.ProjectName,
+            COUNT(*) AS POCount,
+            SUM(u.POValue) AS TotalPOValue,
+            COALESCE(MAX(p.TotalLineAmount), 0) AS TotalLineAmount,
+            SUM(u.RemainingAmount) AS TotalRemainingAmount
+        FROM UniquePOs u
+        LEFT JOIN ProjectLines p ON u.ProjectName = p.ProjectName
+        GROUP BY u.ProjectName
+        ORDER BY TotalPOValue DESC;
+        """
+    )
+    projects = cursor.fetchall()
+
+    cursor.execute(
+        """
+        SELECT TOP 10
+            ImportBatchId,
+            FileName,
+            UploadedAt,
+            TotalRows,
+            SuccessCount,
+            ErrorCount,
+            ImportStatus
+        FROM dbo.ImportBatches
+        ORDER BY UploadedAt DESC;
+        """
+    )
+    imports = cursor.fetchall()
+
+    conn.close()
+
+    return overall, vendors, projects, imports
+
+
+BRANDED_STYLE = """
 <style>
-    body {
-        font-family: Arial, sans-serif;
-        margin: 40px;
-        background: #f5f7fa;
-        color: #222;
-    }
-    .card {
-        background: white;
-        border-radius: 10px;
-        padding: 24px;
-        margin-bottom: 20px;
-        box-shadow: 0 2px 10px rgba(0,0,0,0.08);
-    }
-    .status {
-        padding: 8px 12px;
-        border-radius: 6px;
-        display: inline-block;
-        font-weight: bold;
-    }
-    .ok {
-        background: #d4edda;
-        color: #155724;
-    }
-    .warn {
-        background: #fff3cd;
-        color: #856404;
-    }
-    .error {
-        background: #f8d7da;
-        color: #721c24;
-    }
-    code {
-        background: #f0f0f0;
-        padding: 2px 5px;
-        border-radius: 4px;
-    }
-    ul {
-        line-height: 1.6;
-    }
-    input[type=file] {
-        padding: 10px;
-        border: 1px solid #ddd;
-        border-radius: 6px;
-        background: #fff;
-    }
-    button {
-        background: #1f6feb;
-        color: white;
-        border: none;
-        padding: 10px 16px;
-        border-radius: 6px;
-        font-weight: bold;
-        cursor: pointer;
-    }
-    button:hover {
-        background: #174ea6;
-    }
-    table {
-        width: 100%;
-        border-collapse: collapse;
-        margin-top: 12px;
-    }
-    th, td {
-        border-bottom: 1px solid #ddd;
-        padding: 8px;
-        text-align: left;
-    }
+:root {
+  --navy: #061b36;
+  --blue: #2563eb;
+  --green: #16a34a;
+  --amber: #f59e0b;
+  --red: #dc2626;
+  --bg: #f5f7fb;
+  --card: #ffffff;
+  --text: #0f172a;
+  --muted: #64748b;
+  --line: #e2e8f0;
+  --shadow: 0 14px 30px rgba(15, 23, 42, 0.08);
+  --radius: 16px;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+.sidebar {
+  width: 270px;
+  background: linear-gradient(180deg, var(--navy), #020617);
+  color: white;
+  padding: 24px 16px;
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+}
+.brand {
+  display:flex;
+  gap:12px;
+  align-items:center;
+  margin-bottom:28px;
+  padding:0 8px;
+}
+.logo {
+  width:42px;
+  height:42px;
+  border-radius:12px;
+  display:grid;
+  place-items:center;
+  background: linear-gradient(135deg, #38bdf8, #2563eb);
+  font-weight:900;
+}
+.brand h1 { font-size:18px; line-height:1; margin:0 0 5px; }
+.brand p { margin:0; font-size:12px; color:#bfdbfe; }
+.nav-item {
+  display:flex;
+  gap:12px;
+  align-items:center;
+  color:#e2e8f0;
+  text-decoration:none;
+  padding:13px 14px;
+  border-radius:11px;
+  margin:4px 0;
+  font-size:14px;
+}
+.nav-item:hover { background: rgba(255,255,255,.09); }
+.nav-item.active {
+  background: linear-gradient(135deg, #2563eb, #1d4ed8);
+  color:white;
+  box-shadow: 0 10px 18px rgba(37,99,235,.25);
+}
+.sync-card {
+  position:absolute;
+  left:16px;
+  right:16px;
+  bottom:24px;
+  background:rgba(37,99,235,.16);
+  border:1px solid rgba(191,219,254,.15);
+  border-radius:16px;
+  padding:15px;
+}
+.status-dot {
+  width:9px;
+  height:9px;
+  border-radius:99px;
+  background:#22c55e;
+  display:inline-block;
+  margin-right:8px;
+  box-shadow:0 0 0 5px rgba(34,197,94,.12);
+}
+.main {
+  margin-left:270px;
+  padding:26px;
+}
+.topbar {
+  display:flex;
+  justify-content:space-between;
+  gap:20px;
+  align-items:flex-start;
+  margin-bottom:20px;
+}
+.topbar h2 {
+  margin:0;
+  font-size:28px;
+  letter-spacing:-.04em;
+}
+.topbar p {
+  margin:8px 0 0;
+  color:var(--muted);
+}
+.top-actions {
+  display:flex;
+  gap:12px;
+  align-items:center;
+  color:var(--muted);
+  font-size:13px;
+}
+.button, button {
+  border:1px solid var(--line);
+  background:white;
+  border-radius:12px;
+  padding:10px 14px;
+  cursor:pointer;
+  font-weight:700;
+  text-decoration:none;
+  color:var(--text);
+  display:inline-block;
+}
+.primary {
+  background: var(--blue);
+  color:white;
+  border-color:var(--blue);
+}
+.grid {
+  display:grid;
+  gap:16px;
+}
+.kpis {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+.two {
+  grid-template-columns: 1fr 1fr;
+}
+.card {
+  background:var(--card);
+  border:1px solid var(--line);
+  border-radius:var(--radius);
+  box-shadow:var(--shadow);
+  padding:18px;
+  overflow:hidden;
+  margin-bottom:16px;
+}
+.card h3 {
+  margin:0 0 15px;
+  font-size:16px;
+  letter-spacing:-.02em;
+}
+.card-subtitle {
+  margin:-8px 0 15px;
+  color:var(--muted);
+  font-size:13px;
+}
+.kpi {
+  position:relative;
+  min-height:125px;
+}
+.kpi .label {
+  color:var(--muted);
+  font-size:12px;
+  font-weight:700;
+}
+.kpi .value {
+  margin:9px 0 4px;
+  font-size:25px;
+  font-weight:900;
+  letter-spacing:-.04em;
+}
+.kpi .trend {
+  font-size:12px;
+  color:var(--muted);
+}
+.badge {
+  border-radius:999px;
+  font-size:11px;
+  font-weight:800;
+  padding:4px 8px;
+  display:inline-flex;
+  align-items:center;
+}
+.badge.green { background:#dcfce7; color:#166534; }
+.badge.blue { background:#dbeafe; color:#1e40af; }
+.badge.amber { background:#fef3c7; color:#92400e; }
+.badge.red { background:#fee2e2; color:#991b1b; }
+.table-wrap {
+  max-height:560px;
+  overflow:auto;
+  border:1px solid var(--line);
+  border-radius:14px;
+}
+table {
+  width:100%;
+  border-collapse:collapse;
+  font-size:13px;
+}
+th, td {
+  text-align:left;
+  border-bottom:1px solid var(--line);
+  padding:10px 8px;
+  vertical-align:top;
+}
+th {
+  color:var(--muted);
+  font-size:11px;
+  text-transform:uppercase;
+  letter-spacing:.04em;
+  background:white;
+}
+.right { text-align:right; }
+input[type=file] {
+  padding:12px;
+  border:1px solid var(--line);
+  border-radius:12px;
+  background:white;
+  width:100%;
+  max-width:520px;
+}
+.notice {
+  padding:13px 15px;
+  border-radius:13px;
+  font-weight:700;
+  margin-bottom:16px;
+}
+.notice.ok { background:#dcfce7; color:#166534; }
+.notice.error { background:#fee2e2; color:#991b1b; }
+code {
+  background:#f1f5f9;
+  padding:8px 10px;
+  display:block;
+  border-radius:12px;
+  white-space:normal;
+}
+@media (max-width: 1000px) {
+  .sidebar { position:relative; width:100%; bottom:auto; }
+  .sync-card { position:relative; left:auto; right:auto; bottom:auto; margin-top:20px; }
+  .main { margin-left:0; }
+  .kpis, .two { grid-template-columns: 1fr; }
+}
 </style>
 """
 
 
-HOME_PAGE = """
+def shell(title, subtitle, active, content):
+    nav_items = [
+        ("Dashboard", "/", "📊"),
+        ("PO Summary", "/po-summary", "📋"),
+        ("Upload Issued POs", "/upload-po", "⬆️"),
+        ("Health", "/health", "🟢"),
+        ("DB Test", "/db-test", "🧪"),
+    ]
+
+    nav_html = ""
+    for label, href, icon in nav_items:
+        active_class = " active" if active == label else ""
+        nav_html += f'<a class="nav-item{active_class}" href="{href}"><span>{icon}</span>{label}</a>'
+
+    return f"""
 <!DOCTYPE html>
 <html>
 <head>
-    <title>PO Dashboard</title>
-    """ + BASE_PAGE_STYLE + """
+    <title>{title}</title>
+    {BRANDED_STYLE}
 </head>
 <body>
-    <div class="card">
-        <h1>PO Dashboard</h1>
-        <p>Starter procurement dashboard app is running.</p>
-        <p>
-            <span class="status ok">App Online</span>
-        </p>
-        <p>
-            <a href="/upload-po">Upload Issued POs</a> |
-            <a href="/po-summary">PO Summary</a> |
-            <a href="/health">Health</a> |
-            <a href="/db-test">DB Test</a>
-        </p>
-    </div>
+    <aside class="sidebar">
+        <div class="brand">
+            <div class="logo">CE</div>
+            <div>
+                <h1>Coastal Engineering</h1>
+                <p>Procurement App</p>
+            </div>
+        </div>
+        <nav>{nav_html}</nav>
+        <div class="sync-card">
+            <div style="font-weight:800; font-size:13px; margin-bottom:10px;">Live Azure SQL</div>
+            <div><span class="status-dot"></span>Connected App</div>
+            <div style="margin-top:14px; color:#bfdbfe; font-size:12px;">
+                Environment<br>
+                <strong style="color:white;">{APP_ENVIRONMENT}</strong>
+            </div>
+        </div>
+    </aside>
 
-    <div class="card">
-        <h2>Azure App Settings</h2>
-        <p><strong>Environment:</strong> {{ app_environment }}</p>
-        <p><strong>SQL Server:</strong> {{ sql_server }}</p>
-        <p><strong>SQL Database:</strong> {{ sql_database }}</p>
-        <p><strong>Allowed Email Domain:</strong> {{ allowed_domain }}</p>
-        <p><strong>SQL Connection String Found:</strong> {{ sql_connection_found }}</p>
-    </div>
+    <main class="main">
+        <header class="topbar">
+            <div>
+                <h2>{title}</h2>
+                <p>{subtitle}</p>
+            </div>
+            <div class="top-actions">
+                <span>Database: {SQL_DATABASE_NAME}</span>
+            </div>
+        </header>
 
-    <div class="card">
-        <h2>Next Build Items</h2>
-        <ul>
-            <li>Issued PO upload</li>
-            <li>Import history</li>
-            <li>PO summary dashboard</li>
-            <li>Expense upload</li>
-            <li>Role-based access</li>
-        </ul>
-    </div>
-</body>
-</html>
-"""
-
-PO_SUMMARY_PAGE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>PO Summary</title>
-    """ + BASE_PAGE_STYLE + """
-</head>
-<body>
-    <div class="card">
-        <h1>PO Summary Dashboard</h1>
-        <p><a href="/">Back to Dashboard Home</a> | <a href="/upload-po">Upload Issued POs</a></p>
-    </div>
-
-    {% if error %}
-    <div class="card">
-        <p><span class="status error">Error loading PO summary: {{ error }}</span></p>
-    </div>
-    {% else %}
-
-    <div class="card">
-        <h2>Overall Summary</h2>
-        <table>
-            <tr><th>Total Unique POs</th><td>{{ overall.total_pos }}</td></tr>
-            <tr><th>Open POs</th><td>{{ overall.open_pos }}</td></tr>
-            <tr><th>Total PO Value</th><td>${{ "{:,.2f}".format(overall.total_po_value or 0) }}</td></tr>
-            <tr><th>Total Line Amount</th><td>${{ "{:,.2f}".format(overall.total_line_amount or 0) }}</td></tr>
-            <tr><th>Total Remaining Amount</th><td>${{ "{:,.2f}".format(overall.total_remaining_amount or 0) }}</td></tr>
-        </table>
-    </div>
-
-    <div class="card">
-        <h2>POs by Vendor</h2>
-        <table>
-            <tr>
-                <th>Vendor</th>
-                <th>PO Count</th>
-                <th>Total PO Value</th>
-                <th>Total Line Amount</th>
-                <th>Remaining Amount</th>
-            </tr>
-            {% for row in vendors %}
-            <tr>
-                <td>{{ row.VendorName }}</td>
-                <td>{{ row.POCount }}</td>
-                <td>${{ "{:,.2f}".format(row.TotalPOValue or 0) }}</td>
-                <td>${{ "{:,.2f}".format(row.TotalLineAmount or 0) }}</td>
-                <td>${{ "{:,.2f}".format(row.TotalRemainingAmount or 0) }}</td>
-            </tr>
-            {% endfor %}
-        </table>
-    </div>
-
-    <div class="card">
-        <h2>POs by Project</h2>
-        <table>
-            <tr>
-                <th>Project</th>
-                <th>PO Count</th>
-                <th>Total PO Value</th>
-                <th>Total Line Amount</th>
-                <th>Remaining Amount</th>
-            </tr>
-            {% for row in projects %}
-            <tr>
-                <td>{{ row.ProjectName }}</td>
-                <td>{{ row.POCount }}</td>
-                <td>${{ "{:,.2f}".format(row.TotalPOValue or 0) }}</td>
-                <td>${{ "{:,.2f}".format(row.TotalLineAmount or 0) }}</td>
-                <td>${{ "{:,.2f}".format(row.TotalRemainingAmount or 0) }}</td>
-            </tr>
-            {% endfor %}
-        </table>
-    </div>
-
-    <div class="card">
-        <h2>Recent Import Batches</h2>
-        <table>
-            <tr>
-                <th>Batch ID</th>
-                <th>File Name</th>
-                <th>Uploaded At</th>
-                <th>Total Rows</th>
-                <th>Success</th>
-                <th>Errors</th>
-                <th>Status</th>
-            </tr>
-            {% for row in imports %}
-            <tr>
-                <td>{{ row.ImportBatchId }}</td>
-                <td>{{ row.FileName }}</td>
-                <td>{{ row.UploadedAt }}</td>
-                <td>{{ row.TotalRows }}</td>
-                <td>{{ row.SuccessCount }}</td>
-                <td>{{ row.ErrorCount }}</td>
-                <td>{{ row.ImportStatus }}</td>
-            </tr>
-            {% endfor %}
-        </table>
-    </div>
-
-    {% endif %}
-</body>
-</html>
-"""
-UPLOAD_PO_PAGE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Upload Issued POs</title>
-    """ + BASE_PAGE_STYLE + """
-</head>
-<body>
-    <div class="card">
-        <h1>Upload Issued POs</h1>
-        <p>Upload the cleaned issued PO template as <strong>.xlsx</strong> or <strong>.csv</strong>.</p>
-        <p><a href="/">Back to Dashboard Home</a></p>
-    </div>
-
-    {% if message %}
-    <div class="card">
-        <p><span class="status {{ message_class }}">{{ message }}</span></p>
-    </div>
-    {% endif %}
-
-    {% if result %}
-    <div class="card">
-        <h2>Import Result</h2>
-        <table>
-            <tr><th>Import Batch ID</th><td>{{ result.import_batch_id }}</td></tr>
-            <tr><th>Total Rows</th><td>{{ result.total_rows }}</td></tr>
-            <tr><th>Success Count</th><td>{{ result.success_count }}</td></tr>
-            <tr><th>Error Count</th><td>{{ result.error_count }}</td></tr>
-            <tr><th>Status</th><td>{{ result.status }}</td></tr>
-        </table>
-    </div>
-    {% endif %}
-
-    {% if errors %}
-    <div class="card">
-        <h2>Validation Errors</h2>
-        <ul>
-            {% for error in errors %}
-            <li>{{ error }}</li>
-            {% endfor %}
-        </ul>
-    </div>
-    {% endif %}
-
-    <div class="card">
-        <h2>Select File</h2>
-        <form method="post" enctype="multipart/form-data">
-            <p>
-                <input type="file" name="po_file" accept=".xlsx,.csv" required>
-            </p>
-            <p>
-                <button type="submit">Upload Issued POs</button>
-            </p>
-        </form>
-    </div>
-
-    <div class="card">
-        <h2>Expected Columns</h2>
-        <p>The upload must include these exact headers:</p>
-        <code>{{ expected_columns }}</code>
-    </div>
+        {content}
+    </main>
 </body>
 </html>
 """
@@ -818,13 +934,283 @@ UPLOAD_PO_PAGE = """
 
 @app.route("/")
 def home():
-    return render_template_string(
-        HOME_PAGE,
-        app_environment=APP_ENVIRONMENT,
-        sql_server=SQL_SERVER_NAME,
-        sql_database=SQL_DATABASE_NAME,
-        allowed_domain=ALLOWED_EMAIL_DOMAIN,
-        sql_connection_found="Yes" if SQL_CONNECTION else "No",
+    content = f"""
+    <div class="grid kpis">
+        <div class="card kpi">
+            <div class="label">App Status</div>
+            <div class="value">Online</div>
+            <div class="trend"><span class="badge green">Running</span></div>
+        </div>
+        <div class="card kpi">
+            <div class="label">Environment</div>
+            <div class="value">{APP_ENVIRONMENT}</div>
+            <div class="trend">Azure App Service</div>
+        </div>
+        <div class="card kpi">
+            <div class="label">SQL Server</div>
+            <div class="value" style="font-size:17px;">Connected</div>
+            <div class="trend">{SQL_SERVER_NAME}</div>
+        </div>
+        <div class="card kpi">
+            <div class="label">SQL Database</div>
+            <div class="value" style="font-size:19px;">{SQL_DATABASE_NAME}</div>
+            <div class="trend">Live data source</div>
+        </div>
+        <div class="card kpi">
+            <div class="label">Connection String</div>
+            <div class="value">{"Yes" if SQL_CONNECTION else "No"}</div>
+            <div class="trend">PODASHBOARD_SQL</div>
+        </div>
+    </div>
+
+    <div class="grid two">
+        <div class="card">
+            <h3>Procurement Workflow</h3>
+            <p class="card-subtitle">Current completed workflow for issued purchase orders.</p>
+            <table>
+                <tr><th>Step</th><th>Status</th></tr>
+                <tr><td>Upload issued PO spreadsheet</td><td><span class="badge green">Working</span></td></tr>
+                <tr><td>Validate required columns</td><td><span class="badge green">Working</span></td></tr>
+                <tr><td>Write line items to Azure SQL</td><td><span class="badge green">Working</span></td></tr>
+                <tr><td>Summarize POs by vendor/project</td><td><span class="badge blue">Added</span></td></tr>
+                <tr><td>Expense upload</td><td><span class="badge amber">Next</span></td></tr>
+            </table>
+        </div>
+
+        <div class="card">
+            <h3>Quick Actions</h3>
+            <p><a class="button primary" href="/upload-po">Upload Issued POs</a></p>
+            <p><a class="button" href="/po-summary">View PO Summary</a></p>
+            <p><a class="button" href="/health">Health Check</a></p>
+            <p><a class="button" href="/db-test">Database Test</a></p>
+        </div>
+    </div>
+    """
+
+    return shell(
+        title="Dashboard",
+        subtitle="Live procurement dashboard connected to Azure SQL.",
+        active="Dashboard",
+        content=content,
+    )
+
+
+@app.route("/po-summary")
+def po_summary():
+    try:
+        overall, vendors, projects, imports = load_summary_data()
+
+        vendor_rows = ""
+        for row in vendors:
+            vendor_rows += f"""
+            <tr>
+                <td>{row.VendorName or ""}</td>
+                <td>{row.POCount}</td>
+                <td class="right">{currency(row.TotalPOValue)}</td>
+                <td class="right">{currency(row.TotalLineAmount)}</td>
+                <td class="right">{currency(row.TotalRemainingAmount)}</td>
+            </tr>
+            """
+
+        project_rows = ""
+        for row in projects:
+            project_rows += f"""
+            <tr>
+                <td>{row.ProjectName or ""}</td>
+                <td>{row.POCount}</td>
+                <td class="right">{currency(row.TotalPOValue)}</td>
+                <td class="right">{currency(row.TotalLineAmount)}</td>
+                <td class="right">{currency(row.TotalRemainingAmount)}</td>
+            </tr>
+            """
+
+        import_rows = ""
+        for row in imports:
+            import_rows += f"""
+            <tr>
+                <td>{row.ImportBatchId}</td>
+                <td>{row.FileName}</td>
+                <td>{row.UploadedAt}</td>
+                <td>{row.TotalRows}</td>
+                <td>{row.SuccessCount}</td>
+                <td>{row.ErrorCount}</td>
+                <td>{row.ImportStatus}</td>
+            </tr>
+            """
+
+        content = f"""
+        <div class="grid kpis">
+            <div class="card kpi">
+                <div class="label">Total Unique POs</div>
+                <div class="value">{overall["total_pos"]}</div>
+                <div class="trend">Grouped by PO number</div>
+            </div>
+            <div class="card kpi">
+                <div class="label">Open POs</div>
+                <div class="value">{overall["open_pos"]}</div>
+                <div class="trend">Status = Open</div>
+            </div>
+            <div class="card kpi">
+                <div class="label">Total PO Value</div>
+                <div class="value">{currency(overall["total_po_value"])}</div>
+                <div class="trend">Unique PO totals</div>
+            </div>
+            <div class="card kpi">
+                <div class="label">Line Item Total</div>
+                <div class="value">{currency(overall["total_line_amount"])}</div>
+                <div class="trend">Sum of line amounts</div>
+            </div>
+            <div class="card kpi">
+                <div class="label">Remaining</div>
+                <div class="value">{currency(overall["total_remaining_amount"])}</div>
+                <div class="trend">Unique PO remaining</div>
+            </div>
+        </div>
+
+        <div class="grid two">
+            <div class="card">
+                <h3>POs by Vendor</h3>
+                <p class="card-subtitle">Vendor-level committed value and remaining balance.</p>
+                <div class="table-wrap">
+                    <table>
+                        <tr>
+                            <th>Vendor</th>
+                            <th>PO Count</th>
+                            <th class="right">PO Value</th>
+                            <th class="right">Line Amount</th>
+                            <th class="right">Remaining</th>
+                        </tr>
+                        {vendor_rows}
+                    </table>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>POs by Project</h3>
+                <p class="card-subtitle">Project-level committed value and remaining balance.</p>
+                <div class="table-wrap">
+                    <table>
+                        <tr>
+                            <th>Project</th>
+                            <th>PO Count</th>
+                            <th class="right">PO Value</th>
+                            <th class="right">Line Amount</th>
+                            <th class="right">Remaining</th>
+                        </tr>
+                        {project_rows}
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>Recent Import Batches</h3>
+            <p class="card-subtitle">Latest PO upload activity.</p>
+            <div class="table-wrap">
+                <table>
+                    <tr>
+                        <th>Batch ID</th>
+                        <th>File Name</th>
+                        <th>Uploaded At</th>
+                        <th>Total Rows</th>
+                        <th>Success</th>
+                        <th>Errors</th>
+                        <th>Status</th>
+                    </tr>
+                    {import_rows}
+                </table>
+            </div>
+        </div>
+        """
+
+        return shell(
+            title="PO Summary",
+            subtitle="Live issued PO summary grouped by vendor, project, and import batch.",
+            active="PO Summary",
+            content=content,
+        )
+
+    except Exception as e:
+        content = f'<div class="notice error">Error loading PO summary: {str(e)}</div>'
+        return shell("PO Summary", "Unable to load summary.", "PO Summary", content), 500
+
+
+@app.route("/upload-po", methods=["GET", "POST"])
+def upload_po():
+    message_html = ""
+    result_html = ""
+    errors_html = ""
+
+    if request.method == "POST":
+        uploaded_file = request.files.get("po_file")
+
+        if not uploaded_file or uploaded_file.filename == "":
+            message_html = '<div class="notice error">No file selected.</div>'
+        else:
+            try:
+                rows = read_uploaded_po_file(uploaded_file)
+                validation_errors = validate_po_rows(rows)
+
+                if validation_errors:
+                    message_html = '<div class="notice error">The file could not be imported because validation errors were found.</div>'
+                    error_items = "".join(f"<li>{error}</li>" for error in validation_errors)
+                    errors_html = f"""
+                    <div class="card">
+                        <h3>Validation Errors</h3>
+                        <ul>{error_items}</ul>
+                    </div>
+                    """
+                else:
+                    result = import_po_rows(rows, uploaded_file.filename)
+                    message_html = '<div class="notice ok">Issued PO import completed.</div>'
+                    result_html = f"""
+                    <div class="card">
+                        <h3>Import Result</h3>
+                        <table>
+                            <tr><th>Import Batch ID</th><td>{result["import_batch_id"]}</td></tr>
+                            <tr><th>Total Rows</th><td>{result["total_rows"]}</td></tr>
+                            <tr><th>Success Count</th><td>{result["success_count"]}</td></tr>
+                            <tr><th>Error Count</th><td>{result["error_count"]}</td></tr>
+                            <tr><th>Status</th><td>{result["status"]}</td></tr>
+                        </table>
+                    </div>
+                    """
+
+            except Exception as e:
+                message_html = '<div class="notice error">Import failed.</div>'
+                errors_html = f"""
+                <div class="card">
+                    <h3>Error Details</h3>
+                    <p>{str(e)}</p>
+                </div>
+                """
+
+    content = f"""
+    {message_html}
+    {result_html}
+    {errors_html}
+
+    <div class="card">
+        <h3>Select Issued PO File</h3>
+        <p class="card-subtitle">Upload the cleaned issued PO template as .xlsx or .csv.</p>
+        <form method="post" enctype="multipart/form-data">
+            <p><input type="file" name="po_file" accept=".xlsx,.csv" required></p>
+            <p><button class="primary" type="submit">Upload Issued POs</button></p>
+        </form>
+    </div>
+
+    <div class="card">
+        <h3>Expected Columns</h3>
+        <p class="card-subtitle">The upload must include these exact headers.</p>
+        <code>{", ".join(REQUIRED_PO_COLUMNS)}</code>
+    </div>
+    """
+
+    return shell(
+        title="Upload Issued POs",
+        subtitle="Import issued purchase orders and line items into Azure SQL.",
+        active="Upload Issued POs",
+        content=content,
     )
 
 
@@ -840,149 +1226,7 @@ def health():
         }
     )
 
-@app.route("/po-summary")
-def po_summary():
-    try:
-        conn = get_sql_connection()
-        cursor = conn.cursor()
 
-        cursor.execute(
-            """
-            WITH UniquePOs AS (
-                SELECT
-                    PONumber,
-                    MAX(VendorName) AS VendorName,
-                    MAX(ProjectName) AS ProjectName,
-                    MAX(POStatus) AS POStatus,
-                    MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
-                    MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
-                FROM dbo.IssuedPOLines
-                GROUP BY PONumber
-            ),
-            LineTotals AS (
-                SELECT
-                    SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount
-                FROM dbo.IssuedPOLines
-            )
-            SELECT
-                COUNT(*) AS TotalPOs,
-                SUM(CASE WHEN UPPER(COALESCE(POStatus, '')) = 'OPEN' THEN 1 ELSE 0 END) AS OpenPOs,
-                SUM(POValue) AS TotalPOValue,
-                (SELECT TotalLineAmount FROM LineTotals) AS TotalLineAmount,
-                SUM(RemainingAmount) AS TotalRemainingAmount
-            FROM UniquePOs;
-            """
-        )
-        overall_row = cursor.fetchone()
-
-        overall = {
-            "total_pos": overall_row.TotalPOs or 0,
-            "open_pos": overall_row.OpenPOs or 0,
-            "total_po_value": float(overall_row.TotalPOValue or 0),
-            "total_line_amount": float(overall_row.TotalLineAmount or 0),
-            "total_remaining_amount": float(overall_row.TotalRemainingAmount or 0),
-        }
-
-        cursor.execute(
-            """
-            WITH UniquePOs AS (
-                SELECT
-                    PONumber,
-                    MAX(VendorName) AS VendorName,
-                    MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
-                    MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
-                FROM dbo.IssuedPOLines
-                GROUP BY PONumber
-            ),
-            VendorLines AS (
-                SELECT
-                    VendorName,
-                    SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount
-                FROM dbo.IssuedPOLines
-                GROUP BY VendorName
-            )
-            SELECT
-                u.VendorName,
-                COUNT(*) AS POCount,
-                SUM(u.POValue) AS TotalPOValue,
-                COALESCE(MAX(v.TotalLineAmount), 0) AS TotalLineAmount,
-                SUM(u.RemainingAmount) AS TotalRemainingAmount
-            FROM UniquePOs u
-            LEFT JOIN VendorLines v ON u.VendorName = v.VendorName
-            GROUP BY u.VendorName
-            ORDER BY TotalPOValue DESC;
-            """
-        )
-        vendors = cursor.fetchall()
-
-        cursor.execute(
-            """
-            WITH UniquePOs AS (
-                SELECT
-                    PONumber,
-                    MAX(ProjectName) AS ProjectName,
-                    MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
-                    MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
-                FROM dbo.IssuedPOLines
-                GROUP BY PONumber
-            ),
-            ProjectLines AS (
-                SELECT
-                    ProjectName,
-                    SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount
-                FROM dbo.IssuedPOLines
-                GROUP BY ProjectName
-            )
-            SELECT
-                u.ProjectName,
-                COUNT(*) AS POCount,
-                SUM(u.POValue) AS TotalPOValue,
-                COALESCE(MAX(p.TotalLineAmount), 0) AS TotalLineAmount,
-                SUM(u.RemainingAmount) AS TotalRemainingAmount
-            FROM UniquePOs u
-            LEFT JOIN ProjectLines p ON u.ProjectName = p.ProjectName
-            GROUP BY u.ProjectName
-            ORDER BY TotalPOValue DESC;
-            """
-        )
-        projects = cursor.fetchall()
-
-        cursor.execute(
-            """
-            SELECT TOP 10
-                ImportBatchId,
-                FileName,
-                UploadedAt,
-                TotalRows,
-                SuccessCount,
-                ErrorCount,
-                ImportStatus
-            FROM dbo.ImportBatches
-            ORDER BY UploadedAt DESC;
-            """
-        )
-        imports = cursor.fetchall()
-
-        conn.close()
-
-        return render_template_string(
-            PO_SUMMARY_PAGE,
-            overall=overall,
-            vendors=vendors,
-            projects=projects,
-            imports=imports,
-            error=None,
-        )
-
-    except Exception as e:
-        return render_template_string(
-            PO_SUMMARY_PAGE,
-            overall=None,
-            vendors=[],
-            projects=[],
-            imports=[],
-            error=str(e),
-        ), 500
 @app.route("/db-test")
 def db_test():
     if not SQL_CONNECTION:
@@ -1016,66 +1260,6 @@ def db_test():
                 "step": "connect_to_sql",
                 "message": str(e),
             }
-        ), 500
-
-
-@app.route("/upload-po", methods=["GET", "POST"])
-def upload_po():
-    if request.method == "GET":
-        return render_template_string(
-            UPLOAD_PO_PAGE,
-            message=None,
-            message_class=None,
-            result=None,
-            errors=None,
-            expected_columns=", ".join(REQUIRED_PO_COLUMNS),
-        )
-
-    uploaded_file = request.files.get("po_file")
-
-    if not uploaded_file or uploaded_file.filename == "":
-        return render_template_string(
-            UPLOAD_PO_PAGE,
-            message="No file selected.",
-            message_class="error",
-            result=None,
-            errors=None,
-            expected_columns=", ".join(REQUIRED_PO_COLUMNS),
-        )
-
-    try:
-        rows = read_uploaded_po_file(uploaded_file)
-        validation_errors = validate_po_rows(rows)
-
-        if validation_errors:
-            return render_template_string(
-                UPLOAD_PO_PAGE,
-                message="The file could not be imported because validation errors were found.",
-                message_class="error",
-                result=None,
-                errors=validation_errors,
-                expected_columns=", ".join(REQUIRED_PO_COLUMNS),
-            )
-
-        result = import_po_rows(rows, uploaded_file.filename)
-
-        return render_template_string(
-            UPLOAD_PO_PAGE,
-            message="Issued PO import completed.",
-            message_class="ok",
-            result=result,
-            errors=None,
-            expected_columns=", ".join(REQUIRED_PO_COLUMNS),
-        )
-
-    except Exception as e:
-        return render_template_string(
-            UPLOAD_PO_PAGE,
-            message="Import failed.",
-            message_class="error",
-            result=None,
-            errors=[str(e)],
-            expected_columns=", ".join(REQUIRED_PO_COLUMNS),
         ), 500
 
 
