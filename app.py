@@ -662,9 +662,24 @@ BRANDED_STYLE = """
 body {
   margin: 0;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: var(--bg);
+  background:
+    radial-gradient(circle at 15% 20%, rgba(56, 189, 248, 0.18), transparent 28%),
+    radial-gradient(circle at 85% 15%, rgba(37, 99, 235, 0.12), transparent 30%),
+    linear-gradient(180deg, #eef7ff 0%, #f5f7fb 44%, #eef6fb 100%);
   color: var(--text);
   min-height: 100vh;
+  position: relative;
+}
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: -1;
+  background:
+    url("data:image/svg+xml,%3Csvg width='1600' height='900' viewBox='0 0 1600 900' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M0 620 C 240 520 360 730 620 620 C 860 520 1000 690 1240 600 C 1420 530 1510 560 1600 520 L1600 900 L0 900 Z' fill='%232563eb' fill-opacity='0.055'/%3E%3Cpath d='M0 690 C 220 590 430 770 680 660 C 920 555 1070 740 1310 650 C 1450 600 1530 610 1600 590 L1600 900 L0 900 Z' fill='%23061b36' fill-opacity='0.045'/%3E%3Cpath d='M0 760 C 260 650 420 820 700 720 C 930 640 1120 790 1360 720 C 1480 685 1540 690 1600 670 L1600 900 L0 900 Z' fill='%2338bdf8' fill-opacity='0.08'/%3E%3C/svg%3E");
+  background-size: cover;
+  background-position: bottom center;
 }
 .sidebar {
   width: 270px;
@@ -733,6 +748,8 @@ body {
 .main {
   margin-left:270px;
   padding:26px;
+  position: relative;
+  z-index: 1;
 }
 .topbar {
   display:flex;
@@ -784,8 +801,9 @@ body {
   grid-template-columns: 1fr 1fr;
 }
 .card {
-  background:var(--card);
-  border:1px solid var(--line);
+  background:rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(10px);
+  border:1px solid rgba(226, 232, 240, 0.86);
   border-radius:var(--radius);
   box-shadow:var(--shadow);
   padding:18px;
