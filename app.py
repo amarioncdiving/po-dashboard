@@ -1238,7 +1238,24 @@ body::before {
   overflow-y: auto;
 }
 .brand { display:flex; gap:12px; align-items:center; margin-bottom:28px; padding:0 8px; }
-.logo { width:42px; height:42px; border-radius:12px; display:grid; place-items:center; background: linear-gradient(135deg, #38bdf8, #2563eb); font-weight:900; }
+
+.logo {
+  width:54px;
+  height:54px;
+  border-radius:14px;
+  display:grid;
+  place-items:center;
+  background:white;
+  overflow:hidden;
+  box-shadow:0 10px 18px rgba(0,0,0,.18);
+  flex:0 0 auto;
+}
+.logo img {
+  width:100%;
+  height:100%;
+  object-fit:contain;
+  display:block;
+}
 .brand h1 { font-size:18px; line-height:1; margin:0 0 5px; }
 .brand p { margin:0; font-size:12px; color:#bfdbfe; }
 .nav-section { margin: 18px 8px 8px; color: #93c5fd; font-size: 11px; font-weight: 900; letter-spacing: .12em; text-transform: uppercase; }
@@ -1275,6 +1292,44 @@ table { width:100%; border-collapse:collapse; font-size:13px; }
 th, td { text-align:left; border-bottom:1px solid var(--line); padding:10px 8px; vertical-align:top; }
 th { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.04em; background:white; }
 .right { text-align:right; }
+.column-filter-row th {
+  padding:6px 8px 10px;
+  background:#f8fafc;
+  position:sticky;
+  top:0;
+  z-index:2;
+}
+.column-filter-row input,
+.column-filter-row select {
+  width:100%;
+  max-width:none;
+  padding:7px 8px;
+  border:1px solid var(--line);
+  border-radius:9px;
+  background:white;
+  font-size:12px;
+  text-transform:none;
+  letter-spacing:normal;
+  color:var(--text);
+}
+.filter-hint {
+  display:flex;
+  justify-content:space-between;
+  gap:12px;
+  flex-wrap:wrap;
+  align-items:center;
+  margin-bottom:12px;
+  color:var(--muted);
+  font-size:13px;
+}
+.filter-hint button {
+  border:1px solid var(--line);
+  background:white;
+  border-radius:10px;
+  padding:8px 10px;
+  font-weight:800;
+  cursor:pointer;
+}
 input[type=file], input[type=text], input[type=date], input[type=number], select, textarea { padding:12px; border:1px solid var(--line); border-radius:12px; background:white; width:100%; max-width:520px; font-family: inherit; }
 textarea { min-height: 110px; resize: vertical; }
 .notice { padding:13px 15px; border-radius:13px; font-weight:700; margin-bottom:16px; }
@@ -1423,7 +1478,7 @@ def shell(title, subtitle, active, content):
 <body>
     <aside class="sidebar">
         <div class="brand">
-            <div class="logo">CE</div>
+            <div class="logo"><img src="{CE_LOGO_DATA_URI}" alt="Coastal Engineering logo"></div>
             <div>
                 <h1>Coastal Engineering</h1>
                 <p>Procurement App</p>
@@ -2030,13 +2085,59 @@ def po_list():
         <div class="card">
             <h3>Issued PO List</h3>
             <p class="card-subtitle">Browse all issued POs imported into the dashboard. Click a PO number to view its line items.</p>
+            <div class="filter-hint">
+                <span>Use the filters below each column heading to narrow the issued PO list.</span>
+                <button type="button" onclick="clearPOListFilters()">Clear Filters</button>
+            </div>
             <div class="table-wrap">
-                <table>
-                    <tr><th>PO Number</th><th>Vendor</th><th>Project</th><th>Department</th><th>Status</th><th>PO Date</th><th class="right">Lines</th><th class="right">PO Value</th><th class="right">Line Total</th><th class="right">Remaining</th><th>Flag</th></tr>
-                    {po_rows}
+                <table id="issuedPOListTable">
+                    <thead>
+                        <tr><th>PO Number</th><th>Vendor</th><th>Project</th><th>Department</th><th>Status</th><th>PO Date</th><th class="right">Lines</th><th class="right">PO Value</th><th class="right">Line Total</th><th class="right">Remaining</th><th>Flag</th></tr>
+                        <tr class="column-filter-row">
+                            <th><input data-col="0" oninput="filterIssuedPOList()" placeholder="Filter PO"></th>
+                            <th><input data-col="1" oninput="filterIssuedPOList()" placeholder="Filter vendor"></th>
+                            <th><input data-col="2" oninput="filterIssuedPOList()" placeholder="Filter project"></th>
+                            <th><input data-col="3" oninput="filterIssuedPOList()" placeholder="Filter dept"></th>
+                            <th><input data-col="4" oninput="filterIssuedPOList()" placeholder="Filter status"></th>
+                            <th><input data-col="5" oninput="filterIssuedPOList()" placeholder="Filter date"></th>
+                            <th><input data-col="6" oninput="filterIssuedPOList()" placeholder="Lines"></th>
+                            <th><input data-col="7" oninput="filterIssuedPOList()" placeholder="PO value"></th>
+                            <th><input data-col="8" oninput="filterIssuedPOList()" placeholder="Line total"></th>
+                            <th><input data-col="9" oninput="filterIssuedPOList()" placeholder="Remaining"></th>
+                            <th><input data-col="10" oninput="filterIssuedPOList()" placeholder="Flag"></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {po_rows}
+                    </tbody>
                 </table>
             </div>
         </div>
+        <script>
+        function filterIssuedPOList() {{
+            const table = document.getElementById('issuedPOListTable');
+            if (!table) return;
+            const filters = Array.from(table.querySelectorAll('.column-filter-row input')).map(input => {{
+                return {{ col: Number(input.dataset.col), value: input.value.trim().toLowerCase() }};
+            }});
+            const rows = Array.from(table.querySelectorAll('tbody tr'));
+            rows.forEach(row => {{
+                const cells = Array.from(row.children);
+                const show = filters.every(filter => {{
+                    if (!filter.value) return true;
+                    const cell = cells[filter.col];
+                    return cell && cell.textContent.toLowerCase().includes(filter.value);
+                }});
+                row.style.display = show ? '' : 'none';
+            }});
+        }}
+        function clearPOListFilters() {{
+            const table = document.getElementById('issuedPOListTable');
+            if (!table) return;
+            table.querySelectorAll('.column-filter-row input').forEach(input => input.value = '');
+            filterIssuedPOList();
+        }}
+        </script>
         """
 
         return shell("PO List", "Browse issued purchase orders and open PO detail records.", "PO List", content)
