@@ -3,11 +3,17 @@ import sys
 import site
 import csv
 import io
+import html
 from datetime import datetime, date
 from decimal import Decimal, InvalidOperation
+from urllib.parse import quote_plus
 
 from flask import Flask, render_template_string, jsonify, request
 
+
+# ------------------------------------------------------------
+# Azure / package setup
+# ------------------------------------------------------------
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PACKAGES_DIR = os.path.join(BASE_DIR, ".python_packages", "lib", "site-packages")
@@ -53,6 +59,23 @@ REQUIRED_PO_COLUMNS = [
 ]
 
 
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+
+def h(value):
+    if value is None:
+        return ""
+    return html.escape(str(value))
+
+
+def currency(value):
+    try:
+        return "${:,.2f}".format(float(value or 0))
+    except Exception:
+        return "$0.00"
+
+
 def get_sql_connection():
     if not SQL_CONNECTION:
         raise RuntimeError("SQL connection string was not found.")
@@ -63,7 +86,6 @@ def get_sql_connection():
         connection_string = "Driver={ODBC Driver 18 for SQL Server};" + connection_string
 
     import pyodbc
-
     return pyodbc.connect(connection_string, timeout=20)
 
 
@@ -122,13 +144,6 @@ def normalize_header(header):
     if header is None:
         return ""
     return str(header).strip()
-
-
-def currency(value):
-    try:
-        return "${:,.2f}".format(float(value or 0))
-    except Exception:
-        return "$0.00"
 
 
 def read_uploaded_po_file(uploaded_file):
@@ -620,9 +635,12 @@ def load_summary_data():
     imports = cursor.fetchall()
 
     conn.close()
-
     return overall, vendors, projects, imports
 
+
+# ------------------------------------------------------------
+# Branding / layout
+# ------------------------------------------------------------
 
 BRANDED_STYLE = """
 <style>
@@ -840,7 +858,7 @@ th {
   background:white;
 }
 .right { text-align:right; }
-input[type=file] {
+input[type=file], input[type=text] {
   padding:12px;
   border:1px solid var(--line);
   border-radius:12px;
@@ -875,26 +893,26 @@ code {
 
 def shell(title, subtitle, active, content):
     nav_items = [
-    ("Dashboard", "/", "📊"),
-    ("PO Summary", "/po-summary", "📋"),
-    ("PO List", "/po-list", "📄"),
-    ("PO Detail", "/po-detail", "🔎"),
-    ("Upload Issued POs", "/upload-po", "⬆️"),
-    ("Import History", "/import-history", "🕘"),
-    ("Health", "/health", "🟢"),
-    ("DB Test", "/db-test", "🧪"),
-]
+        ("Dashboard", "/", "📊"),
+        ("PO Summary", "/po-summary", "📋"),
+        ("PO List", "/po-list", "📄"),
+        ("PO Detail", "/po-detail", "🔎"),
+        ("Upload Issued POs", "/upload-po", "⬆️"),
+        ("Import History", "/import-history", "🕘"),
+        ("Health", "/health", "🟢"),
+        ("DB Test", "/db-test", "🧪"),
+    ]
 
     nav_html = ""
     for label, href, icon in nav_items:
         active_class = " active" if active == label else ""
-        nav_html += f'<a class="nav-item{active_class}" href="{href}"><span>{icon}</span>{label}</a>'
+        nav_html += f'<a class="nav-item{active_class}" href="{href}"><span>{icon}</span>{h(label)}</a>'
 
     return f"""
 <!DOCTYPE html>
 <html>
 <head>
-    <title>{title}</title>
+    <title>{h(title)}</title>
     {BRANDED_STYLE}
 </head>
 <body>
@@ -912,7 +930,7 @@ def shell(title, subtitle, active, content):
             <div><span class="status-dot"></span>Connected App</div>
             <div style="margin-top:14px; color:#bfdbfe; font-size:12px;">
                 Environment<br>
-                <strong style="color:white;">{APP_ENVIRONMENT}</strong>
+                <strong style="color:white;">{h(APP_ENVIRONMENT)}</strong>
             </div>
         </div>
     </aside>
@@ -920,11 +938,11 @@ def shell(title, subtitle, active, content):
     <main class="main">
         <header class="topbar">
             <div>
-                <h2>{title}</h2>
-                <p>{subtitle}</p>
+                <h2>{h(title)}</h2>
+                <p>{h(subtitle)}</p>
             </div>
             <div class="top-actions">
-                <span>Database: {SQL_DATABASE_NAME}</span>
+                <span>Database: {h(SQL_DATABASE_NAME)}</span>
             </div>
         </header>
 
@@ -934,6 +952,10 @@ def shell(title, subtitle, active, content):
 </html>
 """
 
+
+# ------------------------------------------------------------
+# Routes
+# ------------------------------------------------------------
 
 @app.route("/")
 def home():
@@ -946,17 +968,17 @@ def home():
         </div>
         <div class="card kpi">
             <div class="label">Environment</div>
-            <div class="value">{APP_ENVIRONMENT}</div>
+            <div class="value">{h(APP_ENVIRONMENT)}</div>
             <div class="trend">Azure App Service</div>
         </div>
         <div class="card kpi">
             <div class="label">SQL Server</div>
             <div class="value" style="font-size:17px;">Connected</div>
-            <div class="trend">{SQL_SERVER_NAME}</div>
+            <div class="trend">{h(SQL_SERVER_NAME)}</div>
         </div>
         <div class="card kpi">
             <div class="label">SQL Database</div>
-            <div class="value" style="font-size:19px;">{SQL_DATABASE_NAME}</div>
+            <div class="value" style="font-size:19px;">{h(SQL_DATABASE_NAME)}</div>
             <div class="trend">Live data source</div>
         </div>
         <div class="card kpi">
@@ -975,8 +997,8 @@ def home():
                 <tr><td>Upload issued PO spreadsheet</td><td><span class="badge green">Working</span></td></tr>
                 <tr><td>Validate required columns</td><td><span class="badge green">Working</span></td></tr>
                 <tr><td>Write line items to Azure SQL</td><td><span class="badge green">Working</span></td></tr>
-                <tr><td>Summarize POs by vendor/project</td><td><span class="badge blue">Added</span></td></tr>
-                <tr><td>Expense upload</td><td><span class="badge amber">Next</span></td></tr>
+                <tr><td>Browse PO list and details</td><td><span class="badge blue">Added</span></td></tr>
+                <tr><td>Expense upload</td><td><span class="badge amber">Later</span></td></tr>
             </table>
         </div>
 
@@ -984,8 +1006,8 @@ def home():
             <h3>Quick Actions</h3>
             <p><a class="button primary" href="/upload-po">Upload Issued POs</a></p>
             <p><a class="button" href="/po-summary">View PO Summary</a></p>
-            <p><a class="button" href="/health">Health Check</a></p>
-            <p><a class="button" href="/db-test">Database Test</a></p>
+            <p><a class="button" href="/po-list">Browse PO List</a></p>
+            <p><a class="button" href="/po-detail">Search PO Detail</a></p>
         </div>
     </div>
     """
@@ -1007,7 +1029,7 @@ def po_summary():
         for row in vendors:
             vendor_rows += f"""
             <tr>
-                <td>{row.VendorName or ""}</td>
+                <td>{h(row.VendorName)}</td>
                 <td>{row.POCount}</td>
                 <td class="right">{currency(row.TotalPOValue)}</td>
                 <td class="right">{currency(row.TotalLineAmount)}</td>
@@ -1019,7 +1041,7 @@ def po_summary():
         for row in projects:
             project_rows += f"""
             <tr>
-                <td>{row.ProjectName or ""}</td>
+                <td>{h(row.ProjectName)}</td>
                 <td>{row.POCount}</td>
                 <td class="right">{currency(row.TotalPOValue)}</td>
                 <td class="right">{currency(row.TotalLineAmount)}</td>
@@ -1032,12 +1054,12 @@ def po_summary():
             import_rows += f"""
             <tr>
                 <td>{row.ImportBatchId}</td>
-                <td>{row.FileName}</td>
-                <td>{row.UploadedAt}</td>
+                <td>{h(row.FileName)}</td>
+                <td>{h(row.UploadedAt)}</td>
                 <td>{row.TotalRows}</td>
                 <td>{row.SuccessCount}</td>
                 <td>{row.ErrorCount}</td>
-                <td>{row.ImportStatus}</td>
+                <td>{h(row.ImportStatus)}</td>
             </tr>
             """
 
@@ -1134,87 +1156,10 @@ def po_summary():
         )
 
     except Exception as e:
-        content = f'<div class="notice error">Error loading PO summary: {str(e)}</div>'
+        content = f'<div class="notice error">Error loading PO summary: {h(e)}</div>'
         return shell("PO Summary", "Unable to load summary.", "PO Summary", content), 500
 
 
-@app.route("/upload-po", methods=["GET", "POST"])
-def upload_po():
-    message_html = ""
-    result_html = ""
-    errors_html = ""
-
-    if request.method == "POST":
-        uploaded_file = request.files.get("po_file")
-
-        if not uploaded_file or uploaded_file.filename == "":
-            message_html = '<div class="notice error">No file selected.</div>'
-        else:
-            try:
-                rows = read_uploaded_po_file(uploaded_file)
-                validation_errors = validate_po_rows(rows)
-
-                if validation_errors:
-                    message_html = '<div class="notice error">The file could not be imported because validation errors were found.</div>'
-                    error_items = "".join(f"<li>{error}</li>" for error in validation_errors)
-                    errors_html = f"""
-                    <div class="card">
-                        <h3>Validation Errors</h3>
-                        <ul>{error_items}</ul>
-                    </div>
-                    """
-                else:
-                    result = import_po_rows(rows, uploaded_file.filename)
-                    message_html = '<div class="notice ok">Issued PO import completed.</div>'
-                    result_html = f"""
-                    <div class="card">
-                        <h3>Import Result</h3>
-                        <table>
-                            <tr><th>Import Batch ID</th><td>{result["import_batch_id"]}</td></tr>
-                            <tr><th>Total Rows</th><td>{result["total_rows"]}</td></tr>
-                            <tr><th>Success Count</th><td>{result["success_count"]}</td></tr>
-                            <tr><th>Error Count</th><td>{result["error_count"]}</td></tr>
-                            <tr><th>Status</th><td>{result["status"]}</td></tr>
-                        </table>
-                    </div>
-                    """
-
-            except Exception as e:
-                message_html = '<div class="notice error">Import failed.</div>'
-                errors_html = f"""
-                <div class="card">
-                    <h3>Error Details</h3>
-                    <p>{str(e)}</p>
-                </div>
-                """
-
-    content = f"""
-    {message_html}
-    {result_html}
-    {errors_html}
-
-    <div class="card">
-        <h3>Select Issued PO File</h3>
-        <p class="card-subtitle">Upload the cleaned issued PO template as .xlsx or .csv.</p>
-        <form method="post" enctype="multipart/form-data">
-            <p><input type="file" name="po_file" accept=".xlsx,.csv" required></p>
-            <p><button class="primary" type="submit">Upload Issued POs</button></p>
-        </form>
-    </div>
-
-    <div class="card">
-        <h3>Expected Columns</h3>
-        <p class="card-subtitle">The upload must include these exact headers.</p>
-        <code>{", ".join(REQUIRED_PO_COLUMNS)}</code>
-    </div>
-    """
-
-    return shell(
-        title="Upload Issued POs",
-        subtitle="Import issued purchase orders and line items into Azure SQL.",
-        active="Upload Issued POs",
-        content=content,
-    )
 @app.route("/po-list")
 def po_list():
     try:
@@ -1264,32 +1209,33 @@ def po_list():
         po_rows = ""
 
         for row in pos:
-            status_class = "blue"
-            status_text = row.POStatus or ""
+            status_text = str(row.POStatus or "")
+            status_lower = status_text.lower()
 
-            if status_text.lower() == "open":
+            status_class = "blue"
+            if status_lower == "open":
                 status_class = "green"
-            elif status_text.lower() in ["closed", "complete", "completed"]:
+            elif status_lower in ["closed", "complete", "completed"]:
                 status_class = "blue"
-            elif status_text.lower() in ["cancelled", "canceled"]:
+            elif status_lower in ["cancelled", "canceled"]:
                 status_class = "red"
-            elif status_text.lower() in ["pending", "draft"]:
+            elif status_lower in ["pending", "draft"]:
                 status_class = "amber"
 
             mismatch_badge = ""
             if row.AmountMismatch:
                 mismatch_badge = '<span class="badge amber">Check totals</span>'
 
+            po_url = "/po-detail?po_number=" + quote_plus(str(row.PONumber or ""))
+
             po_rows += f"""
             <tr>
-                <td>
-                    <a href="/po-detail?po_number={row.PONumber}">{row.PONumber}</a>
-                </td>
-                <td>{row.VendorName or ""}</td>
-                <td>{row.ProjectName or ""}</td>
-                <td>{row.Department or ""}</td>
-                <td><span class="badge {status_class}">{status_text}</span></td>
-                <td>{row.PODate or ""}</td>
+                <td><a href="{po_url}">{h(row.PONumber)}</a></td>
+                <td>{h(row.VendorName)}</td>
+                <td>{h(row.ProjectName)}</td>
+                <td>{h(row.Department)}</td>
+                <td><span class="badge {status_class}">{h(status_text)}</span></td>
+                <td>{h(row.PODate)}</td>
                 <td class="right">{row.LineCount}</td>
                 <td class="right">{currency(row.POValue)}</td>
                 <td class="right">{currency(row.TotalLineAmount)}</td>
@@ -1299,11 +1245,7 @@ def po_list():
             """
 
         if not po_rows:
-            po_rows = """
-            <tr>
-                <td colspan="11">No issued POs found yet.</td>
-            </tr>
-            """
+            po_rows = '<tr><td colspan="11">No issued POs found yet.</td></tr>'
 
         content = f"""
         <div class="card">
@@ -1341,17 +1283,20 @@ def po_list():
         )
 
     except Exception as e:
-        content = f'<div class="notice error">Error loading PO list: {str(e)}</div>'
+        content = f'<div class="notice error">Error loading PO list: {h(e)}</div>'
         return shell(
             title="PO List",
             subtitle="Unable to load issued PO list.",
             active="PO List",
             content=content,
         ), 500
-    
-    @app.route("/po-detail", methods=["GET"])
+
+
+@app.route("/po-detail", methods=["GET"])
 def po_detail():
     po_number = clean_text(request.args.get("po_number"))
+
+    search_value = h(po_number or "")
 
     search_form = f"""
     <div class="card">
@@ -1362,9 +1307,8 @@ def po_detail():
                 <input 
                     type="text" 
                     name="po_number" 
-                    value="{po_number or ""}" 
+                    value="{search_value}" 
                     placeholder="Example: 26-204-002"
-                    style="padding:12px;border:1px solid var(--line);border-radius:12px;width:100%;max-width:420px;"
                     required
                 >
             </p>
@@ -1421,7 +1365,7 @@ def po_detail():
 
             content = search_form + f"""
             <div class="notice error">
-                No PO found for PO number: {po_number}
+                No PO found for PO number: {h(po_number)}
             </div>
             """
 
@@ -1467,17 +1411,16 @@ def po_detail():
         )
 
         totals = cursor.fetchone()
-
         conn.close()
 
         line_rows = ""
         for row in lines:
             line_rows += f"""
             <tr>
-                <td>{row.LineDescription or ""}</td>
-                <td>{row.Unit or ""}</td>
+                <td>{h(row.LineDescription)}</td>
+                <td>{h(row.Unit)}</td>
                 <td class="right">{currency(row.UnitCost)}</td>
-                <td class="right">{row.Qty or ""}</td>
+                <td class="right">{h(row.Qty)}</td>
                 <td class="right">{currency(row.LineAmount)}</td>
             </tr>
             """
@@ -1486,8 +1429,8 @@ def po_detail():
         <div class="grid kpis">
             <div class="card kpi">
                 <div class="label">PO Number</div>
-                <div class="value" style="font-size:22px;">{header.PONumber}</div>
-                <div class="trend">{header.POStatus or ""}</div>
+                <div class="value" style="font-size:22px;">{h(header.PONumber)}</div>
+                <div class="trend">{h(header.POStatus)}</div>
             </div>
             <div class="card kpi">
                 <div class="label">Original Amount</div>
@@ -1514,12 +1457,12 @@ def po_detail():
         <div class="card">
             <h3>PO Header</h3>
             <table>
-                <tr><th>Vendor</th><td>{header.VendorName or ""}</td></tr>
-                <tr><th>Project</th><td>{header.ProjectName or ""}</td></tr>
-                <tr><th>Department</th><td>{header.Department or ""}</td></tr>
-                <tr><th>PO Date</th><td>{header.PODate or ""}</td></tr>
-                <tr><th>Status</th><td>{header.POStatus or ""}</td></tr>
-                <tr><th>Requestor</th><td>{header.Requestor or ""}</td></tr>
+                <tr><th>Vendor</th><td>{h(header.VendorName)}</td></tr>
+                <tr><th>Project</th><td>{h(header.ProjectName)}</td></tr>
+                <tr><th>Department</th><td>{h(header.Department)}</td></tr>
+                <tr><th>PO Date</th><td>{h(header.PODate)}</td></tr>
+                <tr><th>Status</th><td>{h(header.POStatus)}</td></tr>
+                <tr><th>Requestor</th><td>{h(header.Requestor)}</td></tr>
             </table>
         </div>
 
@@ -1551,7 +1494,7 @@ def po_detail():
     except Exception as e:
         content = search_form + f"""
         <div class="notice error">
-            Error loading PO detail: {str(e)}
+            Error loading PO detail: {h(e)}
         </div>
         """
 
@@ -1561,6 +1504,87 @@ def po_detail():
             active="PO Detail",
             content=content,
         ), 500
+
+
+@app.route("/upload-po", methods=["GET", "POST"])
+def upload_po():
+    message_html = ""
+    result_html = ""
+    errors_html = ""
+
+    if request.method == "POST":
+        uploaded_file = request.files.get("po_file")
+
+        if not uploaded_file or uploaded_file.filename == "":
+            message_html = '<div class="notice error">No file selected.</div>'
+        else:
+            try:
+                rows = read_uploaded_po_file(uploaded_file)
+                validation_errors = validate_po_rows(rows)
+
+                if validation_errors:
+                    message_html = '<div class="notice error">The file could not be imported because validation errors were found.</div>'
+                    error_items = "".join(f"<li>{h(error)}</li>" for error in validation_errors)
+                    errors_html = f"""
+                    <div class="card">
+                        <h3>Validation Errors</h3>
+                        <ul>{error_items}</ul>
+                    </div>
+                    """
+                else:
+                    result = import_po_rows(rows, uploaded_file.filename)
+                    message_html = '<div class="notice ok">Issued PO import completed.</div>'
+                    result_html = f"""
+                    <div class="card">
+                        <h3>Import Result</h3>
+                        <table>
+                            <tr><th>Import Batch ID</th><td>{result["import_batch_id"]}</td></tr>
+                            <tr><th>Total Rows</th><td>{result["total_rows"]}</td></tr>
+                            <tr><th>Success Count</th><td>{result["success_count"]}</td></tr>
+                            <tr><th>Error Count</th><td>{result["error_count"]}</td></tr>
+                            <tr><th>Status</th><td>{h(result["status"])}</td></tr>
+                        </table>
+                    </div>
+                    """
+
+            except Exception as e:
+                message_html = '<div class="notice error">Import failed.</div>'
+                errors_html = f"""
+                <div class="card">
+                    <h3>Error Details</h3>
+                    <p>{h(e)}</p>
+                </div>
+                """
+
+    content = f"""
+    {message_html}
+    {result_html}
+    {errors_html}
+
+    <div class="card">
+        <h3>Select Issued PO File</h3>
+        <p class="card-subtitle">Upload the cleaned issued PO template as .xlsx or .csv.</p>
+        <form method="post" enctype="multipart/form-data">
+            <p><input type="file" name="po_file" accept=".xlsx,.csv" required></p>
+            <p><button class="primary" type="submit">Upload Issued POs</button></p>
+        </form>
+    </div>
+
+    <div class="card">
+        <h3>Expected Columns</h3>
+        <p class="card-subtitle">The upload must include these exact headers.</p>
+        <code>{h(", ".join(REQUIRED_PO_COLUMNS))}</code>
+    </div>
+    """
+
+    return shell(
+        title="Upload Issued POs",
+        subtitle="Import issued purchase orders and line items into Azure SQL.",
+        active="Upload Issued POs",
+        content=content,
+    )
+
+
 @app.route("/import-history")
 def import_history():
     try:
@@ -1617,23 +1641,19 @@ def import_history():
             batch_rows += f"""
             <tr>
                 <td>{row.ImportBatchId}</td>
-                <td>{row.FileName or ""}</td>
-                <td>{row.UploadedAt}</td>
-                <td>{row.SourceSystem or ""}</td>
-                <td>{row.UploadedBy or ""}</td>
+                <td>{h(row.FileName)}</td>
+                <td>{h(row.UploadedAt)}</td>
+                <td>{h(row.SourceSystem)}</td>
+                <td>{h(row.UploadedBy)}</td>
                 <td>{row.TotalRows}</td>
                 <td>{row.SuccessCount}</td>
                 <td>{row.ErrorCount}</td>
-                <td><span class="badge {status_badge}">{row.ImportStatus or ""}</span></td>
+                <td><span class="badge {status_badge}">{h(row.ImportStatus)}</span></td>
             </tr>
             """
 
         if not batch_rows:
-            batch_rows = """
-            <tr>
-                <td colspan="9">No import batches found yet.</td>
-            </tr>
-            """
+            batch_rows = '<tr><td colspan="9">No import batches found yet.</td></tr>'
 
         error_rows = ""
         for row in errors:
@@ -1645,20 +1665,16 @@ def import_history():
             <tr>
                 <td>{row.ImportErrorId}</td>
                 <td>{row.ImportBatchId}</td>
-                <td>{row.FileName or ""}</td>
-                <td>{row.RowNumber or ""}</td>
-                <td>{row.ErrorMessage or ""}</td>
-                <td>{raw_row}</td>
-                <td>{row.CreatedAt}</td>
+                <td>{h(row.FileName)}</td>
+                <td>{h(row.RowNumber)}</td>
+                <td>{h(row.ErrorMessage)}</td>
+                <td>{h(raw_row)}</td>
+                <td>{h(row.CreatedAt)}</td>
             </tr>
             """
 
         if not error_rows:
-            error_rows = """
-            <tr>
-                <td colspan="7">No import errors found.</td>
-            </tr>
-            """
+            error_rows = '<tr><td colspan="7">No import errors found.</td></tr>'
 
         content = f"""
         <div class="card">
@@ -1710,13 +1726,15 @@ def import_history():
         )
 
     except Exception as e:
-        content = f'<div class="notice error">Error loading import history: {str(e)}</div>'
+        content = f'<div class="notice error">Error loading import history: {h(e)}</div>'
         return shell(
             title="Import History",
             subtitle="Unable to load import history.",
             active="Import History",
             content=content,
         ), 500
+
+
 @app.route("/health")
 def health():
     return jsonify(
