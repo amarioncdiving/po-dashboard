@@ -73,8 +73,6 @@ PAGE_ACCESS = {
     "Dashboard": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "My Dashboard": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "PO Summary": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
-    "New Purchase Request": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
-    "Purchase Requests": ["Admin", "Executive", "Accounting"],
     "PO List": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "PO Detail": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "Upload Issued POs": ["Admin", "Accounting"],
@@ -1168,19 +1166,13 @@ th {
   background:white;
 }
 .right { text-align:right; }
-input[type=file], input[type=text], input[type=date], input[type=number], select, textarea {
+input[type=file], input[type=text], select {
   padding:12px;
   border:1px solid var(--line);
   border-radius:12px;
   background:white;
   width:100%;
   max-width:520px;
-  font-family: inherit;
-}
-
-textarea {
-  min-height: 110px;
-  resize: vertical;
 }
 .notice {
   padding:13px 15px;
@@ -1210,11 +1202,9 @@ def shell(title, subtitle, active, content):
     access = get_user_access()
     role = access["role"]
 
-   po_nav_items = [
+    po_nav_items = [
         ("Dashboard", "/", "📊"),
         ("My Dashboard", "/my-dashboard", "🏠"),
-        ("New Purchase Request", "/purchase-request", "📝"),
-        ("Purchase Requests", "/purchase-requests", "✅"),
         ("PO Summary", "/po-summary", "📋"),
         ("PO List", "/po-list", "📄"),
         ("PO Detail", "/po-detail", "🔎"),
@@ -1316,510 +1306,11 @@ def shell(title, subtitle, active, content):
 </body>
 </html>
 """
-# ------------------------------------------------------------
-# Purchase request helpers
-# ------------------------------------------------------------
 
-def purchase_request_status_badge(status):
-    status = status or "Submitted"
-    status_lower = status.lower()
-
-    badge_class = "blue"
-
-    if status_lower in ["submitted", "under review"]:
-        badge_class = "amber"
-    elif status_lower in ["approved", "converted to po"]:
-        badge_class = "green"
-    elif status_lower in ["rejected", "cancelled", "canceled"]:
-        badge_class = "red"
-
-    return f'<span class="badge {badge_class}">{h(status)}</span>'
-
-
-def can_review_purchase_requests(role):
-    return role in ["Admin", "Executive", "Accounting"]
-
-
-def generate_purchase_request_number(cursor):
-    today_prefix = datetime.utcnow().strftime("PR-%Y%m%d")
-
-    cursor.execute(
-        """
-        SELECT COUNT(*) AS RequestCount
-        FROM dbo.PurchaseRequests
-        WHERE RequestNumber LIKE ?;
-        """,
-        today_prefix + "-%",
-    )
-
-    row = cursor.fetchone()
-    next_number = (row.RequestCount or 0) + 1
-
-    return f"{today_prefix}-{next_number:04d}"
-
-
-def load_purchase_request_stats():
-    conn = get_sql_connection()
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        SELECT
-            COUNT(*) AS TotalRequests,
-            SUM(CASE WHEN RequestStatus = 'Submitted' THEN 1 ELSE 0 END) AS SubmittedRequests,
-            SUM(CASE WHEN RequestStatus = 'Under Review' THEN 1 ELSE 0 END) AS UnderReviewRequests,
-            SUM(CASE WHEN RequestStatus = 'Approved' THEN 1 ELSE 0 END) AS ApprovedRequests,
-            SUM(CASE WHEN RequestStatus = 'Rejected' THEN 1 ELSE 0 END) AS RejectedRequests,
-            SUM(CASE WHEN RequestStatus = 'Converted to PO' THEN 1 ELSE 0 END) AS ConvertedRequests,
-            SUM(COALESCE(EstimatedAmount, 0)) AS TotalEstimatedAmount
-        FROM dbo.PurchaseRequests;
-        """
-    )
-
-    row = cursor.fetchone()
-    conn.close()
-
-    return {
-        "total_requests": row.TotalRequests or 0,
-        "submitted_requests": row.SubmittedRequests or 0,
-        "under_review_requests": row.UnderReviewRequests or 0,
-        "approved_requests": row.ApprovedRequests or 0,
-        "rejected_requests": row.RejectedRequests or 0,
-        "converted_requests": row.ConvertedRequests or 0,
-        "total_estimated_amount": row.TotalEstimatedAmount or 0,
-    }
-
-
-def load_purchase_requests(limit=100):
-    conn = get_sql_connection()
-    cursor = conn.cursor()
-
-    cursor.execute(
-        f"""
-        SELECT TOP {int(limit)}
-            PurchaseRequestId,
-            RequestNumber,
-            RequestedByEmail,
-            RequestedByName,
-            RequestedAt,
-            NeededByDate,
-            VendorName,
-            ProjectName,
-            Department,
-            RequestTitle,
-            RequestDescription,
-            EstimatedAmount,
-            Priority,
-            RequestStatus,
-            ReviewerEmail,
-            ReviewedAt,
-            ReviewNotes,
-            ConvertedPONumber,
-            UpdatedAt
-        FROM dbo.PurchaseRequests
-        ORDER BY RequestedAt DESC;
-        """
-    )
-
-    rows = cursor.fetchall()
-    conn.close()
-
-    return rows
-
-
-def create_purchase_request(form):
-    user = get_current_user()
-    access = get_user_access()
-
-    request_title = clean_text(form.get("request_title"))
-    vendor_name = clean_text(form.get("vendor_name"))
-    project_name = clean_text(form.get("project_name"))
-    department = clean_text(form.get("department"))
-    needed_by_date = clean_date(form.get("needed_by_date"))
-    estimated_amount = clean_decimal(form.get("estimated_amount"))
-    priority = clean_text(form.get("priority"))
-    request_description = clean_text(form.get("request_description"))
-
-    if not request_title:
-        raise ValueError("Request Title is required.")
-
-    conn = get_sql_connection()
-    cursor = conn.cursor()
-
-    try:
-        request_number = generate_purchase_request_number(cursor)
-
-        cursor.execute(
-            """
-            INSERT INTO dbo.PurchaseRequests
-                (
-                    RequestNumber,
-                    RequestedByEmail,
-                    RequestedByName,
-                    NeededByDate,
-                    VendorName,
-                    ProjectName,
-                    Department,
-                    RequestTitle,
-                    RequestDescription,
-                    EstimatedAmount,
-                    Priority,
-                    RequestStatus
-                )
-            OUTPUT INSERTED.PurchaseRequestId
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Submitted');
-            """,
-            request_number,
-            user["email"],
-            access["display_name"] or user["email"],
-            needed_by_date,
-            vendor_name,
-            project_name,
-            department,
-            request_title,
-            request_description,
-            estimated_amount,
-            priority,
-        )
-
-        purchase_request_id = cursor.fetchone().PurchaseRequestId
-        conn.commit()
-
-        return {
-            "purchase_request_id": purchase_request_id,
-            "request_number": request_number,
-        }
-
-    except Exception:
-        conn.rollback()
-        raise
-
-    finally:
-        conn.close()
-
-
-def update_purchase_request_status(form):
-    user = get_current_user()
-
-    purchase_request_id = clean_text(form.get("purchase_request_id"))
-    request_status = clean_text(form.get("request_status"))
-    review_notes = clean_text(form.get("review_notes"))
-    converted_po_number = clean_text(form.get("converted_po_number"))
-
-    valid_statuses = [
-        "Submitted",
-        "Under Review",
-        "Approved",
-        "Rejected",
-        "Converted to PO",
-    ]
-
-    if request_status not in valid_statuses:
-        raise ValueError("Invalid request status.")
-
-    if not purchase_request_id:
-        raise ValueError("Purchase Request ID is required.")
-
-    conn = get_sql_connection()
-    cursor = conn.cursor()
-
-    try:
-        cursor.execute(
-            """
-            UPDATE dbo.PurchaseRequests
-            SET
-                RequestStatus = ?,
-                ReviewerEmail = ?,
-                ReviewedAt = SYSUTCDATETIME(),
-                ReviewNotes = ?,
-                ConvertedPONumber = ?,
-                UpdatedAt = SYSUTCDATETIME()
-            WHERE PurchaseRequestId = ?;
-            """,
-            request_status,
-            user["email"],
-            review_notes,
-            converted_po_number,
-            purchase_request_id,
-        )
-
-        conn.commit()
-
-    except Exception:
-        conn.rollback()
-        raise
-
-    finally:
-        conn.close()
 
 # ------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------
-@app.route("/purchase-request", methods=["GET", "POST"])
-def purchase_request():
-    allowed, reason = require_page_access("New Purchase Request")
-    if not allowed:
-        return access_denied_response("New Purchase Request", reason)
-
-    message_html = ""
-
-    if request.method == "POST":
-        try:
-            result = create_purchase_request(request.form)
-
-            message_html = f"""
-            <div class="notice ok">
-                Purchase request submitted successfully. Request Number: {h(result["request_number"])}
-            </div>
-            """
-
-        except Exception as e:
-            message_html = f'<div class="notice error">Error submitting purchase request: {h(e)}</div>'
-
-    content = f"""
-    {message_html}
-
-    <div class="card">
-        <h3>New Purchase Request</h3>
-        <p class="card-subtitle">
-            Submit a request before a purchase order is issued.
-        </p>
-
-        <form method="post" action="/purchase-request">
-            <p>
-                <label>Request Title</label><br>
-                <input type="text" name="request_title" placeholder="Example: Dive equipment rental for project 26-204" required>
-            </p>
-
-            <p>
-                <label>Vendor Name</label><br>
-                <input type="text" name="vendor_name" placeholder="Vendor or supplier name">
-            </p>
-
-            <p>
-                <label>Project Name</label><br>
-                <input type="text" name="project_name" placeholder="Project name or number">
-            </p>
-
-            <p>
-                <label>Department</label><br>
-                <input type="text" name="department" placeholder="Department">
-            </p>
-
-            <p>
-                <label>Needed By Date</label><br>
-                <input type="date" name="needed_by_date">
-            </p>
-
-            <p>
-                <label>Estimated Amount</label><br>
-                <input type="number" name="estimated_amount" step="0.01" min="0" placeholder="0.00">
-            </p>
-
-            <p>
-                <label>Priority</label><br>
-                <select name="priority">
-                    <option value="">Select priority</option>
-                    <option value="Low">Low</option>
-                    <option value="Normal">Normal</option>
-                    <option value="High">High</option>
-                    <option value="Urgent">Urgent</option>
-                </select>
-            </p>
-
-            <p>
-                <label>Description / Notes</label><br>
-                <textarea name="request_description" placeholder="Describe what is needed, why it is needed, and any important details."></textarea>
-            </p>
-
-            <p>
-                <button class="primary" type="submit">Submit Purchase Request</button>
-            </p>
-        </form>
-    </div>
-
-    <div class="card">
-        <h3>What happens next?</h3>
-        <table>
-            <tr><th>Step</th><th>Status</th></tr>
-            <tr><td>Request submitted</td><td><span class="badge green">This page</span></td></tr>
-            <tr><td>Admin / Accounting review</td><td><span class="badge amber">Next</span></td></tr>
-            <tr><td>Request approved or rejected</td><td><span class="badge blue">Review step</span></td></tr>
-            <tr><td>PO is issued</td><td><span class="badge blue">Future workflow</span></td></tr>
-        </table>
-    </div>
-    """
-
-    return shell(
-        title="New Purchase Request",
-        subtitle="Submit a new purchase request for review before a PO is issued.",
-        active="New Purchase Request",
-        content=content,
-    )
-@app.route("/purchase-requests", methods=["GET", "POST"])
-def purchase_requests():
-    allowed, reason = require_page_access("Purchase Requests")
-    if not allowed:
-        return access_denied_response("Purchase Requests", reason)
-
-    access = get_user_access()
-    role = access["role"]
-    message_html = ""
-
-    if request.method == "POST":
-        if not can_review_purchase_requests(role):
-            message_html = '<div class="notice error">You do not have permission to update purchase requests.</div>'
-        else:
-            try:
-                update_purchase_request_status(request.form)
-                message_html = '<div class="notice ok">Purchase request status was updated.</div>'
-            except Exception as e:
-                message_html = f'<div class="notice error">Error updating purchase request: {h(e)}</div>'
-
-    try:
-        stats = load_purchase_request_stats()
-        requests = load_purchase_requests()
-
-        request_rows = ""
-
-        for row in requests:
-            description = row.RequestDescription or ""
-            if len(description) > 160:
-                description = description[:160] + "..."
-
-            review_form = ""
-
-            if can_review_purchase_requests(role):
-                review_form = f"""
-                <form method="post" action="/purchase-requests">
-                    <input type="hidden" name="purchase_request_id" value="{h(row.PurchaseRequestId)}">
-
-                    <p>
-                        <select name="request_status">
-                            <option value="Submitted">Submitted</option>
-                            <option value="Under Review">Under Review</option>
-                            <option value="Approved">Approved</option>
-                            <option value="Rejected">Rejected</option>
-                            <option value="Converted to PO">Converted to PO</option>
-                        </select>
-                    </p>
-
-                    <p>
-                        <input type="text" name="converted_po_number" placeholder="PO number if converted">
-                    </p>
-
-                    <p>
-                        <textarea name="review_notes" placeholder="Review notes"></textarea>
-                    </p>
-
-                    <p>
-                        <button type="submit">Update</button>
-                    </p>
-                </form>
-                """
-
-            request_rows += f"""
-            <tr>
-                <td>
-                    <strong>{h(row.RequestNumber)}</strong><br>
-                    <span style="color:var(--muted);">{h(row.RequestedAt)}</span>
-                </td>
-                <td>
-                    <strong>{h(row.RequestTitle)}</strong><br>
-                    <span style="color:var(--muted);">{h(description)}</span>
-                </td>
-                <td>{h(row.VendorName)}</td>
-                <td>{h(row.ProjectName)}</td>
-                <td>{h(row.Department)}</td>
-                <td>{h(row.NeededByDate)}</td>
-                <td class="right">{currency(row.EstimatedAmount)}</td>
-                <td>{h(row.Priority)}</td>
-                <td>{purchase_request_status_badge(row.RequestStatus)}</td>
-                <td>{h(row.RequestedByName or row.RequestedByEmail)}</td>
-                <td>{review_form}</td>
-            </tr>
-            """
-
-        if not request_rows:
-            request_rows = '<tr><td colspan="11">No purchase requests found yet.</td></tr>'
-
-        content = f"""
-        {message_html}
-
-        <div class="grid kpis">
-            <div class="card kpi">
-                <div class="label">Total Requests</div>
-                <div class="value">{stats["total_requests"]}</div>
-                <div class="trend">All purchase requests</div>
-            </div>
-
-            <div class="card kpi">
-                <div class="label">Submitted</div>
-                <div class="value">{stats["submitted_requests"]}</div>
-                <div class="trend">Waiting for review</div>
-            </div>
-
-            <div class="card kpi">
-                <div class="label">Under Review</div>
-                <div class="value">{stats["under_review_requests"]}</div>
-                <div class="trend">Currently being reviewed</div>
-            </div>
-
-            <div class="card kpi">
-                <div class="label">Approved</div>
-                <div class="value">{stats["approved_requests"]}</div>
-                <div class="trend">Approved requests</div>
-            </div>
-
-            <div class="card kpi">
-                <div class="label">Estimated Total</div>
-                <div class="value">{currency(stats["total_estimated_amount"])}</div>
-                <div class="trend">All request estimates</div>
-            </div>
-        </div>
-
-        <div class="card">
-            <h3>Purchase Requests</h3>
-            <p class="card-subtitle">
-                Review submitted purchase requests and update their status.
-            </p>
-
-            <div class="table-wrap">
-                <table>
-                    <tr>
-                        <th>Request #</th>
-                        <th>Title / Description</th>
-                        <th>Vendor</th>
-                        <th>Project</th>
-                        <th>Department</th>
-                        <th>Needed By</th>
-                        <th class="right">Estimate</th>
-                        <th>Priority</th>
-                        <th>Status</th>
-                        <th>Requested By</th>
-                        <th>Review</th>
-                    </tr>
-                    {request_rows}
-                </table>
-            </div>
-        </div>
-        """
-
-        return shell(
-            title="Purchase Requests",
-            subtitle="Review submitted purchase requests before they become issued POs.",
-            active="Purchase Requests",
-            content=content,
-        )
-
-    except Exception as e:
-        content = f'<div class="notice error">Error loading purchase requests: {h(e)}</div>'
-        return shell(
-            title="Purchase Requests",
-            subtitle="Unable to load purchase requests.",
-            active="Purchase Requests",
-            content=content,
-        ), 500
 
 @app.route("/")
 def home():
@@ -1839,8 +1330,7 @@ def my_dashboard():
     try:
         data = load_personal_dashboard_data()
         overall = data["overall"]
-        pr_stats = load_purchase_request_stats()
-        
+
         vendor_rows = ""
         for row in data["top_vendors"]:
             vendor_rows += f"""
@@ -1917,11 +1407,6 @@ def my_dashboard():
                 <div class="value">{currency(overall["total_remaining_amount"])}</div>
                 <div class="trend">Current PO balance</div>
             </div>
-                        <div class="card kpi">
-                <div class="label">Purchase Requests</div>
-                <div class="value">{pr_stats["submitted_requests"]}</div>
-                <div class="trend">Submitted and waiting</div>
-            </div>
         </div>
         """
 
@@ -1933,12 +1418,10 @@ def my_dashboard():
                 <div class="card">
                     <h3>Admin Control Center</h3>
                     <p class="card-subtitle">Security, user access, uploads, and exports.</p>
-                   <p><a class="button primary" href="/user-access">Manage User Access</a></p>
-<p><a class="button" href="/purchase-requests">Review Purchase Requests</a></p>
-<p><a class="button" href="/purchase-request">Create Purchase Request</a></p>
-<p><a class="button" href="/upload-po">Upload Issued POs</a></p>
-<p><a class="button" href="/import-history">Review Import History</a></p>
-<p><a class="button" href="/exports">Download CSV Exports</a></p>
+                    <p><a class="button primary" href="/user-access">Manage User Access</a></p>
+                    <p><a class="button" href="/upload-po">Upload Issued POs</a></p>
+                    <p><a class="button" href="/import-history">Review Import History</a></p>
+                    <p><a class="button" href="/exports">Download CSV Exports</a></p>
                 </div>
 
                 <div class="card">
@@ -1980,11 +1463,9 @@ def my_dashboard():
                 <div class="card">
                     <h3>Executive Actions</h3>
                     <p class="card-subtitle">High-level procurement review tools.</p>
-                   <p><a class="button primary" href="/po-summary">Open PO Summary</a></p>
-<p><a class="button" href="/purchase-requests">Review Purchase Requests</a></p>
-<p><a class="button" href="/purchase-request">Create Purchase Request</a></p>
-<p><a class="button" href="/exceptions">Review Exceptions</a></p>
-<p><a class="button" href="/exports">Download Exports</a></p>
+                    <p><a class="button primary" href="/po-summary">Open PO Summary</a></p>
+                    <p><a class="button" href="/exceptions">Review Exceptions</a></p>
+                    <p><a class="button" href="/exports">Download Exports</a></p>
                 </div>
 
                 <div class="card">
@@ -2008,11 +1489,9 @@ def my_dashboard():
                     <h3>Accounting Workspace</h3>
                     <p class="card-subtitle">Upload, review imports, resolve exceptions, and export records.</p>
                     <p><a class="button primary" href="/upload-po">Upload Issued POs</a></p>
-<p><a class="button" href="/purchase-requests">Review Purchase Requests</a></p>
-<p><a class="button" href="/purchase-request">Create Purchase Request</a></p>
-<p><a class="button" href="/import-history">Review Import History</a></p>
-<p><a class="button" href="/exceptions">Review Exceptions</a></p>
-<p><a class="button" href="/exports">Download Exports</a></p>
+                    <p><a class="button" href="/import-history">Review Import History</a></p>
+                    <p><a class="button" href="/exceptions">Review Exceptions</a></p>
+                    <p><a class="button" href="/exports">Download Exports</a></p>
                 </div>
 
                 <div class="card">
@@ -2053,10 +1532,9 @@ def my_dashboard():
                 <div class="card">
                     <h3>Project Manager Workspace</h3>
                     <p class="card-subtitle">Review issued POs and drill into project/vendor details.</p>
-                    <p><a class="button primary" href="/purchase-request">Create Purchase Request</a></p>
-<p><a class="button" href="/po-list">Browse PO List</a></p>
-<p><a class="button" href="/po-detail">Search PO Detail</a></p>
-<p><a class="button" href="/po-summary">Open PO Summary</a></p>
+                    <p><a class="button primary" href="/po-list">Browse PO List</a></p>
+                    <p><a class="button" href="/po-detail">Search PO Detail</a></p>
+                    <p><a class="button" href="/po-summary">Open PO Summary</a></p>
                 </div>
 
                 <div class="card">
@@ -2079,10 +1557,9 @@ def my_dashboard():
                 <div class="card">
                     <h3>Viewer Dashboard</h3>
                     <p class="card-subtitle">Read-only access to issued PO information.</p>
-                    <p><a class="button primary" href="/purchase-request">Create Purchase Request</a></p>
-<p><a class="button" href="/po-summary">Open PO Summary</a></p>
-<p><a class="button" href="/po-list">Browse PO List</a></p>
-<p><a class="button" href="/po-detail">Search PO Detail</a></p>
+                    <p><a class="button primary" href="/po-summary">Open PO Summary</a></p>
+                    <p><a class="button" href="/po-list">Browse PO List</a></p>
+                    <p><a class="button" href="/po-detail">Search PO Detail</a></p>
                 </div>
 
                 <div class="card">
