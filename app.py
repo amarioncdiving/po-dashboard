@@ -72,6 +72,8 @@ VALID_ROLES = [
 PAGE_ACCESS = {
     "Dashboard": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "My Dashboard": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
+    "New Purchase Request": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
+    "Purchase Requests": ["Admin", "Executive", "Accounting"],
     "PO Summary": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "PO List": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "PO Detail": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
@@ -918,6 +920,242 @@ def load_personal_dashboard_data():
 
 
 # ------------------------------------------------------------
+# Purchase request helpers
+# ------------------------------------------------------------
+
+def purchase_request_status_badge(status):
+    status = status or "Submitted"
+    status_lower = status.lower()
+    badge_class = "blue"
+
+    if status_lower in ["submitted", "under review"]:
+        badge_class = "amber"
+    elif status_lower in ["approved", "converted to po"]:
+        badge_class = "green"
+    elif status_lower in ["rejected", "cancelled", "canceled"]:
+        badge_class = "red"
+
+    return f'<span class="badge {badge_class}">{h(status)}</span>'
+
+
+def can_review_purchase_requests(role):
+    return role in ["Admin", "Executive", "Accounting"]
+
+
+def generate_purchase_request_number(cursor):
+    today_prefix = datetime.utcnow().strftime("PR-%Y%m%d")
+
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS RequestCount
+        FROM dbo.PurchaseRequests
+        WHERE RequestNumber LIKE ?;
+        """,
+        today_prefix + "-%",
+    )
+
+    row = cursor.fetchone()
+    next_number = (row.RequestCount or 0) + 1
+
+    return f"{today_prefix}-{next_number:04d}"
+
+
+def load_purchase_request_stats():
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT
+            COUNT(*) AS TotalRequests,
+            SUM(CASE WHEN RequestStatus = 'Submitted' THEN 1 ELSE 0 END) AS SubmittedRequests,
+            SUM(CASE WHEN RequestStatus = 'Under Review' THEN 1 ELSE 0 END) AS UnderReviewRequests,
+            SUM(CASE WHEN RequestStatus = 'Approved' THEN 1 ELSE 0 END) AS ApprovedRequests,
+            SUM(CASE WHEN RequestStatus = 'Rejected' THEN 1 ELSE 0 END) AS RejectedRequests,
+            SUM(CASE WHEN RequestStatus = 'Converted to PO' THEN 1 ELSE 0 END) AS ConvertedRequests,
+            SUM(COALESCE(EstimatedAmount, 0)) AS TotalEstimatedAmount
+        FROM dbo.PurchaseRequests;
+        """
+    )
+
+    row = cursor.fetchone()
+    conn.close()
+
+    return {
+        "total_requests": row.TotalRequests or 0,
+        "submitted_requests": row.SubmittedRequests or 0,
+        "under_review_requests": row.UnderReviewRequests or 0,
+        "approved_requests": row.ApprovedRequests or 0,
+        "rejected_requests": row.RejectedRequests or 0,
+        "converted_requests": row.ConvertedRequests or 0,
+        "total_estimated_amount": row.TotalEstimatedAmount or 0,
+    }
+
+
+def load_purchase_requests(limit=100):
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        f"""
+        SELECT TOP {int(limit)}
+            PurchaseRequestId,
+            RequestNumber,
+            RequestedByEmail,
+            RequestedByName,
+            RequestedAt,
+            NeededByDate,
+            VendorName,
+            ProjectName,
+            Department,
+            RequestTitle,
+            RequestDescription,
+            EstimatedAmount,
+            Priority,
+            RequestStatus,
+            ReviewerEmail,
+            ReviewedAt,
+            ReviewNotes,
+            ConvertedPONumber,
+            UpdatedAt
+        FROM dbo.PurchaseRequests
+        ORDER BY RequestedAt DESC;
+        """
+    )
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    return rows
+
+
+def create_purchase_request(form):
+    user = get_current_user()
+    access = get_user_access()
+
+    request_title = clean_text(form.get("request_title"))
+    vendor_name = clean_text(form.get("vendor_name"))
+    project_name = clean_text(form.get("project_name"))
+    department = clean_text(form.get("department"))
+    needed_by_date = clean_date(form.get("needed_by_date"))
+    estimated_amount = clean_decimal(form.get("estimated_amount"))
+    priority = clean_text(form.get("priority"))
+    request_description = clean_text(form.get("request_description"))
+
+    if not request_title:
+        raise ValueError("Request Title is required.")
+
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+
+    try:
+        request_number = generate_purchase_request_number(cursor)
+
+        cursor.execute(
+            """
+            INSERT INTO dbo.PurchaseRequests
+                (
+                    RequestNumber,
+                    RequestedByEmail,
+                    RequestedByName,
+                    NeededByDate,
+                    VendorName,
+                    ProjectName,
+                    Department,
+                    RequestTitle,
+                    RequestDescription,
+                    EstimatedAmount,
+                    Priority,
+                    RequestStatus
+                )
+            OUTPUT INSERTED.PurchaseRequestId
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Submitted');
+            """,
+            request_number,
+            user["email"],
+            access["display_name"] or user["email"],
+            needed_by_date,
+            vendor_name,
+            project_name,
+            department,
+            request_title,
+            request_description,
+            estimated_amount,
+            priority,
+        )
+
+        purchase_request_id = cursor.fetchone().PurchaseRequestId
+        conn.commit()
+
+        return {
+            "purchase_request_id": purchase_request_id,
+            "request_number": request_number,
+        }
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+
+def update_purchase_request_status(form):
+    user = get_current_user()
+
+    purchase_request_id = clean_text(form.get("purchase_request_id"))
+    request_status = clean_text(form.get("request_status"))
+    review_notes = clean_text(form.get("review_notes"))
+    converted_po_number = clean_text(form.get("converted_po_number"))
+
+    valid_statuses = [
+        "Submitted",
+        "Under Review",
+        "Approved",
+        "Rejected",
+        "Converted to PO",
+    ]
+
+    if request_status not in valid_statuses:
+        raise ValueError("Invalid request status.")
+
+    if not purchase_request_id:
+        raise ValueError("Purchase Request ID is required.")
+
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute(
+            """
+            UPDATE dbo.PurchaseRequests
+            SET
+                RequestStatus = ?,
+                ReviewerEmail = ?,
+                ReviewedAt = SYSUTCDATETIME(),
+                ReviewNotes = ?,
+                ConvertedPONumber = ?,
+                UpdatedAt = SYSUTCDATETIME()
+            WHERE PurchaseRequestId = ?;
+            """,
+            request_status,
+            user["email"],
+            review_notes,
+            converted_po_number,
+            purchase_request_id,
+        )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------------
 # Branding / layout
 # ------------------------------------------------------------
 
@@ -971,229 +1209,51 @@ body::before {
   bottom: 0;
   overflow-y: auto;
 }
-.brand {
-  display:flex;
-  gap:12px;
-  align-items:center;
-  margin-bottom:28px;
-  padding:0 8px;
-}
-.logo {
-  width:42px;
-  height:42px;
-  border-radius:12px;
-  display:grid;
-  place-items:center;
-  background: linear-gradient(135deg, #38bdf8, #2563eb);
-  font-weight:900;
-}
+.brand { display:flex; gap:12px; align-items:center; margin-bottom:28px; padding:0 8px; }
+.logo { width:42px; height:42px; border-radius:12px; display:grid; place-items:center; background: linear-gradient(135deg, #38bdf8, #2563eb); font-weight:900; }
 .brand h1 { font-size:18px; line-height:1; margin:0 0 5px; }
 .brand p { margin:0; font-size:12px; color:#bfdbfe; }
-.nav-section {
-  margin: 18px 8px 8px;
-  color: #93c5fd;
-  font-size: 11px;
-  font-weight: 900;
-  letter-spacing: .12em;
-  text-transform: uppercase;
-}
-.nav-divider {
-  height: 1px;
-  background: rgba(191, 219, 254, 0.18);
-  margin: 16px 8px 10px;
-}
-.nav-item {
-  display:flex;
-  gap:12px;
-  align-items:center;
-  color:#e2e8f0;
-  text-decoration:none;
-  padding:13px 14px;
-  border-radius:11px;
-  margin:4px 0;
-  font-size:14px;
-}
+.nav-section { margin: 18px 8px 8px; color: #93c5fd; font-size: 11px; font-weight: 900; letter-spacing: .12em; text-transform: uppercase; }
+.nav-divider { height: 1px; background: rgba(191, 219, 254, 0.18); margin: 16px 8px 10px; }
+.nav-item { display:flex; gap:12px; align-items:center; color:#e2e8f0; text-decoration:none; padding:13px 14px; border-radius:11px; margin:4px 0; font-size:14px; }
 .nav-item:hover { background: rgba(255,255,255,.09); }
-.nav-item.active {
-  background: linear-gradient(135deg, #2563eb, #1d4ed8);
-  color:white;
-  box-shadow: 0 10px 18px rgba(37,99,235,.25);
-}
-.sync-card {
-  margin-top: 22px;
-  background:rgba(37,99,235,.16);
-  border:1px solid rgba(191,219,254,.15);
-  border-radius:16px;
-  padding:15px;
-}
-.status-dot {
-  width:9px;
-  height:9px;
-  border-radius:99px;
-  background:#22c55e;
-  display:inline-block;
-  margin-right:8px;
-  box-shadow:0 0 0 5px rgba(34,197,94,.12);
-}
-.main {
-  margin-left:270px;
-  padding:26px;
-  position: relative;
-  z-index: 1;
-}
-.topbar {
-  display:flex;
-  justify-content:space-between;
-  gap:20px;
-  align-items:flex-start;
-  margin-bottom:20px;
-}
-.topbar h2 {
-  margin:0;
-  font-size:28px;
-  letter-spacing:-.04em;
-}
-.topbar p {
-  margin:8px 0 0;
-  color:var(--muted);
-}
-.top-actions {
-  display:flex;
-  gap:12px;
-  align-items:center;
-  color:var(--muted);
-  font-size:13px;
-}
-.button, button {
-  border:1px solid var(--line);
-  background:white;
-  border-radius:12px;
-  padding:10px 14px;
-  cursor:pointer;
-  font-weight:700;
-  text-decoration:none;
-  color:var(--text);
-  display:inline-block;
-}
-.primary {
-  background: var(--blue);
-  color:white;
-  border-color:var(--blue);
-}
-.grid {
-  display:grid;
-  gap:16px;
-}
-.kpis {
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-}
-.two {
-  grid-template-columns: 1fr 1fr;
-}
-.card {
-  background:rgba(255, 255, 255, 0.92);
-  backdrop-filter: blur(10px);
-  border:1px solid rgba(226, 232, 240, 0.86);
-  border-radius:var(--radius);
-  box-shadow:var(--shadow);
-  padding:18px;
-  overflow:hidden;
-  margin-bottom:16px;
-}
-.card h3 {
-  margin:0 0 15px;
-  font-size:16px;
-  letter-spacing:-.02em;
-}
-.card-subtitle {
-  margin:-8px 0 15px;
-  color:var(--muted);
-  font-size:13px;
-}
-.kpi {
-  position:relative;
-  min-height:125px;
-}
-.kpi .label {
-  color:var(--muted);
-  font-size:12px;
-  font-weight:700;
-}
-.kpi .value {
-  margin:9px 0 4px;
-  font-size:25px;
-  font-weight:900;
-  letter-spacing:-.04em;
-}
-.kpi .trend {
-  font-size:12px;
-  color:var(--muted);
-}
-.badge {
-  border-radius:999px;
-  font-size:11px;
-  font-weight:800;
-  padding:4px 8px;
-  display:inline-flex;
-  align-items:center;
-}
+.nav-item.active { background: linear-gradient(135deg, #2563eb, #1d4ed8); color:white; box-shadow: 0 10px 18px rgba(37,99,235,.25); }
+.sync-card { margin-top: 22px; background:rgba(37,99,235,.16); border:1px solid rgba(191,219,254,.15); border-radius:16px; padding:15px; }
+.status-dot { width:9px; height:9px; border-radius:99px; background:#22c55e; display:inline-block; margin-right:8px; box-shadow:0 0 0 5px rgba(34,197,94,.12); }
+.main { margin-left:270px; padding:26px; position: relative; z-index: 1; }
+.topbar { display:flex; justify-content:space-between; gap:20px; align-items:flex-start; margin-bottom:20px; }
+.topbar h2 { margin:0; font-size:28px; letter-spacing:-.04em; }
+.topbar p { margin:8px 0 0; color:var(--muted); }
+.top-actions { display:flex; gap:12px; align-items:center; color:var(--muted); font-size:13px; }
+.button, button { border:1px solid var(--line); background:white; border-radius:12px; padding:10px 14px; cursor:pointer; font-weight:700; text-decoration:none; color:var(--text); display:inline-block; }
+.primary { background: var(--blue); color:white; border-color:var(--blue); }
+.grid { display:grid; gap:16px; }
+.kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.two { grid-template-columns: 1fr 1fr; }
+.card { background:rgba(255, 255, 255, 0.92); backdrop-filter: blur(10px); border:1px solid rgba(226, 232, 240, 0.86); border-radius:var(--radius); box-shadow:var(--shadow); padding:18px; overflow:hidden; margin-bottom:16px; }
+.card h3 { margin:0 0 15px; font-size:16px; letter-spacing:-.02em; }
+.card-subtitle { margin:-8px 0 15px; color:var(--muted); font-size:13px; }
+.kpi { position:relative; min-height:125px; }
+.kpi .label { color:var(--muted); font-size:12px; font-weight:700; }
+.kpi .value { margin:9px 0 4px; font-size:25px; font-weight:900; letter-spacing:-.04em; }
+.kpi .trend { font-size:12px; color:var(--muted); }
+.badge { border-radius:999px; font-size:11px; font-weight:800; padding:4px 8px; display:inline-flex; align-items:center; }
 .badge.green { background:#dcfce7; color:#166534; }
 .badge.blue { background:#dbeafe; color:#1e40af; }
 .badge.amber { background:#fef3c7; color:#92400e; }
 .badge.red { background:#fee2e2; color:#991b1b; }
-.table-wrap {
-  max-height:560px;
-  overflow:auto;
-  border:1px solid var(--line);
-  border-radius:14px;
-}
-table {
-  width:100%;
-  border-collapse:collapse;
-  font-size:13px;
-}
-th, td {
-  text-align:left;
-  border-bottom:1px solid var(--line);
-  padding:10px 8px;
-  vertical-align:top;
-}
-th {
-  color:var(--muted);
-  font-size:11px;
-  text-transform:uppercase;
-  letter-spacing:.04em;
-  background:white;
-}
+.table-wrap { max-height:560px; overflow:auto; border:1px solid var(--line); border-radius:14px; }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th, td { text-align:left; border-bottom:1px solid var(--line); padding:10px 8px; vertical-align:top; }
+th { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.04em; background:white; }
 .right { text-align:right; }
-input[type=file], input[type=text], select {
-  padding:12px;
-  border:1px solid var(--line);
-  border-radius:12px;
-  background:white;
-  width:100%;
-  max-width:520px;
-}
-.notice {
-  padding:13px 15px;
-  border-radius:13px;
-  font-weight:700;
-  margin-bottom:16px;
-}
+input[type=file], input[type=text], input[type=date], input[type=number], select, textarea { padding:12px; border:1px solid var(--line); border-radius:12px; background:white; width:100%; max-width:520px; font-family: inherit; }
+textarea { min-height: 110px; resize: vertical; }
+.notice { padding:13px 15px; border-radius:13px; font-weight:700; margin-bottom:16px; }
 .notice.ok { background:#dcfce7; color:#166534; }
 .notice.error { background:#fee2e2; color:#991b1b; }
-code {
-  background:#f1f5f9;
-  padding:8px 10px;
-  display:block;
-  border-radius:12px;
-  white-space:normal;
-}
-@media (max-width: 1000px) {
-  .sidebar { position:relative; width:100%; bottom:auto; }
-  .main { margin-left:0; }
-  .kpis, .two { grid-template-columns: 1fr; }
-}
+code { background:#f1f5f9; padding:8px 10px; display:block; border-radius:12px; white-space:normal; }
+@media (max-width: 1000px) { .sidebar { position:relative; width:100%; bottom:auto; } .main { margin-left:0; } .kpis, .two { grid-template-columns: 1fr; } }
 </style>
 """
 
@@ -1205,6 +1265,8 @@ def shell(title, subtitle, active, content):
     po_nav_items = [
         ("Dashboard", "/", "📊"),
         ("My Dashboard", "/my-dashboard", "🏠"),
+        ("New Purchase Request", "/purchase-request", "📝"),
+        ("Purchase Requests", "/purchase-requests", "✅"),
         ("PO Summary", "/po-summary", "📋"),
         ("PO List", "/po-list", "📄"),
         ("PO Detail", "/po-detail", "🔎"),
@@ -1317,6 +1379,170 @@ def home():
     return redirect("/my-dashboard")
 
 
+@app.route("/purchase-request", methods=["GET", "POST"])
+def purchase_request():
+    allowed, reason = require_page_access("New Purchase Request")
+    if not allowed:
+        return access_denied_response("New Purchase Request", reason)
+
+    message_html = ""
+
+    if request.method == "POST":
+        try:
+            result = create_purchase_request(request.form)
+            message_html = f"""
+            <div class="notice ok">
+                Purchase request submitted successfully. Request Number: {h(result["request_number"])}
+            </div>
+            """
+        except Exception as e:
+            message_html = f'<div class="notice error">Error submitting purchase request: {h(e)}</div>'
+
+    content = f"""
+    {message_html}
+
+    <div class="card">
+        <h3>New Purchase Request</h3>
+        <p class="card-subtitle">Submit a request before a purchase order is issued.</p>
+
+        <form method="post" action="/purchase-request">
+            <p><label>Request Title</label><br><input type="text" name="request_title" placeholder="Example: Dive equipment rental for project 26-204" required></p>
+            <p><label>Vendor Name</label><br><input type="text" name="vendor_name" placeholder="Vendor or supplier name"></p>
+            <p><label>Project Name</label><br><input type="text" name="project_name" placeholder="Project name or number"></p>
+            <p><label>Department</label><br><input type="text" name="department" placeholder="Department"></p>
+            <p><label>Needed By Date</label><br><input type="date" name="needed_by_date"></p>
+            <p><label>Estimated Amount</label><br><input type="number" name="estimated_amount" step="0.01" min="0" placeholder="0.00"></p>
+            <p>
+                <label>Priority</label><br>
+                <select name="priority">
+                    <option value="">Select priority</option>
+                    <option value="Low">Low</option>
+                    <option value="Normal">Normal</option>
+                    <option value="High">High</option>
+                    <option value="Urgent">Urgent</option>
+                </select>
+            </p>
+            <p><label>Description / Notes</label><br><textarea name="request_description" placeholder="Describe what is needed, why it is needed, and any important details."></textarea></p>
+            <p><button class="primary" type="submit">Submit Purchase Request</button></p>
+        </form>
+    </div>
+
+    <div class="card">
+        <h3>What happens next?</h3>
+        <table>
+            <tr><th>Step</th><th>Status</th></tr>
+            <tr><td>Request submitted</td><td><span class="badge green">This page</span></td></tr>
+            <tr><td>Admin / Accounting review</td><td><span class="badge amber">Next</span></td></tr>
+            <tr><td>Request approved or rejected</td><td><span class="badge blue">Review step</span></td></tr>
+            <tr><td>PO is issued</td><td><span class="badge blue">Future workflow</span></td></tr>
+        </table>
+    </div>
+    """
+
+    return shell("New Purchase Request", "Submit a new purchase request for review before a PO is issued.", "New Purchase Request", content)
+
+
+@app.route("/purchase-requests", methods=["GET", "POST"])
+def purchase_requests():
+    allowed, reason = require_page_access("Purchase Requests")
+    if not allowed:
+        return access_denied_response("Purchase Requests", reason)
+
+    access = get_user_access()
+    role = access["role"]
+    message_html = ""
+
+    if request.method == "POST":
+        if not can_review_purchase_requests(role):
+            message_html = '<div class="notice error">You do not have permission to update purchase requests.</div>'
+        else:
+            try:
+                update_purchase_request_status(request.form)
+                message_html = '<div class="notice ok">Purchase request status was updated.</div>'
+            except Exception as e:
+                message_html = f'<div class="notice error">Error updating purchase request: {h(e)}</div>'
+
+    try:
+        stats = load_purchase_request_stats()
+        requests = load_purchase_requests()
+
+        request_rows = ""
+
+        for row in requests:
+            description = row.RequestDescription or ""
+            if len(description) > 160:
+                description = description[:160] + "..."
+
+            status_options = ""
+            for status in ["Submitted", "Under Review", "Approved", "Rejected", "Converted to PO"]:
+                selected = " selected" if status == row.RequestStatus else ""
+                status_options += f'<option value="{h(status)}"{selected}>{h(status)}</option>'
+
+            review_form = ""
+            if can_review_purchase_requests(role):
+                review_form = f"""
+                <form method="post" action="/purchase-requests">
+                    <input type="hidden" name="purchase_request_id" value="{h(row.PurchaseRequestId)}">
+                    <p><select name="request_status">{status_options}</select></p>
+                    <p><input type="text" name="converted_po_number" value="{h(row.ConvertedPONumber)}" placeholder="PO number if converted"></p>
+                    <p><textarea name="review_notes" placeholder="Review notes">{h(row.ReviewNotes)}</textarea></p>
+                    <p><button type="submit">Update</button></p>
+                </form>
+                """
+
+            request_rows += f"""
+            <tr>
+                <td><strong>{h(row.RequestNumber)}</strong><br><span style="color:var(--muted);">{h(row.RequestedAt)}</span></td>
+                <td><strong>{h(row.RequestTitle)}</strong><br><span style="color:var(--muted);">{h(description)}</span></td>
+                <td>{h(row.VendorName)}</td>
+                <td>{h(row.ProjectName)}</td>
+                <td>{h(row.Department)}</td>
+                <td>{h(row.NeededByDate)}</td>
+                <td class="right">{currency(row.EstimatedAmount)}</td>
+                <td>{h(row.Priority)}</td>
+                <td>{purchase_request_status_badge(row.RequestStatus)}</td>
+                <td>{h(row.RequestedByName or row.RequestedByEmail)}</td>
+                <td>{review_form}</td>
+            </tr>
+            """
+
+        if not request_rows:
+            request_rows = '<tr><td colspan="11">No purchase requests found yet.</td></tr>'
+
+        content = f"""
+        {message_html}
+
+        <div class="grid kpis">
+            <div class="card kpi"><div class="label">Total Requests</div><div class="value">{stats["total_requests"]}</div><div class="trend">All purchase requests</div></div>
+            <div class="card kpi"><div class="label">Submitted</div><div class="value">{stats["submitted_requests"]}</div><div class="trend">Waiting for review</div></div>
+            <div class="card kpi"><div class="label">Under Review</div><div class="value">{stats["under_review_requests"]}</div><div class="trend">Currently being reviewed</div></div>
+            <div class="card kpi"><div class="label">Approved</div><div class="value">{stats["approved_requests"]}</div><div class="trend">Approved requests</div></div>
+            <div class="card kpi"><div class="label">Estimated Total</div><div class="value">{currency(stats["total_estimated_amount"])}</div><div class="trend">All request estimates</div></div>
+            <div class="card kpi"><div class="label">Converted to PO</div><div class="value">{stats["converted_requests"]}</div><div class="trend">Requests linked to POs</div></div>
+        </div>
+
+        <div class="card">
+            <h3>Purchase Requests</h3>
+            <p class="card-subtitle">Review submitted purchase requests and update their status.</p>
+            <div class="table-wrap">
+                <table>
+                    <tr>
+                        <th>Request #</th><th>Title / Description</th><th>Vendor</th><th>Project</th><th>Department</th><th>Needed By</th>
+                        <th class="right">Estimate</th><th>Priority</th><th>Status</th><th>Requested By</th><th>Review</th>
+                    </tr>
+                    {request_rows}
+                </table>
+            </div>
+        </div>
+        """
+
+        return shell("Purchase Requests", "Review submitted purchase requests before they become issued POs.", "Purchase Requests", content)
+
+    except Exception as e:
+        content = f'<div class="notice error">Error loading purchase requests: {h(e)}</div>'
+        return shell("Purchase Requests", "Unable to load purchase requests.", "Purchase Requests", content), 500
+
+
 @app.route("/my-dashboard")
 def my_dashboard():
     allowed, reason = require_page_access("My Dashboard")
@@ -1330,30 +1556,17 @@ def my_dashboard():
     try:
         data = load_personal_dashboard_data()
         overall = data["overall"]
+        pr_stats = load_purchase_request_stats()
 
         vendor_rows = ""
         for row in data["top_vendors"]:
-            vendor_rows += f"""
-            <tr>
-                <td>{h(row.VendorName)}</td>
-                <td class="right">{row.POCount}</td>
-                <td class="right">{currency(row.TotalLineAmount)}</td>
-            </tr>
-            """
-
+            vendor_rows += f"<tr><td>{h(row.VendorName)}</td><td class=\"right\">{row.POCount}</td><td class=\"right\">{currency(row.TotalLineAmount)}</td></tr>"
         if not vendor_rows:
             vendor_rows = '<tr><td colspan="3">No vendor data found.</td></tr>'
 
         project_rows = ""
         for row in data["top_projects"]:
-            project_rows += f"""
-            <tr>
-                <td>{h(row.ProjectName)}</td>
-                <td class="right">{row.POCount}</td>
-                <td class="right">{currency(row.TotalLineAmount)}</td>
-            </tr>
-            """
-
+            project_rows += f"<tr><td>{h(row.ProjectName)}</td><td class=\"right\">{row.POCount}</td><td class=\"right\">{currency(row.TotalLineAmount)}</td></tr>"
         if not project_rows:
             project_rows = '<tr><td colspan="3">No project data found.</td></tr>'
 
@@ -1364,265 +1577,142 @@ def my_dashboard():
                 badge_class = "amber"
             if row.ImportStatus and "fail" in row.ImportStatus.lower():
                 badge_class = "red"
-
-            import_rows += f"""
-            <tr>
-                <td>{row.ImportBatchId}</td>
-                <td>{h(row.FileName)}</td>
-                <td>{h(row.UploadedAt)}</td>
-                <td>{row.TotalRows}</td>
-                <td>{row.SuccessCount}</td>
-                <td>{row.ErrorCount}</td>
-                <td><span class="badge {badge_class}">{h(row.ImportStatus)}</span></td>
-            </tr>
-            """
-
+            import_rows += f"<tr><td>{row.ImportBatchId}</td><td>{h(row.FileName)}</td><td>{h(row.UploadedAt)}</td><td>{row.TotalRows}</td><td>{row.SuccessCount}</td><td>{row.ErrorCount}</td><td><span class=\"badge {badge_class}\">{h(row.ImportStatus)}</span></td></tr>"
         if not import_rows:
             import_rows = '<tr><td colspan="7">No imports found.</td></tr>'
 
         common_kpis = f"""
         <div class="grid kpis">
-            <div class="card kpi">
-                <div class="label">Total POs</div>
-                <div class="value">{overall["total_pos"]}</div>
-                <div class="trend">Unique PO numbers</div>
-            </div>
-            <div class="card kpi">
-                <div class="label">Open POs</div>
-                <div class="value">{overall["open_pos"]}</div>
-                <div class="trend">Currently open</div>
-            </div>
-            <div class="card kpi">
-                <div class="label">Total PO Value</div>
-                <div class="value">{currency(overall["total_po_value"])}</div>
-                <div class="trend">Revised/original PO value</div>
-            </div>
-            <div class="card kpi">
-                <div class="label">Line Item Total</div>
-                <div class="value">{currency(overall["total_line_amount"])}</div>
-                <div class="trend">Imported line total</div>
-            </div>
-            <div class="card kpi">
-                <div class="label">Remaining</div>
-                <div class="value">{currency(overall["total_remaining_amount"])}</div>
-                <div class="trend">Current PO balance</div>
-            </div>
+            <div class="card kpi"><div class="label">Total POs</div><div class="value">{overall["total_pos"]}</div><div class="trend">Unique PO numbers</div></div>
+            <div class="card kpi"><div class="label">Open POs</div><div class="value">{overall["open_pos"]}</div><div class="trend">Currently open</div></div>
+            <div class="card kpi"><div class="label">Total PO Value</div><div class="value">{currency(overall["total_po_value"])}</div><div class="trend">Revised/original PO value</div></div>
+            <div class="card kpi"><div class="label">Line Item Total</div><div class="value">{currency(overall["total_line_amount"])}</div><div class="trend">Imported line total</div></div>
+            <div class="card kpi"><div class="label">Remaining</div><div class="value">{currency(overall["total_remaining_amount"])}</div><div class="trend">Current PO balance</div></div>
+            <div class="card kpi"><div class="label">Purchase Requests</div><div class="value">{pr_stats["submitted_requests"]}</div><div class="trend">Submitted and waiting</div></div>
         </div>
         """
 
         if role == "Admin":
             role_content = f"""
             {common_kpis}
-
             <div class="grid two">
                 <div class="card">
                     <h3>Admin Control Center</h3>
-                    <p class="card-subtitle">Security, user access, uploads, and exports.</p>
+                    <p class="card-subtitle">Security, user access, uploads, purchase requests, and exports.</p>
                     <p><a class="button primary" href="/user-access">Manage User Access</a></p>
+                    <p><a class="button" href="/purchase-requests">Review Purchase Requests</a></p>
+                    <p><a class="button" href="/purchase-request">Create Purchase Request</a></p>
                     <p><a class="button" href="/upload-po">Upload Issued POs</a></p>
                     <p><a class="button" href="/import-history">Review Import History</a></p>
                     <p><a class="button" href="/exports">Download CSV Exports</a></p>
                 </div>
-
                 <div class="card">
                     <h3>Admin Health Snapshot</h3>
                     <table>
                         <tr><th>Active Dashboard Users</th><td>{data["active_user_count"]}</td></tr>
                         <tr><th>Import Errors</th><td>{data["import_error_count"]}</td></tr>
+                        <tr><th>Submitted Purchase Requests</th><td>{pr_stats["submitted_requests"]}</td></tr>
                         <tr><th>Amount Mismatch Flags</th><td>{overall["amount_mismatch_count"]}</td></tr>
-                        <tr><th>Signed-In Role</th><td>{h(role)}</td></tr>
                     </table>
                 </div>
             </div>
-
-            <div class="card">
-                <h3>Recent Imports</h3>
-                <p class="card-subtitle">Latest upload activity across the dashboard.</p>
-                <div class="table-wrap">
-                    <table>
-                        <tr>
-                            <th>Batch ID</th>
-                            <th>File Name</th>
-                            <th>Uploaded At</th>
-                            <th>Total Rows</th>
-                            <th>Success</th>
-                            <th>Errors</th>
-                            <th>Status</th>
-                        </tr>
-                        {import_rows}
-                    </table>
-                </div>
-            </div>
+            <div class="card"><h3>Recent Imports</h3><div class="table-wrap"><table><tr><th>Batch ID</th><th>File Name</th><th>Uploaded At</th><th>Total Rows</th><th>Success</th><th>Errors</th><th>Status</th></tr>{import_rows}</table></div></div>
             """
-
         elif role == "Executive":
             role_content = f"""
             {common_kpis}
-
             <div class="grid two">
                 <div class="card">
                     <h3>Executive Actions</h3>
-                    <p class="card-subtitle">High-level procurement review tools.</p>
+                    <p class="card-subtitle">High-level procurement and request review tools.</p>
                     <p><a class="button primary" href="/po-summary">Open PO Summary</a></p>
+                    <p><a class="button" href="/purchase-requests">Review Purchase Requests</a></p>
+                    <p><a class="button" href="/purchase-request">Create Purchase Request</a></p>
                     <p><a class="button" href="/exceptions">Review Exceptions</a></p>
                     <p><a class="button" href="/exports">Download Exports</a></p>
                 </div>
-
                 <div class="card">
                     <h3>Risk Snapshot</h3>
                     <table>
+                        <tr><th>Submitted Requests</th><td>{pr_stats["submitted_requests"]}</td></tr>
                         <tr><th>Amount Mismatch Flags</th><td>{overall["amount_mismatch_count"]}</td></tr>
                         <tr><th>Import Errors</th><td>{data["import_error_count"]}</td></tr>
                         <tr><th>Open POs</th><td>{overall["open_pos"]}</td></tr>
-                        <tr><th>Closed POs</th><td>{overall["closed_pos"]}</td></tr>
                     </table>
                 </div>
             </div>
             """
-
         elif role == "Accounting":
             role_content = f"""
             {common_kpis}
-
             <div class="grid two">
                 <div class="card">
                     <h3>Accounting Workspace</h3>
-                    <p class="card-subtitle">Upload, review imports, resolve exceptions, and export records.</p>
+                    <p class="card-subtitle">Upload, review requests, resolve exceptions, and export records.</p>
                     <p><a class="button primary" href="/upload-po">Upload Issued POs</a></p>
+                    <p><a class="button" href="/purchase-requests">Review Purchase Requests</a></p>
+                    <p><a class="button" href="/purchase-request">Create Purchase Request</a></p>
                     <p><a class="button" href="/import-history">Review Import History</a></p>
                     <p><a class="button" href="/exceptions">Review Exceptions</a></p>
                     <p><a class="button" href="/exports">Download Exports</a></p>
                 </div>
-
                 <div class="card">
-                    <h3>Import Snapshot</h3>
+                    <h3>Import / Request Snapshot</h3>
                     <table>
+                        <tr><th>Submitted Requests</th><td>{pr_stats["submitted_requests"]}</td></tr>
                         <tr><th>Import Errors</th><td>{data["import_error_count"]}</td></tr>
                         <tr><th>Amount Mismatch Flags</th><td>{overall["amount_mismatch_count"]}</td></tr>
                         <tr><th>Total POs</th><td>{overall["total_pos"]}</td></tr>
-                        <tr><th>Open POs</th><td>{overall["open_pos"]}</td></tr>
                     </table>
                 </div>
             </div>
-
-            <div class="card">
-                <h3>Recent Imports</h3>
-                <div class="table-wrap">
-                    <table>
-                        <tr>
-                            <th>Batch ID</th>
-                            <th>File Name</th>
-                            <th>Uploaded At</th>
-                            <th>Total Rows</th>
-                            <th>Success</th>
-                            <th>Errors</th>
-                            <th>Status</th>
-                        </tr>
-                        {import_rows}
-                    </table>
-                </div>
-            </div>
+            <div class="card"><h3>Recent Imports</h3><div class="table-wrap"><table><tr><th>Batch ID</th><th>File Name</th><th>Uploaded At</th><th>Total Rows</th><th>Success</th><th>Errors</th><th>Status</th></tr>{import_rows}</table></div></div>
             """
-
         elif role == "Project Manager":
             role_content = f"""
             {common_kpis}
-
             <div class="grid two">
                 <div class="card">
                     <h3>Project Manager Workspace</h3>
-                    <p class="card-subtitle">Review issued POs and drill into project/vendor details.</p>
-                    <p><a class="button primary" href="/po-list">Browse PO List</a></p>
+                    <p class="card-subtitle">Submit purchase requests and review issued POs.</p>
+                    <p><a class="button primary" href="/purchase-request">Create Purchase Request</a></p>
+                    <p><a class="button" href="/po-list">Browse PO List</a></p>
                     <p><a class="button" href="/po-detail">Search PO Detail</a></p>
                     <p><a class="button" href="/po-summary">Open PO Summary</a></p>
                 </div>
-
-                <div class="card">
-                    <h3>Top Projects</h3>
-                    <div class="table-wrap">
-                        <table>
-                            <tr><th>Project</th><th class="right">POs</th><th class="right">Line Total</th></tr>
-                            {project_rows}
-                        </table>
-                    </div>
-                </div>
+                <div class="card"><h3>Top Projects</h3><div class="table-wrap"><table><tr><th>Project</th><th class="right">POs</th><th class="right">Line Total</th></tr>{project_rows}</table></div></div>
             </div>
             """
-
         else:
             role_content = f"""
             {common_kpis}
-
             <div class="grid two">
                 <div class="card">
                     <h3>Viewer Dashboard</h3>
-                    <p class="card-subtitle">Read-only access to issued PO information.</p>
-                    <p><a class="button primary" href="/po-summary">Open PO Summary</a></p>
+                    <p class="card-subtitle">Submit requests and view read-only PO information.</p>
+                    <p><a class="button primary" href="/purchase-request">Create Purchase Request</a></p>
+                    <p><a class="button" href="/po-summary">Open PO Summary</a></p>
                     <p><a class="button" href="/po-list">Browse PO List</a></p>
                     <p><a class="button" href="/po-detail">Search PO Detail</a></p>
                 </div>
-
-                <div class="card">
-                    <h3>Top Vendors</h3>
-                    <div class="table-wrap">
-                        <table>
-                            <tr><th>Vendor</th><th class="right">POs</th><th class="right">Line Total</th></tr>
-                            {vendor_rows}
-                        </table>
-                    </div>
-                </div>
+                <div class="card"><h3>Top Vendors</h3><div class="table-wrap"><table><tr><th>Vendor</th><th class="right">POs</th><th class="right">Line Total</th></tr>{vendor_rows}</table></div></div>
             </div>
             """
 
         content = f"""
-        <div class="card">
-            <h3>Welcome, {h(display_name)}</h3>
-            <p class="card-subtitle">
-                This dashboard is customized for your role: <strong>{h(role)}</strong>.
-            </p>
-        </div>
-
+        <div class="card"><h3>Welcome, {h(display_name)}</h3><p class="card-subtitle">This dashboard is customized for your role: <strong>{h(role)}</strong>.</p></div>
         {role_content}
-
         <div class="grid two">
-            <div class="card">
-                <h3>Top Vendors</h3>
-                <div class="table-wrap">
-                    <table>
-                        <tr><th>Vendor</th><th class="right">POs</th><th class="right">Line Total</th></tr>
-                        {vendor_rows}
-                    </table>
-                </div>
-            </div>
-
-            <div class="card">
-                <h3>Top Projects</h3>
-                <div class="table-wrap">
-                    <table>
-                        <tr><th>Project</th><th class="right">POs</th><th class="right">Line Total</th></tr>
-                        {project_rows}
-                    </table>
-                </div>
-            </div>
+            <div class="card"><h3>Top Vendors</h3><div class="table-wrap"><table><tr><th>Vendor</th><th class="right">POs</th><th class="right">Line Total</th></tr>{vendor_rows}</table></div></div>
+            <div class="card"><h3>Top Projects</h3><div class="table-wrap"><table><tr><th>Project</th><th class="right">POs</th><th class="right">Line Total</th></tr>{project_rows}</table></div></div>
         </div>
         """
 
-        return shell(
-            title="My Dashboard",
-            subtitle=f"Personalized procurement dashboard for {role}.",
-            active="My Dashboard",
-            content=content,
-        )
+        return shell("My Dashboard", f"Personalized procurement dashboard for {role}.", "My Dashboard", content)
 
     except Exception as e:
         content = f'<div class="notice error">Error loading personal dashboard: {h(e)}</div>'
-        return shell(
-            title="My Dashboard",
-            subtitle="Unable to load personalized dashboard.",
-            active="My Dashboard",
-            content=content,
-        ), 500
-
+        return shell("My Dashboard", "Unable to load personalized dashboard.", "My Dashboard", content), 500
 
 @app.route("/po-summary")
 def po_summary():
@@ -1681,39 +1771,11 @@ def po_summary():
         </div>
 
         <div class="grid two">
-            <div class="card">
-                <h3>POs by Vendor</h3>
-                <p class="card-subtitle">Vendor-level committed value and remaining balance.</p>
-                <div class="table-wrap">
-                    <table>
-                        <tr><th>Vendor</th><th>PO Count</th><th class="right">PO Value</th><th class="right">Line Amount</th><th class="right">Remaining</th></tr>
-                        {vendor_rows}
-                    </table>
-                </div>
-            </div>
-
-            <div class="card">
-                <h3>POs by Project</h3>
-                <p class="card-subtitle">Project-level committed value and remaining balance.</p>
-                <div class="table-wrap">
-                    <table>
-                        <tr><th>Project</th><th>PO Count</th><th class="right">PO Value</th><th class="right">Line Amount</th><th class="right">Remaining</th></tr>
-                        {project_rows}
-                    </table>
-                </div>
-            </div>
+            <div class="card"><h3>POs by Vendor</h3><p class="card-subtitle">Vendor-level committed value and remaining balance.</p><div class="table-wrap"><table><tr><th>Vendor</th><th>PO Count</th><th class="right">PO Value</th><th class="right">Line Amount</th><th class="right">Remaining</th></tr>{vendor_rows}</table></div></div>
+            <div class="card"><h3>POs by Project</h3><p class="card-subtitle">Project-level committed value and remaining balance.</p><div class="table-wrap"><table><tr><th>Project</th><th>PO Count</th><th class="right">PO Value</th><th class="right">Line Amount</th><th class="right">Remaining</th></tr>{project_rows}</table></div></div>
         </div>
 
-        <div class="card">
-            <h3>Recent Import Batches</h3>
-            <p class="card-subtitle">Latest PO upload activity.</p>
-            <div class="table-wrap">
-                <table>
-                    <tr><th>Batch ID</th><th>File Name</th><th>Uploaded At</th><th>Total Rows</th><th>Success</th><th>Errors</th><th>Status</th></tr>
-                    {import_rows}
-                </table>
-            </div>
-        </div>
+        <div class="card"><h3>Recent Import Batches</h3><p class="card-subtitle">Latest PO upload activity.</p><div class="table-wrap"><table><tr><th>Batch ID</th><th>File Name</th><th>Uploaded At</th><th>Total Rows</th><th>Success</th><th>Errors</th><th>Status</th></tr>{import_rows}</table></div></div>
         """
 
         return shell("PO Summary", "Live issued PO summary grouped by vendor, project, and import batch.", "PO Summary", content)
@@ -1721,6 +1783,7 @@ def po_summary():
     except Exception as e:
         content = f'<div class="notice error">Error loading PO summary: {h(e)}</div>'
         return shell("PO Summary", "Unable to load summary.", "PO Summary", content), 500
+
 
 @app.route("/po-list")
 def po_list():
@@ -1760,10 +1823,7 @@ def po_list():
                 POValue,
                 TotalLineAmount,
                 RemainingAmount,
-                CASE
-                    WHEN ABS(COALESCE(POValue, 0) - COALESCE(TotalLineAmount, 0)) > 0.01 THEN 1
-                    ELSE 0
-                END AS AmountMismatch
+                CASE WHEN ABS(COALESCE(POValue, 0) - COALESCE(TotalLineAmount, 0)) > 0.01 THEN 1 ELSE 0 END AS AmountMismatch
             FROM POList
             ORDER BY PODate DESC, PONumber DESC;
             """
@@ -1819,19 +1879,7 @@ def po_list():
             <p class="card-subtitle">Browse all issued POs imported into the dashboard. Click a PO number to view its line items.</p>
             <div class="table-wrap">
                 <table>
-                    <tr>
-                        <th>PO Number</th>
-                        <th>Vendor</th>
-                        <th>Project</th>
-                        <th>Department</th>
-                        <th>Status</th>
-                        <th>PO Date</th>
-                        <th class="right">Lines</th>
-                        <th class="right">PO Value</th>
-                        <th class="right">Line Total</th>
-                        <th class="right">Remaining</th>
-                        <th>Flag</th>
-                    </tr>
+                    <tr><th>PO Number</th><th>Vendor</th><th>Project</th><th>Department</th><th>Status</th><th>PO Date</th><th class="right">Lines</th><th class="right">PO Value</th><th class="right">Line Total</th><th class="right">Remaining</th><th>Flag</th></tr>
                     {po_rows}
                 </table>
             </div>
@@ -1867,10 +1915,7 @@ def po_detail():
 
     if not po_number:
         content = search_form + """
-        <div class="card">
-            <h3>PO Detail</h3>
-            <p class="card-subtitle">Search for a PO number to see vendor, project, totals, and line items.</p>
-        </div>
+        <div class="card"><h3>PO Detail</h3><p class="card-subtitle">Search for a PO number to see vendor, project, totals, and line items.</p></div>
         """
         return shell("PO Detail", "Search and review issued PO line items.", "PO Detail", content)
 
@@ -1907,12 +1952,7 @@ def po_detail():
 
         cursor.execute(
             """
-            SELECT
-                LineDescription,
-                Unit,
-                UnitCost,
-                Qty,
-                LineAmount
+            SELECT LineDescription, Unit, UnitCost, Qty, LineAmount
             FROM dbo.IssuedPOLines
             WHERE PONumber = ?
             ORDER BY IssuedPOLineId;
@@ -1940,13 +1980,7 @@ def po_detail():
         line_rows = ""
         for row in lines:
             line_rows += f"""
-            <tr>
-                <td>{h(row.LineDescription)}</td>
-                <td>{h(row.Unit)}</td>
-                <td class="right">{currency(row.UnitCost)}</td>
-                <td class="right">{h(row.Qty)}</td>
-                <td class="right">{currency(row.LineAmount)}</td>
-            </tr>
+            <tr><td>{h(row.LineDescription)}</td><td>{h(row.Unit)}</td><td class="right">{currency(row.UnitCost)}</td><td class="right">{h(row.Qty)}</td><td class="right">{currency(row.LineAmount)}</td></tr>
             """
 
         content = search_form + f"""
@@ -1957,29 +1991,8 @@ def po_detail():
             <div class="card kpi"><div class="label">Line Item Total</div><div class="value">{currency(totals.TotalLineAmount)}</div><div class="trend">{totals.LineCount} line item(s)</div></div>
             <div class="card kpi"><div class="label">Remaining</div><div class="value">{currency(totals.RemainingAmount)}</div><div class="trend">Current PO balance</div></div>
         </div>
-
-        <div class="card">
-            <h3>PO Header</h3>
-            <table>
-                <tr><th>Vendor</th><td>{h(header.VendorName)}</td></tr>
-                <tr><th>Project</th><td>{h(header.ProjectName)}</td></tr>
-                <tr><th>Department</th><td>{h(header.Department)}</td></tr>
-                <tr><th>PO Date</th><td>{h(header.PODate)}</td></tr>
-                <tr><th>Status</th><td>{h(header.POStatus)}</td></tr>
-                <tr><th>Requestor</th><td>{h(header.Requestor)}</td></tr>
-            </table>
-        </div>
-
-        <div class="card">
-            <h3>Line Items</h3>
-            <p class="card-subtitle">Issued PO line items imported from the upload document.</p>
-            <div class="table-wrap">
-                <table>
-                    <tr><th>Description</th><th>Unit</th><th class="right">Unit Cost</th><th class="right">Qty</th><th class="right">Line Amount</th></tr>
-                    {line_rows}
-                </table>
-            </div>
-        </div>
+        <div class="card"><h3>PO Header</h3><table><tr><th>Vendor</th><td>{h(header.VendorName)}</td></tr><tr><th>Project</th><td>{h(header.ProjectName)}</td></tr><tr><th>Department</th><td>{h(header.Department)}</td></tr><tr><th>PO Date</th><td>{h(header.PODate)}</td></tr><tr><th>Status</th><td>{h(header.POStatus)}</td></tr><tr><th>Requestor</th><td>{h(header.Requestor)}</td></tr></table></div>
+        <div class="card"><h3>Line Items</h3><p class="card-subtitle">Issued PO line items imported from the upload document.</p><div class="table-wrap"><table><tr><th>Description</th><th>Unit</th><th class="right">Unit Cost</th><th class="right">Qty</th><th class="right">Line Amount</th></tr>{line_rows}</table></div></div>
         """
 
         return shell("PO Detail", f"Line item detail for PO {po_number}.", "PO Detail", content)
@@ -2017,16 +2030,7 @@ def upload_po():
                     result = import_po_rows(rows, uploaded_file.filename)
                     message_html = '<div class="notice ok">Issued PO import completed.</div>'
                     result_html = f"""
-                    <div class="card">
-                        <h3>Import Result</h3>
-                        <table>
-                            <tr><th>Import Batch ID</th><td>{result["import_batch_id"]}</td></tr>
-                            <tr><th>Total Rows</th><td>{result["total_rows"]}</td></tr>
-                            <tr><th>Success Count</th><td>{result["success_count"]}</td></tr>
-                            <tr><th>Error Count</th><td>{result["error_count"]}</td></tr>
-                            <tr><th>Status</th><td>{h(result["status"])}</td></tr>
-                        </table>
-                    </div>
+                    <div class="card"><h3>Import Result</h3><table><tr><th>Import Batch ID</th><td>{result["import_batch_id"]}</td></tr><tr><th>Total Rows</th><td>{result["total_rows"]}</td></tr><tr><th>Success Count</th><td>{result["success_count"]}</td></tr><tr><th>Error Count</th><td>{result["error_count"]}</td></tr><tr><th>Status</th><td>{h(result["status"])}</td></tr></table></div>
                     """
 
             except Exception as e:
@@ -2034,28 +2038,12 @@ def upload_po():
                 errors_html = f'<div class="card"><h3>Error Details</h3><p>{h(e)}</p></div>'
 
     content = f"""
-    {message_html}
-    {result_html}
-    {errors_html}
-
-    <div class="card">
-        <h3>Select Issued PO File</h3>
-        <p class="card-subtitle">Upload the cleaned issued PO template as .xlsx or .csv.</p>
-        <form method="post" enctype="multipart/form-data">
-            <p><input type="file" name="po_file" accept=".xlsx,.csv" required></p>
-            <p><button class="primary" type="submit">Upload Issued POs</button></p>
-        </form>
-    </div>
-
-    <div class="card">
-        <h3>Expected Columns</h3>
-        <p class="card-subtitle">The upload must include these exact headers.</p>
-        <code>{h(", ".join(REQUIRED_PO_COLUMNS))}</code>
-    </div>
+    {message_html}{result_html}{errors_html}
+    <div class="card"><h3>Select Issued PO File</h3><p class="card-subtitle">Upload the cleaned issued PO template as .xlsx or .csv.</p><form method="post" enctype="multipart/form-data"><p><input type="file" name="po_file" accept=".xlsx,.csv" required></p><p><button class="primary" type="submit">Upload Issued POs</button></p></form></div>
+    <div class="card"><h3>Expected Columns</h3><p class="card-subtitle">The upload must include these exact headers.</p><code>{h(", ".join(REQUIRED_PO_COLUMNS))}</code></div>
     """
 
     return shell("Upload Issued POs", "Import issued purchase orders and line items into Azure SQL.", "Upload Issued POs", content)
-
 
 @app.route("/import-history")
 def import_history():
@@ -2097,8 +2085,7 @@ def import_history():
                 e.RawRow,
                 e.CreatedAt
             FROM dbo.ImportErrors e
-            LEFT JOIN dbo.ImportBatches b
-                ON e.ImportBatchId = b.ImportBatchId
+            LEFT JOIN dbo.ImportBatches b ON e.ImportBatchId = b.ImportBatchId
             ORDER BY e.CreatedAt DESC;
             """
         )
@@ -2114,17 +2101,7 @@ def import_history():
                 status_badge = "red"
 
             batch_rows += f"""
-            <tr>
-                <td>{row.ImportBatchId}</td>
-                <td>{h(row.FileName)}</td>
-                <td>{h(row.UploadedAt)}</td>
-                <td>{h(row.SourceSystem)}</td>
-                <td>{h(row.UploadedBy)}</td>
-                <td>{row.TotalRows}</td>
-                <td>{row.SuccessCount}</td>
-                <td>{row.ErrorCount}</td>
-                <td><span class="badge {status_badge}">{h(row.ImportStatus)}</span></td>
-            </tr>
+            <tr><td>{row.ImportBatchId}</td><td>{h(row.FileName)}</td><td>{h(row.UploadedAt)}</td><td>{h(row.SourceSystem)}</td><td>{h(row.UploadedBy)}</td><td>{row.TotalRows}</td><td>{row.SuccessCount}</td><td>{row.ErrorCount}</td><td><span class="badge {status_badge}">{h(row.ImportStatus)}</span></td></tr>
             """
 
         if not batch_rows:
@@ -2137,42 +2114,15 @@ def import_history():
                 raw_row = raw_row[:300] + "..."
 
             error_rows += f"""
-            <tr>
-                <td>{row.ImportErrorId}</td>
-                <td>{row.ImportBatchId}</td>
-                <td>{h(row.FileName)}</td>
-                <td>{h(row.RowNumber)}</td>
-                <td>{h(row.ErrorMessage)}</td>
-                <td>{h(raw_row)}</td>
-                <td>{h(row.CreatedAt)}</td>
-            </tr>
+            <tr><td>{row.ImportErrorId}</td><td>{row.ImportBatchId}</td><td>{h(row.FileName)}</td><td>{h(row.RowNumber)}</td><td>{h(row.ErrorMessage)}</td><td>{h(raw_row)}</td><td>{h(row.CreatedAt)}</td></tr>
             """
 
         if not error_rows:
             error_rows = '<tr><td colspan="7">No import errors found.</td></tr>'
 
         content = f"""
-        <div class="card">
-            <h3>Import Batches</h3>
-            <p class="card-subtitle">Latest uploaded PO files and processing results.</p>
-            <div class="table-wrap">
-                <table>
-                    <tr><th>Batch ID</th><th>File Name</th><th>Uploaded At</th><th>Source</th><th>Uploaded By</th><th>Total Rows</th><th>Success</th><th>Errors</th><th>Status</th></tr>
-                    {batch_rows}
-                </table>
-            </div>
-        </div>
-
-        <div class="card">
-            <h3>Recent Import Errors</h3>
-            <p class="card-subtitle">Rows that failed validation or import processing.</p>
-            <div class="table-wrap">
-                <table>
-                    <tr><th>Error ID</th><th>Batch ID</th><th>File Name</th><th>Row Number</th><th>Error Message</th><th>Raw Row</th><th>Created At</th></tr>
-                    {error_rows}
-                </table>
-            </div>
-        </div>
+        <div class="card"><h3>Import Batches</h3><p class="card-subtitle">Latest uploaded PO files and processing results.</p><div class="table-wrap"><table><tr><th>Batch ID</th><th>File Name</th><th>Uploaded At</th><th>Source</th><th>Uploaded By</th><th>Total Rows</th><th>Success</th><th>Errors</th><th>Status</th></tr>{batch_rows}</table></div></div>
+        <div class="card"><h3>Recent Import Errors</h3><p class="card-subtitle">Rows that failed validation or import processing.</p><div class="table-wrap"><table><tr><th>Error ID</th><th>Batch ID</th><th>File Name</th><th>Row Number</th><th>Error Message</th><th>Raw Row</th><th>Created At</th></tr>{error_rows}</table></div></div>
         """
 
         return shell("Import History", "Review uploaded files, row counts, import status, and row-level errors.", "Import History", content)
@@ -2208,89 +2158,31 @@ def exceptions():
                 FROM dbo.IssuedPOLines
                 GROUP BY PONumber
             )
-            SELECT
-                'Amount Mismatch' AS ExceptionType,
-                PONumber,
-                VendorName,
-                ProjectName,
-                Department,
-                POStatus,
-                'Line total does not match revised/original PO value.' AS Message,
-                POValue,
-                TotalLineAmount,
-                RemainingAmount
+            SELECT 'Amount Mismatch' AS ExceptionType, PONumber, VendorName, ProjectName, Department, POStatus,
+                   'Line total does not match revised/original PO value.' AS Message, POValue, TotalLineAmount, RemainingAmount
             FROM POList
             WHERE ABS(COALESCE(POValue, 0) - COALESCE(TotalLineAmount, 0)) > 0.01
-
             UNION ALL
-
-            SELECT
-                'Closed With Remaining Balance' AS ExceptionType,
-                PONumber,
-                VendorName,
-                ProjectName,
-                Department,
-                POStatus,
-                'PO appears closed but still has remaining balance.' AS Message,
-                POValue,
-                TotalLineAmount,
-                RemainingAmount
+            SELECT 'Closed With Remaining Balance' AS ExceptionType, PONumber, VendorName, ProjectName, Department, POStatus,
+                   'PO appears closed but still has remaining balance.' AS Message, POValue, TotalLineAmount, RemainingAmount
             FROM POList
-            WHERE UPPER(COALESCE(POStatus, '')) IN ('CLOSED', 'COMPLETE', 'COMPLETED')
-              AND COALESCE(RemainingAmount, 0) > 0.01
-
+            WHERE UPPER(COALESCE(POStatus, '')) IN ('CLOSED', 'COMPLETE', 'COMPLETED') AND COALESCE(RemainingAmount, 0) > 0.01
             UNION ALL
-
-            SELECT
-                'Open With Zero Remaining' AS ExceptionType,
-                PONumber,
-                VendorName,
-                ProjectName,
-                Department,
-                POStatus,
-                'PO appears open but has zero remaining balance.' AS Message,
-                POValue,
-                TotalLineAmount,
-                RemainingAmount
+            SELECT 'Open With Zero Remaining' AS ExceptionType, PONumber, VendorName, ProjectName, Department, POStatus,
+                   'PO appears open but has zero remaining balance.' AS Message, POValue, TotalLineAmount, RemainingAmount
             FROM POList
-            WHERE UPPER(COALESCE(POStatus, '')) = 'OPEN'
-              AND COALESCE(RemainingAmount, 0) = 0
-
+            WHERE UPPER(COALESCE(POStatus, '')) = 'OPEN' AND COALESCE(RemainingAmount, 0) = 0
             UNION ALL
-
-            SELECT
-                'Missing Department' AS ExceptionType,
-                PONumber,
-                VendorName,
-                ProjectName,
-                Department,
-                POStatus,
-                'PO is missing a department, which may affect role-based filtering.' AS Message,
-                POValue,
-                TotalLineAmount,
-                RemainingAmount
+            SELECT 'Missing Department' AS ExceptionType, PONumber, VendorName, ProjectName, Department, POStatus,
+                   'PO is missing a department, which may affect role-based filtering.' AS Message, POValue, TotalLineAmount, RemainingAmount
             FROM POList
             WHERE Department IS NULL OR LTRIM(RTRIM(Department)) = ''
-
             UNION ALL
-
-            SELECT
-                'Missing Revised Amount' AS ExceptionType,
-                PONumber,
-                VendorName,
-                ProjectName,
-                Department,
-                POStatus,
-                'PO is missing RevisedAmount. OriginalAmount is being used as fallback.' AS Message,
-                POValue,
-                TotalLineAmount,
-                RemainingAmount
+            SELECT 'Missing Revised Amount' AS ExceptionType, PONumber, VendorName, ProjectName, Department, POStatus,
+                   'PO is missing RevisedAmount. OriginalAmount is being used as fallback.' AS Message, POValue, TotalLineAmount, RemainingAmount
             FROM POList
             WHERE PONumber IN (
-                SELECT PONumber
-                FROM dbo.IssuedPOLines
-                GROUP BY PONumber
-                HAVING MAX(RevisedAmount) IS NULL
+                SELECT PONumber FROM dbo.IssuedPOLines GROUP BY PONumber HAVING MAX(RevisedAmount) IS NULL
             )
             ORDER BY ExceptionType, PONumber;
             """
@@ -2308,18 +2200,7 @@ def exceptions():
             badge_class = "red" if row.ExceptionType == "Amount Mismatch" else "amber"
 
             exception_rows += f"""
-            <tr>
-                <td><span class="badge {badge_class}">{h(row.ExceptionType)}</span></td>
-                <td><a href="{po_url}">{h(row.PONumber)}</a></td>
-                <td>{h(row.VendorName)}</td>
-                <td>{h(row.ProjectName)}</td>
-                <td>{h(row.Department)}</td>
-                <td>{h(row.POStatus)}</td>
-                <td>{h(row.Message)}</td>
-                <td class="right">{currency(row.POValue)}</td>
-                <td class="right">{currency(row.TotalLineAmount)}</td>
-                <td class="right">{currency(row.RemainingAmount)}</td>
-            </tr>
+            <tr><td><span class="badge {badge_class}">{h(row.ExceptionType)}</span></td><td><a href="{po_url}">{h(row.PONumber)}</a></td><td>{h(row.VendorName)}</td><td>{h(row.ProjectName)}</td><td>{h(row.Department)}</td><td>{h(row.POStatus)}</td><td>{h(row.Message)}</td><td class="right">{currency(row.POValue)}</td><td class="right">{currency(row.TotalLineAmount)}</td><td class="right">{currency(row.RemainingAmount)}</td></tr>
             """
 
         if not exception_rows:
@@ -2328,46 +2209,13 @@ def exceptions():
         kpi_cards = ""
         if count_by_type:
             for exception_type, count in sorted(count_by_type.items()):
-                kpi_cards += f"""
-                <div class="card kpi">
-                    <div class="label">{h(exception_type)}</div>
-                    <div class="value">{count}</div>
-                    <div class="trend">Exception count</div>
-                </div>
-                """
+                kpi_cards += f'<div class="card kpi"><div class="label">{h(exception_type)}</div><div class="value">{count}</div><div class="trend">Exception count</div></div>'
         else:
-            kpi_cards = """
-            <div class="card kpi">
-                <div class="label">Exceptions</div>
-                <div class="value">0</div>
-                <div class="trend"><span class="badge green">Clean</span></div>
-            </div>
-            """
+            kpi_cards = '<div class="card kpi"><div class="label">Exceptions</div><div class="value">0</div><div class="trend"><span class="badge green">Clean</span></div></div>'
 
         content = f"""
         <div class="grid kpis">{kpi_cards}</div>
-
-        <div class="card">
-            <h3>Data Quality Exceptions</h3>
-            <p class="card-subtitle">Review issued POs that may need correction before expense tracking begins.</p>
-            <div class="table-wrap">
-                <table>
-                    <tr>
-                        <th>Type</th>
-                        <th>PO Number</th>
-                        <th>Vendor</th>
-                        <th>Project</th>
-                        <th>Department</th>
-                        <th>Status</th>
-                        <th>Message</th>
-                        <th class="right">PO Value</th>
-                        <th class="right">Line Total</th>
-                        <th class="right">Remaining</th>
-                    </tr>
-                    {exception_rows}
-                </table>
-            </div>
-        </div>
+        <div class="card"><h3>Data Quality Exceptions</h3><p class="card-subtitle">Review issued POs that may need correction before expense tracking begins.</p><div class="table-wrap"><table><tr><th>Type</th><th>PO Number</th><th>Vendor</th><th>Project</th><th>Department</th><th>Status</th><th>Message</th><th class="right">PO Value</th><th class="right">Line Total</th><th class="right">Remaining</th></tr>{exception_rows}</table></div></div>
         """
 
         return shell("Exceptions", "Data quality checks for issued purchase orders.", "Exceptions", content)
@@ -2385,17 +2233,8 @@ def exports():
 
     content = """
     <div class="grid two">
-        <div class="card">
-            <h3>PO List Export</h3>
-            <p class="card-subtitle">Download one row per issued PO with totals and status.</p>
-            <p><a class="button primary" href="/export-po-list.csv">Download PO List CSV</a></p>
-        </div>
-
-        <div class="card">
-            <h3>Issued Line Items Export</h3>
-            <p class="card-subtitle">Download all issued PO line items from the upload data.</p>
-            <p><a class="button primary" href="/export-issued-lines.csv">Download Line Items CSV</a></p>
-        </div>
+        <div class="card"><h3>PO List Export</h3><p class="card-subtitle">Download one row per issued PO with totals and status.</p><p><a class="button primary" href="/export-po-list.csv">Download PO List CSV</a></p></div>
+        <div class="card"><h3>Issued Line Items Export</h3><p class="card-subtitle">Download all issued PO line items from the upload data.</p><p><a class="button primary" href="/export-issued-lines.csv">Download Line Items CSV</a></p></div>
     </div>
     """
 
@@ -2428,17 +2267,7 @@ def export_po_list_csv():
             FROM dbo.IssuedPOLines
             GROUP BY PONumber
         )
-        SELECT
-            PONumber,
-            VendorName,
-            ProjectName,
-            Department,
-            POStatus,
-            PODate,
-            LineCount,
-            POValue,
-            TotalLineAmount,
-            RemainingAmount
+        SELECT PONumber, VendorName, ProjectName, Department, POStatus, PODate, LineCount, POValue, TotalLineAmount, RemainingAmount
         FROM POList
         ORDER BY PODate DESC, PONumber DESC;
         """
@@ -2449,39 +2278,12 @@ def export_po_list_csv():
 
     output = io.StringIO()
     writer = csv.writer(output)
-
-    writer.writerow([
-        "PONumber",
-        "VendorName",
-        "ProjectName",
-        "Department",
-        "POStatus",
-        "PODate",
-        "LineCount",
-        "POValue",
-        "TotalLineAmount",
-        "RemainingAmount",
-    ])
+    writer.writerow(["PONumber", "VendorName", "ProjectName", "Department", "POStatus", "PODate", "LineCount", "POValue", "TotalLineAmount", "RemainingAmount"])
 
     for row in rows:
-        writer.writerow([
-            row.PONumber,
-            row.VendorName,
-            row.ProjectName,
-            row.Department,
-            row.POStatus,
-            row.PODate,
-            row.LineCount,
-            row.POValue,
-            row.TotalLineAmount,
-            row.RemainingAmount,
-        ])
+        writer.writerow([row.PONumber, row.VendorName, row.ProjectName, row.Department, row.POStatus, row.PODate, row.LineCount, row.POValue, row.TotalLineAmount, row.RemainingAmount])
 
-    return Response(
-        output.getvalue(),
-        mimetype="text/csv",
-        headers={"Content-Disposition": "attachment; filename=po_list_export.csv"},
-    )
+    return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=po_list_export.csv"})
 
 
 @app.route("/export-issued-lines.csv")
@@ -2495,23 +2297,7 @@ def export_issued_lines_csv():
 
     cursor.execute(
         """
-        SELECT
-            PONumber,
-            VendorName,
-            ProjectName,
-            Department,
-            PODate,
-            POStatus,
-            LineDescription,
-            Unit,
-            UnitCost,
-            Qty,
-            LineAmount,
-            OriginalAmount,
-            RevisedAmount,
-            RemainingAmount,
-            Requestor,
-            CreatedAt
+        SELECT PONumber, VendorName, ProjectName, Department, PODate, POStatus, LineDescription, Unit, UnitCost, Qty, LineAmount, OriginalAmount, RevisedAmount, RemainingAmount, Requestor, CreatedAt
         FROM dbo.IssuedPOLines
         ORDER BY PONumber, IssuedPOLineId;
         """
@@ -2522,51 +2308,13 @@ def export_issued_lines_csv():
 
     output = io.StringIO()
     writer = csv.writer(output)
-
-    writer.writerow([
-        "PONumber",
-        "VendorName",
-        "ProjectName",
-        "Department",
-        "PODate",
-        "POStatus",
-        "Description",
-        "Unit",
-        "UnitCost",
-        "Qty",
-        "LineAmount",
-        "OriginalAmount",
-        "RevisedAmount",
-        "RemainingAmount",
-        "Requestor",
-        "CreatedAt",
-    ])
+    writer.writerow(["PONumber", "VendorName", "ProjectName", "Department", "PODate", "POStatus", "Description", "Unit", "UnitCost", "Qty", "LineAmount", "OriginalAmount", "RevisedAmount", "RemainingAmount", "Requestor", "CreatedAt"])
 
     for row in rows:
-        writer.writerow([
-            row.PONumber,
-            row.VendorName,
-            row.ProjectName,
-            row.Department,
-            row.PODate,
-            row.POStatus,
-            row.LineDescription,
-            row.Unit,
-            row.UnitCost,
-            row.Qty,
-            row.LineAmount,
-            row.OriginalAmount,
-            row.RevisedAmount,
-            row.RemainingAmount,
-            row.Requestor,
-            row.CreatedAt,
-        ])
+        writer.writerow([row.PONumber, row.VendorName, row.ProjectName, row.Department, row.PODate, row.POStatus, row.LineDescription, row.Unit, row.UnitCost, row.Qty, row.LineAmount, row.OriginalAmount, row.RevisedAmount, row.RemainingAmount, row.Requestor, row.CreatedAt])
 
-    return Response(
-        output.getvalue(),
-        mimetype="text/csv",
-        headers={"Content-Disposition": "attachment; filename=issued_po_lines_export.csv"},
-    )
+    return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=issued_po_lines_export.csv"})
+
 @app.route("/user-access", methods=["GET", "POST"])
 def user_access():
     allowed, reason = require_page_access("User Access")
@@ -2597,36 +2345,16 @@ def user_access():
 
                 cursor.execute(
                     """
-                    IF EXISTS (
-                        SELECT 1
-                        FROM dbo.DashboardUsers
-                        WHERE LOWER(Email) = LOWER(?)
-                    )
+                    IF EXISTS (SELECT 1 FROM dbo.DashboardUsers WHERE LOWER(Email) = LOWER(?))
                     BEGIN
                         UPDATE dbo.DashboardUsers
-                        SET
-                            DisplayName = ?,
-                            RoleName = ?,
-                            IsActive = ?,
-                            UpdatedAt = SYSUTCDATETIME()
+                        SET DisplayName = ?, RoleName = ?, IsActive = ?, UpdatedAt = SYSUTCDATETIME()
                         WHERE LOWER(Email) = LOWER(?);
                     END
                     ELSE
                     BEGIN
-                        INSERT INTO dbo.DashboardUsers
-                            (
-                                Email,
-                                DisplayName,
-                                RoleName,
-                                IsActive
-                            )
-                        VALUES
-                            (
-                                ?,
-                                ?,
-                                ?,
-                                ?
-                            );
+                        INSERT INTO dbo.DashboardUsers (Email, DisplayName, RoleName, IsActive)
+                        VALUES (?, ?, ?, ?);
                     END
                     """,
                     email,
@@ -2642,7 +2370,6 @@ def user_access():
 
                 conn.commit()
                 conn.close()
-
                 message_html = '<div class="notice ok">User access was saved.</div>'
 
             except Exception as e:
@@ -2654,14 +2381,7 @@ def user_access():
 
         cursor.execute(
             """
-            SELECT
-                DashboardUserId,
-                Email,
-                DisplayName,
-                RoleName,
-                IsActive,
-                CreatedAt,
-                UpdatedAt
+            SELECT DashboardUserId, Email, DisplayName, RoleName, IsActive, CreatedAt, UpdatedAt
             FROM dbo.DashboardUsers
             ORDER BY Email;
             """
@@ -2673,16 +2393,7 @@ def user_access():
         user_rows = ""
         for row in users:
             active_badge = '<span class="badge green">Active</span>' if row.IsActive else '<span class="badge red">Inactive</span>'
-
-            user_rows += f"""
-            <tr>
-                <td>{h(row.Email)}</td>
-                <td>{h(row.DisplayName)}</td>
-                <td><span class="badge blue">{h(row.RoleName)}</span></td>
-                <td>{active_badge}</td>
-                <td>{h(row.UpdatedAt)}</td>
-            </tr>
-            """
+            user_rows += f"<tr><td>{h(row.Email)}</td><td>{h(row.DisplayName)}</td><td><span class=\"badge blue\">{h(row.RoleName)}</span></td><td>{active_badge}</td><td>{h(row.UpdatedAt)}</td></tr>"
 
         if not user_rows:
             user_rows = '<tr><td colspan="5">No users found.</td></tr>'
@@ -2693,73 +2404,19 @@ def user_access():
 
         content = f"""
         {message_html}
-
         <div class="card">
             <h3>Add or Update User Access</h3>
-            <p class="card-subtitle">
-                Admins can add users or update their dashboard role. Use the exact Microsoft 365 email address.
-            </p>
-
+            <p class="card-subtitle">Admins can add users or update their dashboard role. Use the exact Microsoft 365 email address.</p>
             <form method="post" action="/user-access">
-                <p>
-                    <label>Email</label><br>
-                    <input type="text" name="email" placeholder="person@c-diving.com" required>
-                </p>
-
-                <p>
-                    <label>Display Name</label><br>
-                    <input type="text" name="display_name" placeholder="Person Name">
-                </p>
-
-                <p>
-                    <label>Role</label><br>
-                    <select name="role_name" required>
-                        {role_options}
-                    </select>
-                </p>
-
-                <p>
-                    <label>Status</label><br>
-                    <select name="is_active">
-                        <option value="1">Active</option>
-                        <option value="0">Inactive</option>
-                    </select>
-                </p>
-
+                <p><label>Email</label><br><input type="text" name="email" placeholder="person@c-diving.com" required></p>
+                <p><label>Display Name</label><br><input type="text" name="display_name" placeholder="Person Name"></p>
+                <p><label>Role</label><br><select name="role_name" required>{role_options}</select></p>
+                <p><label>Status</label><br><select name="is_active"><option value="1">Active</option><option value="0">Inactive</option></select></p>
                 <p><button class="primary" type="submit">Save User Access</button></p>
             </form>
         </div>
-
-        <div class="card">
-            <h3>Current Dashboard Users</h3>
-            <p class="card-subtitle">Users listed here can be assigned roles for the procurement dashboard.</p>
-
-            <div class="table-wrap">
-                <table>
-                    <tr>
-                        <th>Email</th>
-                        <th>Display Name</th>
-                        <th>Role</th>
-                        <th>Status</th>
-                        <th>Updated At</th>
-                    </tr>
-                    {user_rows}
-                </table>
-            </div>
-        </div>
-
-        <div class="card">
-            <h3>Role Guide</h3>
-            <table>
-                <tr><th>Role</th><th>Access</th></tr>
-                <tr><td>Admin</td><td>Everything, including User Access</td></tr>
-                <tr><td>Executive</td><td>Summary, PO pages, Exceptions, Exports</td></tr>
-                <tr><td>Accounting</td><td>PO pages, Uploads, Import History, Exceptions, Exports</td></tr>
-                <tr><td>Project Manager</td><td>PO Summary, PO List, PO Detail</td></tr>
-                <tr><td>Viewer</td><td>PO Summary, PO List, PO Detail</td></tr>
-                <tr><td>No Access</td><td>Can sign in through Microsoft, but cannot view dashboard data</td></tr>
-            </table>
-        </div>
+        <div class="card"><h3>Current Dashboard Users</h3><p class="card-subtitle">Users listed here can be assigned roles for the procurement dashboard.</p><div class="table-wrap"><table><tr><th>Email</th><th>Display Name</th><th>Role</th><th>Status</th><th>Updated At</th></tr>{user_rows}</table></div></div>
+        <div class="card"><h3>Role Guide</h3><table><tr><th>Role</th><th>Access</th></tr><tr><td>Admin</td><td>Everything, including User Access</td></tr><tr><td>Executive</td><td>Summary, PO pages, purchase request review, Exceptions, Exports</td></tr><tr><td>Accounting</td><td>PO pages, request review, Uploads, Import History, Exceptions, Exports</td></tr><tr><td>Project Manager</td><td>Submit requests, PO Summary, PO List, PO Detail</td></tr><tr><td>Viewer</td><td>Submit requests, read-only PO Summary/List/Detail</td></tr><tr><td>No Access</td><td>Can sign in through Microsoft, but cannot view dashboard data</td></tr></table></div>
         """
 
         return shell("User Access", "Manage SQL-backed dashboard roles and permissions.", "User Access", content)
@@ -2778,6 +2435,9 @@ def whoami():
     user = get_current_user()
     access = get_user_access()
     principal = request.headers.get("X-MS-CLIENT-PRINCIPAL", "")
+    principal_preview = principal[:500]
+    if len(principal) > 500:
+        principal_preview += "..."
 
     auth_status_badge = '<span class="badge green">Authenticated</span>' if user["is_authenticated"] else '<span class="badge amber">Not Detected</span>'
     domain_status_badge = '<span class="badge green">Allowed Domain</span>' if user["is_allowed_domain"] else '<span class="badge amber">Domain Not Confirmed</span>'
@@ -2789,7 +2449,6 @@ def whoami():
         <div class="card">
             <h3>Signed-In User</h3>
             <p class="card-subtitle">This page reads the Microsoft login headers provided by Azure App Service Authentication.</p>
-
             <table>
                 <tr><th>Authentication Status</th><td>{auth_status_badge}</td></tr>
                 <tr><th>Email / User Principal Name</th><td>{h(user["email"])}</td></tr>
@@ -2800,11 +2459,9 @@ def whoami():
                 <tr><th>Azure User ID</th><td>{h(user["user_id"])}</td></tr>
             </table>
         </div>
-
         <div class="card">
             <h3>Dashboard Access</h3>
             <p class="card-subtitle">This is the SQL-backed dashboard permission result.</p>
-
             <table>
                 <tr><th>Found In DashboardUsers</th><td>{sql_status_badge}</td></tr>
                 <tr><th>Display Name</th><td>{h(access["display_name"])}</td></tr>
@@ -2814,17 +2471,15 @@ def whoami():
             </table>
         </div>
     </div>
-
     <div class="card">
         <h3>Raw Azure Authentication Headers</h3>
         <p class="card-subtitle">Useful for troubleshooting.</p>
-
         <table>
             <tr><th>Header</th><th>Value</th></tr>
             <tr><td>X-MS-CLIENT-PRINCIPAL-NAME</td><td>{h(user["email"])}</td></tr>
             <tr><td>X-MS-CLIENT-PRINCIPAL-ID</td><td>{h(user["user_id"])}</td></tr>
             <tr><td>X-MS-CLIENT-PRINCIPAL-IDP</td><td>{h(user["identity_provider"])}</td></tr>
-            <tr><td>X-MS-CLIENT-PRINCIPAL</td><td>{h(principal[:500])}{"..." if len(principal) > 500 else ""}</td></tr>
+            <tr><td>X-MS-CLIENT-PRINCIPAL</td><td>{h(principal_preview)}</td></tr>
         </table>
     </div>
     """
@@ -2839,27 +2494,13 @@ def access_denied():
 
 @app.route("/health")
 def health():
-    return jsonify(
-        {
-            "status": "ok",
-            "environment": APP_ENVIRONMENT,
-            "sql_server": SQL_SERVER_NAME,
-            "database": SQL_DATABASE_NAME,
-            "connection_string_found": bool(SQL_CONNECTION),
-        }
-    )
+    return jsonify({"status": "ok", "environment": APP_ENVIRONMENT, "sql_server": SQL_SERVER_NAME, "database": SQL_DATABASE_NAME, "connection_string_found": bool(SQL_CONNECTION)})
 
 
 @app.route("/db-test")
 def db_test():
     if not SQL_CONNECTION:
-        return jsonify(
-            {
-                "status": "error",
-                "step": "connection_string",
-                "message": "SQL connection string was not found.",
-            }
-        ), 500
+        return jsonify({"status": "error", "step": "connection_string", "message": "SQL connection string was not found."}), 500
 
     try:
         conn = get_sql_connection()
@@ -2867,23 +2508,9 @@ def db_test():
         cursor.execute("SELECT DB_NAME() AS DatabaseName, GETUTCDATE() AS ServerTime")
         row = cursor.fetchone()
         conn.close()
-
-        return jsonify(
-            {
-                "status": "success",
-                "database": row.DatabaseName,
-                "server_time_utc": str(row.ServerTime),
-            }
-        )
-
+        return jsonify({"status": "success", "database": row.DatabaseName, "server_time_utc": str(row.ServerTime)})
     except Exception as e:
-        return jsonify(
-            {
-                "status": "error",
-                "step": "connect_to_sql",
-                "message": str(e),
-            }
-        ), 500
+        return jsonify({"status": "error", "step": "connect_to_sql", "message": str(e)}), 500
 
 
 if __name__ == "__main__":
