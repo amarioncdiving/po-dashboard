@@ -1521,7 +1521,17 @@ def purchase_request():
                         <input type="text" name="request_title" placeholder="Example: Dive equipment rental for project 26-204" required>
                     </div>
                     <div class="form-field"><label>Project</label><input type="text" name="project_name" placeholder="Project name or number"></div>
-                    <div class="form-field"><label>Department</label><input type="text" name="department" placeholder="Department"></div>
+                    <div class="form-field">
+                        <label>Department</label>
+                        <select name="department" required>
+                            <option value="">Select department</option>
+                            <option value="Engineering">Engineering</option>
+                            <option value="Marine Construction">Marine Construction</option>
+                            <option value="Commercial Diving">Commercial Diving</option>
+                            <option value="Dredging">Dredging</option>
+                            <option value="Marine Services">Marine Services</option>
+                        </select>
+                    </div>
                     <div class="form-field"><label>Vendor</label><input type="text" name="vendor_name" placeholder="Vendor or supplier name"></div>
                     <div class="form-field"><label>Estimated Amount</label><input type="number" name="estimated_amount" step="0.01" min="0" placeholder="0.00"></div>
                     <div class="form-field"><label>Estimated Purchase Date</label><input type="date" name="estimated_purchase_date"></div>
