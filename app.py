@@ -877,6 +877,7 @@ def shell(title, subtitle, active, content):
     nav_items = [
     ("Dashboard", "/", "📊"),
     ("PO Summary", "/po-summary", "📋"),
+    ("PO List", "/po-list", "📄"),
     ("PO Detail", "/po-detail", "🔎"),
     ("Upload Issued POs", "/upload-po", "⬆️"),
     ("Import History", "/import-history", "🕘"),
@@ -1214,7 +1215,141 @@ def upload_po():
         active="Upload Issued POs",
         content=content,
     )
-@app.route("/po-detail", methods=["GET"])
+@app.route("/po-list")
+def po_list():
+    try:
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            WITH POList AS (
+                SELECT
+                    PONumber,
+                    MAX(VendorName) AS VendorName,
+                    MAX(ProjectName) AS ProjectName,
+                    MAX(Department) AS Department,
+                    MAX(POStatus) AS POStatus,
+                    MAX(PODate) AS PODate,
+                    COUNT(*) AS LineCount,
+                    MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
+                    SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount,
+                    MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
+                FROM dbo.IssuedPOLines
+                GROUP BY PONumber
+            )
+            SELECT
+                PONumber,
+                VendorName,
+                ProjectName,
+                Department,
+                POStatus,
+                PODate,
+                LineCount,
+                POValue,
+                TotalLineAmount,
+                RemainingAmount,
+                CASE
+                    WHEN ABS(COALESCE(POValue, 0) - COALESCE(TotalLineAmount, 0)) > 0.01 THEN 1
+                    ELSE 0
+                END AS AmountMismatch
+            FROM POList
+            ORDER BY PODate DESC, PONumber DESC;
+            """
+        )
+
+        pos = cursor.fetchall()
+        conn.close()
+
+        po_rows = ""
+
+        for row in pos:
+            status_class = "blue"
+            status_text = row.POStatus or ""
+
+            if status_text.lower() == "open":
+                status_class = "green"
+            elif status_text.lower() in ["closed", "complete", "completed"]:
+                status_class = "blue"
+            elif status_text.lower() in ["cancelled", "canceled"]:
+                status_class = "red"
+            elif status_text.lower() in ["pending", "draft"]:
+                status_class = "amber"
+
+            mismatch_badge = ""
+            if row.AmountMismatch:
+                mismatch_badge = '<span class="badge amber">Check totals</span>'
+
+            po_rows += f"""
+            <tr>
+                <td>
+                    <a href="/po-detail?po_number={row.PONumber}">{row.PONumber}</a>
+                </td>
+                <td>{row.VendorName or ""}</td>
+                <td>{row.ProjectName or ""}</td>
+                <td>{row.Department or ""}</td>
+                <td><span class="badge {status_class}">{status_text}</span></td>
+                <td>{row.PODate or ""}</td>
+                <td class="right">{row.LineCount}</td>
+                <td class="right">{currency(row.POValue)}</td>
+                <td class="right">{currency(row.TotalLineAmount)}</td>
+                <td class="right">{currency(row.RemainingAmount)}</td>
+                <td>{mismatch_badge}</td>
+            </tr>
+            """
+
+        if not po_rows:
+            po_rows = """
+            <tr>
+                <td colspan="11">No issued POs found yet.</td>
+            </tr>
+            """
+
+        content = f"""
+        <div class="card">
+            <h3>Issued PO List</h3>
+            <p class="card-subtitle">
+                Browse all issued POs imported into the dashboard. Click a PO number to view its line items.
+            </p>
+
+            <div class="table-wrap">
+                <table>
+                    <tr>
+                        <th>PO Number</th>
+                        <th>Vendor</th>
+                        <th>Project</th>
+                        <th>Department</th>
+                        <th>Status</th>
+                        <th>PO Date</th>
+                        <th class="right">Lines</th>
+                        <th class="right">PO Value</th>
+                        <th class="right">Line Total</th>
+                        <th class="right">Remaining</th>
+                        <th>Flag</th>
+                    </tr>
+                    {po_rows}
+                </table>
+            </div>
+        </div>
+        """
+
+        return shell(
+            title="PO List",
+            subtitle="Browse issued purchase orders and open PO detail records.",
+            active="PO List",
+            content=content,
+        )
+
+    except Exception as e:
+        content = f'<div class="notice error">Error loading PO list: {str(e)}</div>'
+        return shell(
+            title="PO List",
+            subtitle="Unable to load issued PO list.",
+            active="PO List",
+            content=content,
+        ), 500
+    
+    @app.route("/po-detail", methods=["GET"])
 def po_detail():
     po_number = clean_text(request.args.get("po_number"))
 
