@@ -79,7 +79,7 @@ PAGE_ACCESS = {
     "Exceptions": ["Admin", "Executive", "Accounting"],
     "Exports": ["Admin", "Executive", "Accounting"],
     "User Access": ["Admin"],
-    "Who Am I": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer", "No Access"],
+    "Who Am I": ["Admin"],
 }
 
 
