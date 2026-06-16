@@ -75,6 +75,7 @@ PAGE_ACCESS = {
     "New Purchase Request": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "Purchase Requests": ["Admin", "Executive", "Accounting"],
     "Approver Queue": ["Admin", "Executive", "Accounting"],
+    "Approval Workflow": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "POs & Balances": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "Forecasting": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "Missing PO Review": ["Admin", "Executive", "Accounting"],
@@ -932,9 +933,9 @@ def purchase_request_status_badge(status):
     status_lower = status.lower()
     badge_class = "blue"
 
-    if status_lower in ["submitted", "under review"]:
+    if status_lower in ["submitted", "under review", "project manager review", "project accountant review", "executive approval", "needs information"]:
         badge_class = "amber"
-    elif status_lower in ["approved", "converted to po"]:
+    elif status_lower in ["approved", "converted to po", "auto approved"]:
         badge_class = "green"
     elif status_lower in ["rejected", "cancelled", "canceled"]:
         badge_class = "red"
@@ -944,6 +945,175 @@ def purchase_request_status_badge(status):
 
 def can_review_purchase_requests(role):
     return role in ["Admin", "Executive", "Accounting"]
+
+
+APPROVAL_OPEN_STATUSES = [
+    "Needs Information",
+    "Project Manager Review",
+    "Project Accountant Review",
+    "Executive Approval",
+    "Submitted",
+    "Under Review",
+]
+
+APPROVAL_FINAL_STATUSES = [
+    "Auto Approved",
+    "Approved",
+    "Rejected",
+    "Converted to PO",
+]
+
+
+def approval_status_options(current_status=None):
+    statuses = [
+        "Needs Information",
+        "Project Manager Review",
+        "Project Accountant Review",
+        "Executive Approval",
+        "Auto Approved",
+        "Approved",
+        "Rejected",
+        "Converted to PO",
+    ]
+    options = ""
+    for status in statuses:
+        selected = " selected" if status == current_status else ""
+        options += f'<option value="{h(status)}"{selected}>{h(status)}</option>'
+    return options
+
+
+def load_po_match_snapshot(project_name, vendor_name, estimated_amount):
+    """Return a conservative PO/vendor match snapshot for approval routing."""
+    project_name = clean_text(project_name)
+    vendor_name = clean_text(vendor_name)
+    estimated_amount = float(estimated_amount or 0)
+    empty = {
+        "vendor_exists": False,
+        "open_po_exists": False,
+        "open_balance": 0,
+        "sufficient_balance": False,
+        "po_count": 0,
+        "clean_balance_match": False,
+    }
+    if not project_name or not vendor_name:
+        return empty
+    conn = None
+    try:
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        project_like = "%" + project_name + "%"
+        vendor_like = "%" + vendor_name + "%"
+        cursor.execute(
+            """
+            WITH UniquePOs AS (
+                SELECT
+                    PONumber,
+                    MAX(VendorName) AS VendorName,
+                    MAX(ProjectName) AS ProjectName,
+                    MAX(POStatus) AS POStatus,
+                    MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
+                FROM dbo.IssuedPOLines
+                WHERE
+                    (ProjectName LIKE ? OR ? LIKE '%' + ProjectName + '%')
+                    AND (VendorName LIKE ? OR ? LIKE '%' + VendorName + '%')
+                GROUP BY PONumber
+            )
+            SELECT
+                COUNT(*) AS POCount,
+                SUM(CASE WHEN UPPER(COALESCE(POStatus, '')) = 'OPEN' THEN 1 ELSE 0 END) AS OpenPOCount,
+                SUM(CASE WHEN UPPER(COALESCE(POStatus, '')) = 'OPEN' THEN COALESCE(RemainingAmount, 0) ELSE 0 END) AS OpenBalance
+            FROM UniquePOs;
+            """,
+            project_like,
+            project_name,
+            vendor_like,
+            vendor_name,
+        )
+        row = cursor.fetchone()
+        po_count = row.POCount or 0
+        open_count = row.OpenPOCount or 0
+        open_balance = float(row.OpenBalance or 0)
+        sufficient = open_balance >= estimated_amount if estimated_amount else open_balance > 0
+        return {
+            "vendor_exists": po_count > 0,
+            "open_po_exists": open_count > 0,
+            "open_balance": open_balance,
+            "sufficient_balance": sufficient,
+            "po_count": po_count,
+            "clean_balance_match": po_count > 0 and open_count > 0 and sufficient,
+        }
+    except Exception:
+        return empty
+    finally:
+        if conn:
+            conn.close()
+
+
+def determine_purchase_request_workflow(project_name, vendor_name, estimated_amount, priority=None, has_other_items=False):
+    amount = float(estimated_amount or 0)
+    project_name = clean_text(project_name)
+    vendor_name = clean_text(vendor_name)
+    priority = clean_text(priority)
+    snapshot = load_po_match_snapshot(project_name, vendor_name, amount)
+    exceptions = []
+    if not project_name or not vendor_name:
+        exceptions.append("Missing project or vendor")
+    if vendor_name and not snapshot["vendor_exists"]:
+        exceptions.append("New vendor or no issued PO match")
+    if snapshot["vendor_exists"] and not snapshot["open_po_exists"]:
+        exceptions.append("No open PO balance")
+    if snapshot["open_po_exists"] and not snapshot["sufficient_balance"]:
+        exceptions.append("Insufficient PO balance")
+    if has_other_items:
+        exceptions.append("Other items included")
+    if priority and priority.lower() == "critical":
+        exceptions.append("Critical priority flag - urgency only")
+
+    clean_balance_match = snapshot["clean_balance_match"] and not has_other_items
+    if not project_name or not vendor_name:
+        return {"status":"Needs Information", "next_approver":"Requester", "route":["Requester"], "summary":"Returned to requester for missing required information.", "exceptions":exceptions, "snapshot":snapshot}
+    if amount <= 499.99:
+        if clean_balance_match:
+            return {"status":"Auto Approved", "next_approver":"Complete", "route":["Auto Approved", "Use Existing PO"], "summary":"Auto approved because the request is under $500 and has an existing open PO balance match.", "exceptions":exceptions, "snapshot":snapshot}
+        return {"status":"Project Manager Review", "next_approver":"Project Manager", "route":["Project Manager", "Project Accountant"], "summary":"Auto approval is blocked, so the request routes to PM then Project Accountant.", "exceptions":exceptions, "snapshot":snapshot}
+    if amount <= 2999.99:
+        if clean_balance_match:
+            return {"status":"Project Accountant Review", "next_approver":"Project Accountant", "route":["Project Accountant"], "summary":"Request routes directly to Project Accountant based on amount and PO balance match.", "exceptions":exceptions, "snapshot":snapshot}
+        return {"status":"Project Manager Review", "next_approver":"Project Manager", "route":["Project Manager", "Project Accountant"], "summary":"Request routes to PM then Project Accountant because it does not have a clean PO balance match.", "exceptions":exceptions, "snapshot":snapshot}
+    if amount <= 9999.99:
+        return {"status":"Project Manager Review", "next_approver":"Project Manager", "route":["Project Manager", "Project Accountant"], "summary":"Request routes to PM then Project Accountant based on the $3,000 to $9,999.99 threshold.", "exceptions":exceptions, "snapshot":snapshot}
+    return {"status":"Project Manager Review", "next_approver":"Project Manager", "route":["Project Manager", "Project Accountant", "Executive"], "summary":"Request routes to PM, Project Accountant, then Executive based on the $10,000+ threshold.", "exceptions":exceptions, "snapshot":snapshot}
+
+
+def workflow_note_text(workflow):
+    exceptions = workflow.get("exceptions") or []
+    route = " -> ".join(workflow.get("route") or [])
+    notes = [
+        "Approval Workflow: " + workflow.get("summary", ""),
+        "Initial Route: " + route,
+        "Next Approver: " + workflow.get("next_approver", ""),
+    ]
+    snapshot = workflow.get("snapshot") or {}
+    if snapshot:
+        notes.append("PO Match Snapshot: open balance " + currency(snapshot.get("open_balance", 0)) + " across " + str(snapshot.get("po_count", 0)) + " matching issued PO(s).")
+    if exceptions:
+        notes.append("Routing Flags: " + "; ".join(exceptions))
+    return "\n".join(notes)
+
+
+def approval_route_html(workflow):
+    steps = workflow.get("route") or []
+    if not steps:
+        return ""
+    html = '<div class="approval-route-summary">'
+    for idx, step in enumerate(steps, start=1):
+        state = "done" if idx == 1 and workflow.get("status") in APPROVAL_FINAL_STATUSES else ("active" if idx == 1 else "future")
+        label = "Current step" if idx == 1 else "Next step"
+        html += f'<div class="workflow-step {state}"><div class="workflow-circle">{idx}</div><div class="workflow-text"><strong>{h(step)}</strong><span>{h(label)}</span></div></div>'
+        if idx < len(steps):
+            html += '<div class="workflow-line"></div>'
+    html += '</div>'
+    return html
 
 
 def generate_purchase_request_number(cursor):
@@ -973,8 +1143,8 @@ def load_purchase_request_stats():
         SELECT
             COUNT(*) AS TotalRequests,
             SUM(CASE WHEN RequestStatus = 'Submitted' THEN 1 ELSE 0 END) AS SubmittedRequests,
-            SUM(CASE WHEN RequestStatus = 'Under Review' THEN 1 ELSE 0 END) AS UnderReviewRequests,
-            SUM(CASE WHEN RequestStatus = 'Approved' THEN 1 ELSE 0 END) AS ApprovedRequests,
+            SUM(CASE WHEN RequestStatus IN ('Under Review','Project Manager Review','Project Accountant Review','Executive Approval','Needs Information') THEN 1 ELSE 0 END) AS UnderReviewRequests,
+            SUM(CASE WHEN RequestStatus IN ('Approved','Auto Approved') THEN 1 ELSE 0 END) AS ApprovedRequests,
             SUM(CASE WHEN RequestStatus = 'Rejected' THEN 1 ELSE 0 END) AS RejectedRequests,
             SUM(CASE WHEN RequestStatus = 'Converted to PO' THEN 1 ELSE 0 END) AS ConvertedRequests,
             SUM(COALESCE(EstimatedAmount, 0)) AS TotalEstimatedAmount
@@ -1076,6 +1246,9 @@ def create_purchase_request(form):
     request_description = "\n\n".join(detail_parts) if detail_parts else request_description
 
     requested_by_name = requested_by or access["display_name"] or user["email"]
+    workflow = determine_purchase_request_workflow(project_name, vendor_name, estimated_amount, priority)
+    initial_status = workflow["status"]
+    workflow_review_notes = workflow_note_text(workflow)
 
     conn = get_sql_connection()
     cursor = conn.cursor()
@@ -1098,10 +1271,12 @@ def create_purchase_request(form):
                     RequestDescription,
                     EstimatedAmount,
                     Priority,
-                    RequestStatus
+                    RequestStatus,
+                    ReviewerEmail,
+                    ReviewNotes
                 )
             OUTPUT INSERTED.PurchaseRequestId
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Submitted');
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
             request_number,
             user["email"],
@@ -1114,6 +1289,9 @@ def create_purchase_request(form):
             request_description,
             estimated_amount,
             priority,
+            initial_status,
+            workflow["next_approver"],
+            workflow_review_notes,
         )
 
         purchase_request_id = cursor.fetchone().PurchaseRequestId
@@ -1122,6 +1300,7 @@ def create_purchase_request(form):
         return {
             "purchase_request_id": purchase_request_id,
             "request_number": request_number,
+            "workflow": workflow,
         }
 
     except Exception:
@@ -1141,8 +1320,13 @@ def update_purchase_request_status(form):
     converted_po_number = clean_text(form.get("converted_po_number"))
 
     valid_statuses = [
+        "Needs Information",
+        "Project Manager Review",
+        "Project Accountant Review",
+        "Executive Approval",
         "Submitted",
         "Under Review",
+        "Auto Approved",
         "Approved",
         "Rejected",
         "Converted to PO",
@@ -1757,6 +1941,21 @@ code { background:#f1f5f9; padding:8px 10px; display:block; border-radius:12px; 
   }
 }
 
+
+
+.approval-route-summary { display:grid; gap:10px; }
+.route-pill { display:inline-flex; align-items:center; gap:8px; border-radius:999px; padding:7px 11px; font-size:12px; font-weight:900; background:#eef2ff; color:#3730a3; }
+.approval-rule-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+.approval-rule-card { border:1px solid var(--line); background:#f8fafc; border-radius:14px; padding:14px; }
+.approval-rule-card strong { display:block; margin-bottom:6px; }
+.approval-rule-card span { color:var(--muted); font-size:12px; }
+.workflow-note { background:#eff6ff; border:1px solid #bfdbfe; color:#1e3a8a; border-radius:13px; padding:12px 14px; font-size:13px; margin:12px 0; }
+.approval-flow-columns { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
+.approval-flow-card { border:1px solid var(--line); border-radius:14px; background:#fff; padding:14px; }
+.approval-flow-card h4 { margin:0 0 8px; }
+.approval-flow-card p { margin:0; color:var(--muted); font-size:13px; }
+@media (max-width: 900px) { .approval-rule-grid, .approval-flow-columns { grid-template-columns:1fr; } }
+
 </style>
 """
 
@@ -1770,6 +1969,7 @@ def shell(title, subtitle, active, content):
         ("New Purchase Request", "/purchase-request", "📝"),
         ("Purchase Requests", "/purchase-requests", "📋"),
         ("Approver Queue", "/approver-queue", "✅"),
+        ("Approval Workflow", "/approval-workflow", "🧭"),
         ("POs & Balances", "/pos-balances", "💳"),
         ("Forecasting", "/forecasting", "📈"),
     ]
@@ -2234,7 +2434,8 @@ def purchase_request():
             message_html = f"""
             <div class="submit-status-box success">
                 <strong>Purchase request submitted successfully.</strong><br>
-                Request Number: {h(result["request_number"])}
+                Request Number: {h(result["request_number"])}<br>
+                Initial Route: {h(" -> ".join(result.get("workflow", {}).get("route", [])))}
             </div>
             """
         except Exception as e:
@@ -2373,10 +2574,10 @@ def purchase_request():
                     <h3>Cost Guidance</h3>
                     <table>
                         <tr><th>Estimated Cost</th><th>Likely Review</th></tr>
-                        <tr><td>Under $500</td><td><span class="badge green">Quick review</span></td></tr>
-                        <tr><td>$500 - $3,000</td><td><span class="badge blue">PM / Accounting</span></td></tr>
-                        <tr><td>$3,000 - $10,000</td><td><span class="badge amber">PM + Accounting</span></td></tr>
-                        <tr><td>Over $10,000</td><td><span class="badge purple">Executive likely</span></td></tr>
+                        <tr><td>Up to $499.99</td><td><span class="badge green">Auto if PO balance match, otherwise PM + PA</span></td></tr>
+                        <tr><td>$500 - $2,999.99</td><td><span class="badge blue">PA if matched, otherwise PM + PA</span></td></tr>
+                        <tr><td>$3,000 - $9,999.99</td><td><span class="badge amber">PM + PA</span></td></tr>
+                        <tr><td>$10,000+</td><td><span class="badge purple">PM + PA + Executive</span></td></tr>
                     </table>
                 </div>
 
@@ -2427,10 +2628,7 @@ def purchase_requests():
             if len(description) > 160:
                 description = description[:160] + "..."
 
-            status_options = ""
-            for status in ["Submitted", "Under Review", "Approved", "Rejected", "Converted to PO"]:
-                selected = " selected" if status == row.RequestStatus else ""
-                status_options += f'<option value="{h(status)}"{selected}>{h(status)}</option>'
+            status_options = approval_status_options(row.RequestStatus)
 
             review_form = ""
             if can_review_purchase_requests(role):
@@ -3341,7 +3539,7 @@ def approver_queue():
                 message_html = f'<div class="notice error">Error updating approval item: {h(e)}</div>'
 
     try:
-        rows = [row for row in load_purchase_requests(200) if (row.RequestStatus or "Submitted") in ["Submitted", "Under Review"]]
+        rows = [row for row in load_purchase_requests(200) if (row.RequestStatus or "Submitted") in APPROVAL_OPEN_STATUSES]
         selected_id = clean_text(request.args.get("request_id"))
         selected = None
         if selected_id:
@@ -3367,10 +3565,7 @@ def approver_queue():
 
         detail_html = ""
         if selected:
-            status_options = ""
-            for status in ["Submitted", "Under Review", "Approved", "Rejected", "Converted to PO"]:
-                selected_option = " selected" if status == selected.RequestStatus else ""
-                status_options += f'<option value="{h(status)}"{selected_option}>{h(status)}</option>'
+            status_options = approval_status_options(selected.RequestStatus)
             detail_html = f"""
             <div class="card">
                 <h3>Approval Detail</h3>
@@ -3409,6 +3604,56 @@ def approver_queue():
     except Exception as e:
         content = f'<div class="notice error">Error loading approver queue: {h(e)}</div>'
         return shell("Approver Queue", "Unable to load approval queue.", "Approver Queue", content), 500
+
+
+
+@app.route("/approval-workflow")
+def approval_workflow():
+    allowed, reason = require_page_access("Approval Workflow")
+    if not allowed:
+        return access_denied_response("Approval Workflow", reason)
+
+    content = """
+    <div class="card">
+        <h3>Approval Situations & Routing</h3>
+        <p class="card-subtitle">Critical priority changes urgency only. It does not change approval authority.</p>
+        <div class="workflow-note"><strong>How this is applied in the app:</strong> New purchase requests are assigned an initial approval status based on amount, project/vendor information, and available issued PO balance. The detailed line-item clean-match check can be expanded later when we reintroduce issued PO item selection.</div>
+    </div>
+
+    <div class="approval-flow-columns">
+        <div class="approval-flow-card"><h4>Up to $499.99</h4><p>Auto Approved only when there is an existing vendor, open PO balance, sufficient balance, and no exception. Otherwise routes to Project Manager then Project Accountant.</p></div>
+        <div class="approval-flow-card"><h4>$500 to $2,999.99</h4><p>Clean PO balance match routes to Project Accountant. If not clean, routes to Project Manager then Project Accountant.</p></div>
+        <div class="approval-flow-card"><h4>$3,000 to $9,999.99</h4><p>Routes to Project Manager then Project Accountant.</p></div>
+        <div class="approval-flow-card"><h4>$10,000+</h4><p>Routes to Project Manager, Project Accountant, then Executive approval.</p></div>
+    </div>
+
+    <div class="grid two">
+        <div class="card">
+            <h3>Exception Rules</h3>
+            <div class="approval-rule-grid">
+                <div class="approval-rule-card"><strong>Missing Project or Vendor</strong><span>Returns to requester for more information.</span></div>
+                <div class="approval-rule-card"><strong>New Vendor</strong><span>Blocks auto approval and routes manually by amount threshold.</span></div>
+                <div class="approval-rule-card"><strong>No Open PO Balance</strong><span>Manual approval is required.</span></div>
+                <div class="approval-rule-card"><strong>Insufficient PO Balance</strong><span>Routes manually by amount threshold.</span></div>
+                <div class="approval-rule-card"><strong>Critical Priority</strong><span>Urgency flag only; authority does not change.</span></div>
+                <div class="approval-rule-card"><strong>Requester = Approver</strong><span>Future rule: route to next approval level to prevent self-approval.</span></div>
+            </div>
+        </div>
+        <div class="card">
+            <h3>Approval Hierarchy</h3>
+            <div class="workflow">
+                <div class="workflow-step done"><div class="workflow-circle">1</div><div class="workflow-text"><strong>Field / Requester</strong><span>Submits purchase request.</span></div></div>
+                <div class="workflow-line"></div>
+                <div class="workflow-step active"><div class="workflow-circle">2</div><div class="workflow-text"><strong>Project Manager</strong><span>Reviews scope, need, and project fit.</span></div></div>
+                <div class="workflow-line"></div>
+                <div class="workflow-step future"><div class="workflow-circle">3</div><div class="workflow-text"><strong>Project Accountant</strong><span>Reviews cost, budget, and PO handling.</span></div></div>
+                <div class="workflow-line"></div>
+                <div class="workflow-step future"><div class="workflow-circle">4</div><div class="workflow-text"><strong>Executive</strong><span>Required for $10,000+ requests.</span></div></div>
+            </div>
+        </div>
+    </div>
+    """
+    return shell("Approval Workflow", "Visual routing logic for purchase requests and exception handling.", "Approval Workflow", content)
 
 
 @app.route("/missing-po-review")
