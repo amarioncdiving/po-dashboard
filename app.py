@@ -1042,8 +1042,36 @@ def create_purchase_request(form):
     priority = clean_text(form.get("priority"))
     request_description = clean_text(form.get("request_description"))
 
+    estimated_purchase_date = clean_text(form.get("estimated_purchase_date"))
+    requested_by = clean_text(form.get("requested_by"))
+    business_justification = clean_text(form.get("business_justification"))
+    payment_type = clean_text(form.get("payment_type"))
+    selected_issued_items = clean_text(form.get("selected_issued_items"))
+    other_items = clean_text(form.get("other_items"))
+    quote_backup = clean_text(form.get("quote_backup"))
+
     if not request_title:
         raise ValueError("Request Title is required.")
+
+    detail_parts = []
+    if request_description:
+        detail_parts.append("Description: " + request_description)
+    if business_justification:
+        detail_parts.append("Business Justification: " + business_justification)
+    if estimated_purchase_date:
+        detail_parts.append("Estimated Purchase Date: " + estimated_purchase_date)
+    if payment_type:
+        detail_parts.append("Payment Type: " + payment_type)
+    if selected_issued_items:
+        detail_parts.append("Selected Issued PO Items: " + selected_issued_items)
+    if other_items:
+        detail_parts.append("Other Items: " + other_items)
+    if quote_backup:
+        detail_parts.append("Quote / Backup: " + quote_backup)
+
+    request_description = "\n\n".join(detail_parts) if detail_parts else request_description
+
+    requested_by_name = requested_by or access["display_name"] or user["email"]
 
     conn = get_sql_connection()
     cursor = conn.cursor()
@@ -1073,7 +1101,7 @@ def create_purchase_request(form):
             """,
             request_number,
             user["email"],
-            access["display_name"] or user["email"],
+            requested_by_name,
             needed_by_date,
             vendor_name,
             project_name,
@@ -1254,6 +1282,68 @@ textarea { min-height: 110px; resize: vertical; }
 .notice.error { background:#fee2e2; color:#991b1b; }
 code { background:#f1f5f9; padding:8px 10px; display:block; border-radius:12px; white-space:normal; }
 @media (max-width: 1000px) { .sidebar { position:relative; width:100%; bottom:auto; } .main { margin-left:0; } .kpis, .two { grid-template-columns: 1fr; } }
+
+
+/* Prototype-style purchase request page */
+.page-hero {
+  display:flex;
+  gap:16px;
+  align-items:center;
+  margin-bottom:16px;
+  padding:18px;
+  border-radius:18px;
+  border:1px solid rgba(226,232,240,.9);
+  background:linear-gradient(135deg, rgba(22,163,74,.13), rgba(37,99,235,.10));
+  box-shadow:var(--shadow);
+}
+.page-hero-icon {
+  width:54px;
+  height:54px;
+  border-radius:16px;
+  display:grid;
+  place-items:center;
+  color:white;
+  font-size:26px;
+  background:linear-gradient(135deg, #16a34a, #2563eb);
+}
+.page-hero h2 { margin:0 0 5px; font-size:24px; letter-spacing:-.03em; }
+.page-hero p { margin:0; color:var(--muted); }
+.form-grid { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:14px; }
+.form-field label { display:block; font-weight:800; font-size:12px; color:var(--muted); margin-bottom:7px; }
+.form-field input, .form-field select, .form-field textarea { width:100%; max-width:none; border:1px solid var(--line); border-radius:11px; padding:11px; background:white; font-family:inherit; }
+.form-field.full { grid-column:1 / -1; }
+.form-field textarea { min-height:88px; resize:vertical; }
+.request-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:16px; flex-wrap:wrap; }
+.workflow { display:grid; gap:0; }
+.workflow-step { display:grid; grid-template-columns:44px 1fr; gap:12px; align-items:center; padding:10px; border:1px solid var(--line); border-radius:14px; background:#fff; }
+.workflow-circle { width:36px; height:36px; border-radius:999px; display:grid; place-items:center; font-weight:900; color:white; background:#94a3b8; }
+.workflow-step.done .workflow-circle { background:#16a34a; }
+.workflow-step.active .workflow-circle { background:#2563eb; }
+.workflow-step.warning .workflow-circle { background:#f59e0b; }
+.workflow-step.info .workflow-circle { background:#7c3aed; }
+.workflow-step.future .workflow-circle { background:#64748b; }
+.workflow-text strong { display:block; font-size:14px; }
+.workflow-text span { display:block; color:var(--muted); font-size:12px; margin-top:3px; }
+.workflow-line { width:2px; height:16px; background:var(--line); margin-left:27px; }
+.role-card { display:grid; gap:14px; }
+.role-meta { display:flex; gap:12px; flex-wrap:wrap; color:var(--muted); font-size:13px; }
+.role-meta span { background:#f8fafc; border:1px solid var(--line); border-radius:999px; padding:7px 10px; }
+.issued-items-box { border:1px solid var(--line); border-radius:13px; background:#f8fafc; padding:10px; display:grid; gap:8px; }
+.empty-issued-items { color:var(--muted); font-size:13px; padding:10px; }
+.other-items-header, .other-item-row { display:grid; grid-template-columns:1fr 90px 130px 90px; gap:8px; align-items:center; }
+.other-items-header { color:var(--muted); font-size:11px; font-weight:800; margin-bottom:6px; }
+.other-items-box { display:grid; gap:8px; margin-bottom:10px; }
+.other-item-row input { width:100%; max-width:none; border:1px solid var(--line); border-radius:10px; padding:9px; }
+.match-summary { margin-top:14px; border:1px solid var(--line); background:#f8fafc; border-radius:14px; padding:13px; display:grid; gap:6px; font-size:13px; }
+.match-summary strong { font-size:14px; }
+.match-summary span { color:var(--muted); }
+.form-field input[type="file"] { width:100%; border:1px dashed var(--line); border-radius:11px; padding:10px; background:#f8fafc; }
+.validation-banner { background:#fff7ed; border:1px solid #fed7aa; color:#7c2d12; border-radius:13px; padding:12px 14px; margin:12px 0 14px; font-size:13px; }
+.submit-status-box { border-radius:13px; padding:12px 14px; margin:0 0 16px; font-size:13px; }
+.submit-status-box.success { background:#dcfce7; border:1px solid #bbf7d0; color:#166534; }
+.submit-status-box.error { background:#fee2e2; border:1px solid #fecaca; color:#991b1b; }
+@media (max-width:820px) { .form-grid, .issued-item-option, .other-items-header, .other-item-row { grid-template-columns:1fr; } }
+
 </style>
 """
 
@@ -1385,57 +1475,119 @@ def purchase_request():
     if not allowed:
         return access_denied_response("New Purchase Request", reason)
 
+    user = get_current_user()
+    access = get_user_access()
+    display_name = access["display_name"] or user["email"] or "Current User"
+    role = access["role"]
+
     message_html = ""
 
     if request.method == "POST":
         try:
             result = create_purchase_request(request.form)
             message_html = f"""
-            <div class="notice ok">
-                Purchase request submitted successfully. Request Number: {h(result["request_number"])}
+            <div class="submit-status-box success">
+                <strong>Purchase request submitted successfully.</strong><br>
+                Request Number: {h(result["request_number"])}
             </div>
             """
         except Exception as e:
-            message_html = f'<div class="notice error">Error submitting purchase request: {h(e)}</div>'
+            message_html = f"""
+            <div class="submit-status-box error">
+                <strong>Error submitting purchase request.</strong><br>{h(e)}
+            </div>
+            """
 
     content = f"""
-    {message_html}
-
-    <div class="card">
-        <h3>New Purchase Request</h3>
-        <p class="card-subtitle">Submit a request before a purchase order is issued.</p>
-
-        <form method="post" action="/purchase-request">
-            <p><label>Request Title</label><br><input type="text" name="request_title" placeholder="Example: Dive equipment rental for project 26-204" required></p>
-            <p><label>Vendor Name</label><br><input type="text" name="vendor_name" placeholder="Vendor or supplier name"></p>
-            <p><label>Project Name</label><br><input type="text" name="project_name" placeholder="Project name or number"></p>
-            <p><label>Department</label><br><input type="text" name="department" placeholder="Department"></p>
-            <p><label>Needed By Date</label><br><input type="date" name="needed_by_date"></p>
-            <p><label>Estimated Amount</label><br><input type="number" name="estimated_amount" step="0.01" min="0" placeholder="0.00"></p>
-            <p>
-                <label>Priority</label><br>
-                <select name="priority">
-                    <option value="">Select priority</option>
-                    <option value="Low">Low</option>
-                    <option value="Normal">Normal</option>
-                    <option value="High">High</option>
-                    <option value="Urgent">Urgent</option>
-                </select>
-            </p>
-            <p><label>Description / Notes</label><br><textarea name="request_description" placeholder="Describe what is needed, why it is needed, and any important details."></textarea></p>
-            <p><button class="primary" type="submit">Submit Purchase Request</button></p>
-        </form>
+    <div class="page-hero green">
+        <div class="page-hero-icon">📝</div>
+        <div>
+            <h2>Purchase Request</h2>
+            <p>Submit a purchase request and preview approval routing before a PO is issued.</p>
+        </div>
     </div>
 
-    <div class="card">
-        <h3>What happens next?</h3>
-        <table>
-            <tr><th>Step</th><th>Status</th></tr>
-            <tr><td>Request submitted</td><td><span class="badge green">This page</span></td></tr>
-            <tr><td>Admin / Accounting review</td><td><span class="badge amber">Next</span></td></tr>
-            <tr><td>Request approved or rejected</td><td><span class="badge blue">Review step</span></td></tr>
-            <tr><td>PO is issued</td><td><span class="badge blue">Future workflow</span></td></tr>
-        </table>
+    {message_html}
+
+    <div class="grid two">
+        <div class="card">
+            <h3>Request Details</h3>
+            <p class="card-subtitle">Complete the fields below. Required fields are marked with an asterisk.</p>
+
+            <form method="post" action="/purchase-request">
+                <div class="form-grid">
+                    <div class="form-field full">
+                        <label>Request Title *</label>
+                        <input type="text" name="request_title" placeholder="Example: Dive equipment rental for project 26-204" required>
+                    </div>
+                    <div class="form-field"><label>Project</label><input type="text" name="project_name" placeholder="Project name or number"></div>
+                    <div class="form-field"><label>Department</label><input type="text" name="department" placeholder="Department"></div>
+                    <div class="form-field"><label>Vendor</label><input type="text" name="vendor_name" placeholder="Vendor or supplier name"></div>
+                    <div class="form-field"><label>Estimated Amount</label><input type="number" name="estimated_amount" step="0.01" min="0" placeholder="0.00"></div>
+                    <div class="form-field"><label>Estimated Purchase Date</label><input type="date" name="estimated_purchase_date"></div>
+                    <div class="form-field"><label>Needed By Date</label><input type="date" name="needed_by_date"></div>
+                    <div class="form-field">
+                        <label>Priority</label>
+                        <select name="priority">
+                            <option value="Normal">Normal</option><option value="Low">Low</option><option value="High">High</option><option value="Urgent">Urgent</option><option value="Critical">Critical</option>
+                        </select>
+                    </div>
+                    <div class="form-field"><label>Requested By</label><input type="text" name="requested_by" value="{h(display_name)}"></div>
+                    <div class="form-field full"><label>Description *</label><textarea name="request_description" placeholder="Describe what is needed." required></textarea></div>
+                    <div class="form-field full"><label>Business Justification</label><textarea name="business_justification" placeholder="Why is this needed? Include project impact, urgency, or operational reason."></textarea></div>
+                    <div class="form-field">
+                        <label>Payment Type</label>
+                        <select name="payment_type"><option value="Single Payment">Single Payment</option><option value="Split Payment">Split Payment</option><option value="Progress Payment">Progress Payment</option></select>
+                    </div>
+                    <div class="form-field">
+                        <label>Quote / Backup File Name</label>
+                        <input type="text" name="quote_backup" placeholder="Example: vendor_quote.pdf">
+                        <p class="field-help">File upload will be added later. For now, enter the backup file name or note.</p>
+                    </div>
+                    <div class="form-field full">
+                        <label>Selected Issued PO Items</label>
+                        <div class="issued-items-box"><div class="empty-issued-items">Future phase: after project/vendor selection, matching issued PO line items can appear here for selection.</div></div>
+                        <textarea name="selected_issued_items" placeholder="Optional: list any existing PO items this request relates to."></textarea>
+                    </div>
+                    <div class="form-field full">
+                        <label>Other Items</label>
+                        <div class="other-items-header"><span>Description</span><span>Qty</span><span>Unit Cost</span><span>Total</span></div>
+                        <div class="other-items-box"><div class="other-item-row"><input type="text" name="other_item_description" placeholder="Item description"><input type="number" name="other_item_qty" min="0" step="1" placeholder="1"><input type="number" name="other_item_unit_cost" min="0" step="0.01" placeholder="0.00"><input type="text" placeholder="Auto later" disabled></div></div>
+                        <textarea name="other_items" placeholder="Optional: summarize additional requested items."></textarea>
+                    </div>
+                </div>
+                <div class="request-actions"><a class="button" href="/my-dashboard">Cancel</a><button class="primary" type="submit">Submit Purchase Request</button></div>
+            </form>
+        </div>
+
+        <div>
+            <div class="card role-card">
+                <h3>Requester Profile</h3>
+                <p class="card-subtitle">This is pulled from Microsoft login and dashboard role access.</p>
+                <div class="role-meta"><span><strong>User:</strong> {h(display_name)}</span><span><strong>Role:</strong> {h(role)}</span><span><strong>Email:</strong> {h(user["email"])}</span></div>
+            </div>
+            <div class="card">
+                <h3>Approval Route Preview</h3>
+                <p class="card-subtitle">Initial routing rules. We can make this smarter after the workflow is tested.</p>
+                <div class="workflow">
+                    <div class="workflow-step done"><div class="workflow-circle">1</div><div class="workflow-text"><strong>Request Submitted</strong><span>User submits request and backup details.</span></div></div>
+                    <div class="workflow-line"></div>
+                    <div class="workflow-step active"><div class="workflow-circle">2</div><div class="workflow-text"><strong>Admin / Accounting Review</strong><span>Validate project, vendor, amount, quote, and need.</span></div></div>
+                    <div class="workflow-line"></div>
+                    <div class="workflow-step warning"><div class="workflow-circle">3</div><div class="workflow-text"><strong>Approval Decision</strong><span>Approve, reject, or request more information.</span></div></div>
+                    <div class="workflow-line"></div>
+                    <div class="workflow-step future"><div class="workflow-circle">4</div><div class="workflow-text"><strong>PO Issued</strong><span>Approved request can later be converted into a PO.</span></div></div>
+                </div>
+            </div>
+            <div class="card">
+                <h3>Readiness Checks</h3>
+                <div class="match-summary"><strong>Before submitting, confirm:</strong><span>• Project and vendor are correct.</span><span>• Estimated amount is realistic.</span><span>• Needed-by date supports the project schedule.</span><span>• Quote / backup is available or noted.</span></div>
+            </div>
+            <div class="card">
+                <h3>What Happens Next?</h3>
+                <table><tr><th>Step</th><th>Status</th></tr><tr><td>Request submitted</td><td><span class="badge green">This page</span></td></tr><tr><td>Review queue</td><td><span class="badge amber">/purchase-requests</span></td></tr><tr><td>Approval decision</td><td><span class="badge blue">Reviewer action</span></td></tr><tr><td>PO conversion</td><td><span class="badge blue">Future workflow</span></td></tr></table>
+            </div>
+        </div>
     </div>
     """
 
