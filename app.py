@@ -23,9 +23,9 @@ ALLOWED_EMAIL_DOMAIN = os.getenv("ALLOWED_EMAIL_DOMAIN", "Not set")
 # SQLAzure type becomes SQLAZURECONNSTR_<name>.
 # Custom type becomes CUSTOMCONNSTR_<name>.
 SQL_CONNECTION = (
-    os.getenv("SQLAZURECONNSTR_PODASHBOARD_SQL")
+    os.getenv("PODASHBOARD_SQL")
+    or os.getenv("SQLAZURECONNSTR_PODASHBOARD_SQL")
     or os.getenv("CUSTOMCONNSTR_PODASHBOARD_SQL")
-    or os.getenv("PODASHBOARD_SQL")
     or ""
 )
 
