@@ -275,38 +275,25 @@ def require_page_access(page_name):
 
     return True, ""
 
-
 def access_denied_response(page_name, reason):
-    user = get_current_user()
-    access = get_user_access()
-
-    content = f"""
+    content = """
     <div class="notice error">Access denied.</div>
 
     <div class="card">
-        <h3>You do not have access to this page</h3>
-        <p class="card-subtitle">The dashboard blocked this page based on your assigned role.</p>
+        <h3>You do not have access to this dashboard</h3>
+        <p class="card-subtitle">
+            Your Microsoft account is signed in, but it has not been approved for this procurement dashboard.
+        </p>
 
-        <table>
-            <tr><th>Requested Page</th><td>{h(page_name)}</td></tr>
-            <tr><th>Reason</th><td>{h(reason)}</td></tr>
-            <tr><th>Signed-In Email</th><td>{h(user["email"])}</td></tr>
-            <tr><th>Detected Role</th><td>{h(access["role"])}</td></tr>
-            <tr><th>Found In DashboardUsers</th><td>{"Yes" if access["found_in_sql"] else "No"}</td></tr>
-            <tr><th>Is Active</th><td>{"Yes" if access["is_active"] else "No"}</td></tr>
-        </table>
-    </div>
-
-    <div class="card">
-        <h3>What to do next</h3>
-        <p>If you believe you should have access, ask an Admin to update your role on the User Access page.</p>
-        <p><a class="button" href="/whoami">View Who Am I</a></p>
+        <p>
+            Contact a dashboard Admin if you believe you should have access.
+        </p>
     </div>
     """
 
     return shell(
         title="Access Denied",
-        subtitle="Your signed-in account does not have permission for this page.",
+        subtitle="Your account is not approved for this dashboard.",
         active="",
         content=content,
     ), 403
