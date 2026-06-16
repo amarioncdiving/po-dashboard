@@ -1498,14 +1498,6 @@ def purchase_request():
             """
 
     content = f"""
-    <div class="page-hero green">
-        <div class="page-hero-icon">📝</div>
-        <div>
-            <h2>Purchase Request</h2>
-            <p>Submit a purchase request and preview approval routing before a PO is issued.</p>
-        </div>
-    </div>
-
     {message_html}
 
     <div class="grid two">
