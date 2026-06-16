@@ -617,6 +617,7 @@ HOME_PAGE = """
         </p>
         <p>
             <a href="/upload-po">Upload Issued POs</a> |
+            <a href="/po-summary">PO Summary</a> |
             <a href="/health">Health</a> |
             <a href="/db-test">DB Test</a>
         </p>
@@ -645,7 +646,110 @@ HOME_PAGE = """
 </html>
 """
 
+PO_SUMMARY_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PO Summary</title>
+    """ + BASE_PAGE_STYLE + """
+</head>
+<body>
+    <div class="card">
+        <h1>PO Summary Dashboard</h1>
+        <p><a href="/">Back to Dashboard Home</a> | <a href="/upload-po">Upload Issued POs</a></p>
+    </div>
 
+    {% if error %}
+    <div class="card">
+        <p><span class="status error">Error loading PO summary: {{ error }}</span></p>
+    </div>
+    {% else %}
+
+    <div class="card">
+        <h2>Overall Summary</h2>
+        <table>
+            <tr><th>Total Unique POs</th><td>{{ overall.total_pos }}</td></tr>
+            <tr><th>Open POs</th><td>{{ overall.open_pos }}</td></tr>
+            <tr><th>Total PO Value</th><td>${{ "{:,.2f}".format(overall.total_po_value or 0) }}</td></tr>
+            <tr><th>Total Line Amount</th><td>${{ "{:,.2f}".format(overall.total_line_amount or 0) }}</td></tr>
+            <tr><th>Total Remaining Amount</th><td>${{ "{:,.2f}".format(overall.total_remaining_amount or 0) }}</td></tr>
+        </table>
+    </div>
+
+    <div class="card">
+        <h2>POs by Vendor</h2>
+        <table>
+            <tr>
+                <th>Vendor</th>
+                <th>PO Count</th>
+                <th>Total PO Value</th>
+                <th>Total Line Amount</th>
+                <th>Remaining Amount</th>
+            </tr>
+            {% for row in vendors %}
+            <tr>
+                <td>{{ row.VendorName }}</td>
+                <td>{{ row.POCount }}</td>
+                <td>${{ "{:,.2f}".format(row.TotalPOValue or 0) }}</td>
+                <td>${{ "{:,.2f}".format(row.TotalLineAmount or 0) }}</td>
+                <td>${{ "{:,.2f}".format(row.TotalRemainingAmount or 0) }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+
+    <div class="card">
+        <h2>POs by Project</h2>
+        <table>
+            <tr>
+                <th>Project</th>
+                <th>PO Count</th>
+                <th>Total PO Value</th>
+                <th>Total Line Amount</th>
+                <th>Remaining Amount</th>
+            </tr>
+            {% for row in projects %}
+            <tr>
+                <td>{{ row.ProjectName }}</td>
+                <td>{{ row.POCount }}</td>
+                <td>${{ "{:,.2f}".format(row.TotalPOValue or 0) }}</td>
+                <td>${{ "{:,.2f}".format(row.TotalLineAmount or 0) }}</td>
+                <td>${{ "{:,.2f}".format(row.TotalRemainingAmount or 0) }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+
+    <div class="card">
+        <h2>Recent Import Batches</h2>
+        <table>
+            <tr>
+                <th>Batch ID</th>
+                <th>File Name</th>
+                <th>Uploaded At</th>
+                <th>Total Rows</th>
+                <th>Success</th>
+                <th>Errors</th>
+                <th>Status</th>
+            </tr>
+            {% for row in imports %}
+            <tr>
+                <td>{{ row.ImportBatchId }}</td>
+                <td>{{ row.FileName }}</td>
+                <td>{{ row.UploadedAt }}</td>
+                <td>{{ row.TotalRows }}</td>
+                <td>{{ row.SuccessCount }}</td>
+                <td>{{ row.ErrorCount }}</td>
+                <td>{{ row.ImportStatus }}</td>
+            </tr>
+            {% endfor %}
+        </table>
+    </div>
+
+    {% endif %}
+</body>
+</html>
+"""
 UPLOAD_PO_PAGE = """
 <!DOCTYPE html>
 <html>
@@ -736,7 +840,149 @@ def health():
         }
     )
 
+@app.route("/po-summary")
+def po_summary():
+    try:
+        conn = get_sql_connection()
+        cursor = conn.cursor()
 
+        cursor.execute(
+            """
+            WITH UniquePOs AS (
+                SELECT
+                    PONumber,
+                    MAX(VendorName) AS VendorName,
+                    MAX(ProjectName) AS ProjectName,
+                    MAX(POStatus) AS POStatus,
+                    MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
+                    MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
+                FROM dbo.IssuedPOLines
+                GROUP BY PONumber
+            ),
+            LineTotals AS (
+                SELECT
+                    SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount
+                FROM dbo.IssuedPOLines
+            )
+            SELECT
+                COUNT(*) AS TotalPOs,
+                SUM(CASE WHEN UPPER(COALESCE(POStatus, '')) = 'OPEN' THEN 1 ELSE 0 END) AS OpenPOs,
+                SUM(POValue) AS TotalPOValue,
+                (SELECT TotalLineAmount FROM LineTotals) AS TotalLineAmount,
+                SUM(RemainingAmount) AS TotalRemainingAmount
+            FROM UniquePOs;
+            """
+        )
+        overall_row = cursor.fetchone()
+
+        overall = {
+            "total_pos": overall_row.TotalPOs or 0,
+            "open_pos": overall_row.OpenPOs or 0,
+            "total_po_value": float(overall_row.TotalPOValue or 0),
+            "total_line_amount": float(overall_row.TotalLineAmount or 0),
+            "total_remaining_amount": float(overall_row.TotalRemainingAmount or 0),
+        }
+
+        cursor.execute(
+            """
+            WITH UniquePOs AS (
+                SELECT
+                    PONumber,
+                    MAX(VendorName) AS VendorName,
+                    MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
+                    MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
+                FROM dbo.IssuedPOLines
+                GROUP BY PONumber
+            ),
+            VendorLines AS (
+                SELECT
+                    VendorName,
+                    SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount
+                FROM dbo.IssuedPOLines
+                GROUP BY VendorName
+            )
+            SELECT
+                u.VendorName,
+                COUNT(*) AS POCount,
+                SUM(u.POValue) AS TotalPOValue,
+                COALESCE(MAX(v.TotalLineAmount), 0) AS TotalLineAmount,
+                SUM(u.RemainingAmount) AS TotalRemainingAmount
+            FROM UniquePOs u
+            LEFT JOIN VendorLines v ON u.VendorName = v.VendorName
+            GROUP BY u.VendorName
+            ORDER BY TotalPOValue DESC;
+            """
+        )
+        vendors = cursor.fetchall()
+
+        cursor.execute(
+            """
+            WITH UniquePOs AS (
+                SELECT
+                    PONumber,
+                    MAX(ProjectName) AS ProjectName,
+                    MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
+                    MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
+                FROM dbo.IssuedPOLines
+                GROUP BY PONumber
+            ),
+            ProjectLines AS (
+                SELECT
+                    ProjectName,
+                    SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount
+                FROM dbo.IssuedPOLines
+                GROUP BY ProjectName
+            )
+            SELECT
+                u.ProjectName,
+                COUNT(*) AS POCount,
+                SUM(u.POValue) AS TotalPOValue,
+                COALESCE(MAX(p.TotalLineAmount), 0) AS TotalLineAmount,
+                SUM(u.RemainingAmount) AS TotalRemainingAmount
+            FROM UniquePOs u
+            LEFT JOIN ProjectLines p ON u.ProjectName = p.ProjectName
+            GROUP BY u.ProjectName
+            ORDER BY TotalPOValue DESC;
+            """
+        )
+        projects = cursor.fetchall()
+
+        cursor.execute(
+            """
+            SELECT TOP 10
+                ImportBatchId,
+                FileName,
+                UploadedAt,
+                TotalRows,
+                SuccessCount,
+                ErrorCount,
+                ImportStatus
+            FROM dbo.ImportBatches
+            ORDER BY UploadedAt DESC;
+            """
+        )
+        imports = cursor.fetchall()
+
+        conn.close()
+
+        return render_template_string(
+            PO_SUMMARY_PAGE,
+            overall=overall,
+            vendors=vendors,
+            projects=projects,
+            imports=imports,
+            error=None,
+        )
+
+    except Exception as e:
+        return render_template_string(
+            PO_SUMMARY_PAGE,
+            overall=None,
+            vendors=[],
+            projects=[],
+            imports=[],
+            error=str(e),
+        ), 500
 @app.route("/db-test")
 def db_test():
     if not SQL_CONNECTION:
