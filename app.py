@@ -1353,7 +1353,6 @@ def shell(title, subtitle, active, content):
     role = access["role"]
 
     po_nav_items = [
-        ("Dashboard", "/", "📊"),
         ("My Dashboard", "/my-dashboard", "🏠"),
         ("New Purchase Request", "/purchase-request", "📝"),
         ("Purchase Requests", "/purchase-requests", "✅"),
