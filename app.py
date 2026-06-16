@@ -8,7 +8,7 @@ from datetime import datetime, date
 from decimal import Decimal, InvalidOperation
 from urllib.parse import quote_plus
 
-from flask import Flask, render_template_string, jsonify, request
+from flask import Flask, render_template_string, jsonify, request, Response
 
 
 # ------------------------------------------------------------
@@ -899,6 +899,8 @@ def shell(title, subtitle, active, content):
         ("PO Detail", "/po-detail", "🔎"),
         ("Upload Issued POs", "/upload-po", "⬆️"),
         ("Import History", "/import-history", "🕘"),
+        ("Exceptions", "/exceptions", "⚠️"),
+        ("Exports", "/exports", "⬇️"),
         ("Health", "/health", "🟢"),
         ("DB Test", "/db-test", "🧪"),
     ]
@@ -997,7 +999,9 @@ def home():
                 <tr><td>Upload issued PO spreadsheet</td><td><span class="badge green">Working</span></td></tr>
                 <tr><td>Validate required columns</td><td><span class="badge green">Working</span></td></tr>
                 <tr><td>Write line items to Azure SQL</td><td><span class="badge green">Working</span></td></tr>
-                <tr><td>Browse PO list and details</td><td><span class="badge blue">Added</span></td></tr>
+                <tr><td>Browse PO list and details</td><td><span class="badge green">Working</span></td></tr>
+                <tr><td>Exceptions / data quality</td><td><span class="badge blue">Added</span></td></tr>
+                <tr><td>CSV exports</td><td><span class="badge blue">Added</span></td></tr>
                 <tr><td>Expense upload</td><td><span class="badge amber">Later</span></td></tr>
             </table>
         </div>
@@ -1008,6 +1012,8 @@ def home():
             <p><a class="button" href="/po-summary">View PO Summary</a></p>
             <p><a class="button" href="/po-list">Browse PO List</a></p>
             <p><a class="button" href="/po-detail">Search PO Detail</a></p>
+            <p><a class="button" href="/exceptions">Review Exceptions</a></p>
+            <p><a class="button" href="/exports">Download CSV Exports</a></p>
         </div>
     </div>
     """
@@ -1733,6 +1739,399 @@ def import_history():
             active="Import History",
             content=content,
         ), 500
+
+
+@app.route("/exceptions")
+def exceptions():
+    try:
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            WITH POList AS (
+                SELECT
+                    PONumber,
+                    MAX(VendorName) AS VendorName,
+                    MAX(ProjectName) AS ProjectName,
+                    MAX(Department) AS Department,
+                    MAX(POStatus) AS POStatus,
+                    COUNT(*) AS LineCount,
+                    MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
+                    SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount,
+                    MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
+                FROM dbo.IssuedPOLines
+                GROUP BY PONumber
+            )
+            SELECT
+                'Amount Mismatch' AS ExceptionType,
+                PONumber,
+                VendorName,
+                ProjectName,
+                Department,
+                POStatus,
+                'Line total does not match revised/original PO value.' AS Message,
+                POValue,
+                TotalLineAmount,
+                RemainingAmount
+            FROM POList
+            WHERE ABS(COALESCE(POValue, 0) - COALESCE(TotalLineAmount, 0)) > 0.01
+
+            UNION ALL
+
+            SELECT
+                'Closed With Remaining Balance' AS ExceptionType,
+                PONumber,
+                VendorName,
+                ProjectName,
+                Department,
+                POStatus,
+                'PO appears closed but still has remaining balance.' AS Message,
+                POValue,
+                TotalLineAmount,
+                RemainingAmount
+            FROM POList
+            WHERE UPPER(COALESCE(POStatus, '')) IN ('CLOSED', 'COMPLETE', 'COMPLETED')
+              AND COALESCE(RemainingAmount, 0) > 0.01
+
+            UNION ALL
+
+            SELECT
+                'Open With Zero Remaining' AS ExceptionType,
+                PONumber,
+                VendorName,
+                ProjectName,
+                Department,
+                POStatus,
+                'PO appears open but has zero remaining balance.' AS Message,
+                POValue,
+                TotalLineAmount,
+                RemainingAmount
+            FROM POList
+            WHERE UPPER(COALESCE(POStatus, '')) = 'OPEN'
+              AND COALESCE(RemainingAmount, 0) = 0
+
+            UNION ALL
+
+            SELECT
+                'Missing Department' AS ExceptionType,
+                PONumber,
+                VendorName,
+                ProjectName,
+                Department,
+                POStatus,
+                'PO is missing a department, which may affect role-based filtering.' AS Message,
+                POValue,
+                TotalLineAmount,
+                RemainingAmount
+            FROM POList
+            WHERE Department IS NULL OR LTRIM(RTRIM(Department)) = ''
+
+            UNION ALL
+
+            SELECT
+                'Missing Revised Amount' AS ExceptionType,
+                PONumber,
+                VendorName,
+                ProjectName,
+                Department,
+                POStatus,
+                'PO is missing RevisedAmount. OriginalAmount is being used as fallback.' AS Message,
+                POValue,
+                TotalLineAmount,
+                RemainingAmount
+            FROM POList
+            WHERE PONumber IN (
+                SELECT PONumber
+                FROM dbo.IssuedPOLines
+                GROUP BY PONumber
+                HAVING MAX(RevisedAmount) IS NULL
+            )
+            ORDER BY ExceptionType, PONumber;
+            """
+        )
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        exception_rows = ""
+        count_by_type = {}
+
+        for row in rows:
+            count_by_type[row.ExceptionType] = count_by_type.get(row.ExceptionType, 0) + 1
+            po_url = "/po-detail?po_number=" + quote_plus(str(row.PONumber or ""))
+
+            badge_class = "amber"
+            if row.ExceptionType in ["Amount Mismatch"]:
+                badge_class = "red"
+
+            exception_rows += f"""
+            <tr>
+                <td><span class="badge {badge_class}">{h(row.ExceptionType)}</span></td>
+                <td><a href="{po_url}">{h(row.PONumber)}</a></td>
+                <td>{h(row.VendorName)}</td>
+                <td>{h(row.ProjectName)}</td>
+                <td>{h(row.Department)}</td>
+                <td>{h(row.POStatus)}</td>
+                <td>{h(row.Message)}</td>
+                <td class="right">{currency(row.POValue)}</td>
+                <td class="right">{currency(row.TotalLineAmount)}</td>
+                <td class="right">{currency(row.RemainingAmount)}</td>
+            </tr>
+            """
+
+        if not exception_rows:
+            exception_rows = '<tr><td colspan="10">No exceptions found. Your issued PO data looks clean.</td></tr>'
+
+        kpi_cards = ""
+        if count_by_type:
+            for exception_type, count in sorted(count_by_type.items()):
+                kpi_cards += f"""
+                <div class="card kpi">
+                    <div class="label">{h(exception_type)}</div>
+                    <div class="value">{count}</div>
+                    <div class="trend">Exception count</div>
+                </div>
+                """
+        else:
+            kpi_cards = """
+            <div class="card kpi">
+                <div class="label">Exceptions</div>
+                <div class="value">0</div>
+                <div class="trend"><span class="badge green">Clean</span></div>
+            </div>
+            """
+
+        content = f"""
+        <div class="grid kpis">
+            {kpi_cards}
+        </div>
+
+        <div class="card">
+            <h3>Data Quality Exceptions</h3>
+            <p class="card-subtitle">
+                Review issued POs that may need correction before expense tracking begins.
+            </p>
+            <div class="table-wrap">
+                <table>
+                    <tr>
+                        <th>Type</th>
+                        <th>PO Number</th>
+                        <th>Vendor</th>
+                        <th>Project</th>
+                        <th>Department</th>
+                        <th>Status</th>
+                        <th>Message</th>
+                        <th class="right">PO Value</th>
+                        <th class="right">Line Total</th>
+                        <th class="right">Remaining</th>
+                    </tr>
+                    {exception_rows}
+                </table>
+            </div>
+        </div>
+        """
+
+        return shell(
+            title="Exceptions",
+            subtitle="Data quality checks for issued purchase orders.",
+            active="Exceptions",
+            content=content,
+        )
+
+    except Exception as e:
+        content = f'<div class="notice error">Error loading exceptions: {h(e)}</div>'
+        return shell(
+            title="Exceptions",
+            subtitle="Unable to load exceptions.",
+            active="Exceptions",
+            content=content,
+        ), 500
+
+
+@app.route("/exports")
+def exports():
+    content = """
+    <div class="grid two">
+        <div class="card">
+            <h3>PO List Export</h3>
+            <p class="card-subtitle">Download one row per issued PO with totals and status.</p>
+            <p><a class="button primary" href="/export-po-list.csv">Download PO List CSV</a></p>
+        </div>
+
+        <div class="card">
+            <h3>Issued Line Items Export</h3>
+            <p class="card-subtitle">Download all issued PO line items from the upload data.</p>
+            <p><a class="button primary" href="/export-issued-lines.csv">Download Line Items CSV</a></p>
+        </div>
+    </div>
+    """
+
+    return shell(
+        title="Exports",
+        subtitle="Download procurement dashboard data as CSV files.",
+        active="Exports",
+        content=content,
+    )
+
+
+@app.route("/export-po-list.csv")
+def export_po_list_csv():
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        WITH POList AS (
+            SELECT
+                PONumber,
+                MAX(VendorName) AS VendorName,
+                MAX(ProjectName) AS ProjectName,
+                MAX(Department) AS Department,
+                MAX(POStatus) AS POStatus,
+                MAX(PODate) AS PODate,
+                COUNT(*) AS LineCount,
+                MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
+                SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount,
+                MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
+            FROM dbo.IssuedPOLines
+            GROUP BY PONumber
+        )
+        SELECT
+            PONumber,
+            VendorName,
+            ProjectName,
+            Department,
+            POStatus,
+            PODate,
+            LineCount,
+            POValue,
+            TotalLineAmount,
+            RemainingAmount
+        FROM POList
+        ORDER BY PODate DESC, PONumber DESC;
+        """
+    )
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    writer.writerow([
+        "PONumber",
+        "VendorName",
+        "ProjectName",
+        "Department",
+        "POStatus",
+        "PODate",
+        "LineCount",
+        "POValue",
+        "TotalLineAmount",
+        "RemainingAmount",
+    ])
+
+    for row in rows:
+        writer.writerow([
+            row.PONumber,
+            row.VendorName,
+            row.ProjectName,
+            row.Department,
+            row.POStatus,
+            row.PODate,
+            row.LineCount,
+            row.POValue,
+            row.TotalLineAmount,
+            row.RemainingAmount,
+        ])
+
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=po_list_export.csv"},
+    )
+
+
+@app.route("/export-issued-lines.csv")
+def export_issued_lines_csv():
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT
+            PONumber,
+            VendorName,
+            ProjectName,
+            Department,
+            PODate,
+            POStatus,
+            LineDescription,
+            Unit,
+            UnitCost,
+            Qty,
+            LineAmount,
+            OriginalAmount,
+            RevisedAmount,
+            RemainingAmount,
+            Requestor,
+            CreatedAt
+        FROM dbo.IssuedPOLines
+        ORDER BY PONumber, IssuedPOLineId;
+        """
+    )
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    writer.writerow([
+        "PONumber",
+        "VendorName",
+        "ProjectName",
+        "Department",
+        "PODate",
+        "POStatus",
+        "Description",
+        "Unit",
+        "UnitCost",
+        "Qty",
+        "LineAmount",
+        "OriginalAmount",
+        "RevisedAmount",
+        "RemainingAmount",
+        "Requestor",
+        "CreatedAt",
+    ])
+
+    for row in rows:
+        writer.writerow([
+            row.PONumber,
+            row.VendorName,
+            row.ProjectName,
+            row.Department,
+            row.PODate,
+            row.POStatus,
+            row.LineDescription,
+            row.Unit,
+            row.UnitCost,
+            row.Qty,
+            row.LineAmount,
+            row.OriginalAmount,
+            row.RevisedAmount,
+            row.RemainingAmount,
+            row.Requestor,
+            row.CreatedAt,
+        ])
+
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=issued_po_lines_export.csv"},
+    )
 
 
 @app.route("/health")
