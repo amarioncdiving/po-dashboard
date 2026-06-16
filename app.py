@@ -71,6 +71,7 @@ VALID_ROLES = [
 
 PAGE_ACCESS = {
     "Dashboard": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
+    "My Dashboard": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "PO Summary": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "PO List": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "PO Detail": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
@@ -79,7 +80,7 @@ PAGE_ACCESS = {
     "Exceptions": ["Admin", "Executive", "Accounting"],
     "Exports": ["Admin", "Executive", "Accounting"],
     "User Access": ["Admin"],
-    "Who Am I": ["Admin"],
+    "Who Am I": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
 }
 
 
@@ -274,6 +275,7 @@ def require_page_access(page_name):
         return False, f"Your role, {access['role']}, does not have access to {page_name}."
 
     return True, ""
+
 
 def access_denied_response(page_name, reason):
     content = """
@@ -676,6 +678,10 @@ def import_po_rows(rows, filename):
         conn.close()
 
 
+# ------------------------------------------------------------
+# Data loaders
+# ------------------------------------------------------------
+
 def load_summary_data():
     conn = get_sql_connection()
     cursor = conn.cursor()
@@ -796,6 +802,121 @@ def load_summary_data():
     return overall, vendors, projects, imports
 
 
+def load_personal_dashboard_data():
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        WITH UniquePOs AS (
+            SELECT
+                PONumber,
+                MAX(VendorName) AS VendorName,
+                MAX(ProjectName) AS ProjectName,
+                MAX(Department) AS Department,
+                MAX(POStatus) AS POStatus,
+                MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
+                SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount,
+                MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
+            FROM dbo.IssuedPOLines
+            GROUP BY PONumber
+        )
+        SELECT
+            COUNT(*) AS TotalPOs,
+            SUM(CASE WHEN UPPER(COALESCE(POStatus, '')) = 'OPEN' THEN 1 ELSE 0 END) AS OpenPOs,
+            SUM(CASE WHEN UPPER(COALESCE(POStatus, '')) IN ('CLOSED', 'COMPLETE', 'COMPLETED') THEN 1 ELSE 0 END) AS ClosedPOs,
+            SUM(POValue) AS TotalPOValue,
+            SUM(TotalLineAmount) AS TotalLineAmount,
+            SUM(RemainingAmount) AS TotalRemainingAmount,
+            SUM(CASE WHEN ABS(COALESCE(POValue, 0) - COALESCE(TotalLineAmount, 0)) > 0.01 THEN 1 ELSE 0 END) AS AmountMismatchCount
+        FROM UniquePOs;
+        """
+    )
+    row = cursor.fetchone()
+
+    overall = {
+        "total_pos": row.TotalPOs or 0,
+        "open_pos": row.OpenPOs or 0,
+        "closed_pos": row.ClosedPOs or 0,
+        "total_po_value": row.TotalPOValue or 0,
+        "total_line_amount": row.TotalLineAmount or 0,
+        "total_remaining_amount": row.TotalRemainingAmount or 0,
+        "amount_mismatch_count": row.AmountMismatchCount or 0,
+    }
+
+    cursor.execute(
+        """
+        SELECT TOP 5
+            VendorName,
+            COUNT(DISTINCT PONumber) AS POCount,
+            SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount
+        FROM dbo.IssuedPOLines
+        GROUP BY VendorName
+        ORDER BY TotalLineAmount DESC;
+        """
+    )
+    top_vendors = cursor.fetchall()
+
+    cursor.execute(
+        """
+        SELECT TOP 5
+            ProjectName,
+            COUNT(DISTINCT PONumber) AS POCount,
+            SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount
+        FROM dbo.IssuedPOLines
+        GROUP BY ProjectName
+        ORDER BY TotalLineAmount DESC;
+        """
+    )
+    top_projects = cursor.fetchall()
+
+    cursor.execute(
+        """
+        SELECT TOP 5
+            ImportBatchId,
+            FileName,
+            UploadedAt,
+            TotalRows,
+            SuccessCount,
+            ErrorCount,
+            ImportStatus
+        FROM dbo.ImportBatches
+        ORDER BY UploadedAt DESC;
+        """
+    )
+    recent_imports = cursor.fetchall()
+
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS ActiveUserCount
+        FROM dbo.DashboardUsers
+        WHERE IsActive = 1;
+        """
+    )
+    user_row = cursor.fetchone()
+    active_user_count = user_row.ActiveUserCount or 0
+
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS ErrorCount
+        FROM dbo.ImportErrors;
+        """
+    )
+    error_row = cursor.fetchone()
+    import_error_count = error_row.ErrorCount or 0
+
+    conn.close()
+
+    return {
+        "overall": overall,
+        "top_vendors": top_vendors,
+        "top_projects": top_projects,
+        "recent_imports": recent_imports,
+        "active_user_count": active_user_count,
+        "import_error_count": import_error_count,
+    }
+
+
 # ------------------------------------------------------------
 # Branding / layout
 # ------------------------------------------------------------
@@ -876,7 +997,6 @@ body::before {
   letter-spacing: .12em;
   text-transform: uppercase;
 }
-
 .nav-divider {
   height: 1px;
   background: rgba(191, 219, 254, 0.18);
@@ -1084,6 +1204,7 @@ def shell(title, subtitle, active, content):
 
     po_nav_items = [
         ("Dashboard", "/", "📊"),
+        ("My Dashboard", "/my-dashboard", "🏠"),
         ("PO Summary", "/po-summary", "📋"),
         ("PO List", "/po-list", "📄"),
         ("PO Detail", "/po-detail", "🔎"),
@@ -1133,7 +1254,8 @@ def shell(title, subtitle, active, content):
         account_nav_html = ""
 
         for label, href, icon in account_nav_items:
-            account_nav_html += build_nav_item(label, href, icon)
+            if role_can_access(role, label):
+                account_nav_html += build_nav_item(label, href, icon)
 
         if account_nav_html:
             nav_html += '<div class="nav-divider"></div>'
@@ -1192,66 +1314,314 @@ def shell(title, subtitle, active, content):
 
 @app.route("/")
 def home():
-    allowed, reason = require_page_access("Dashboard")
+    return redirect("/my-dashboard")
+
+
+@app.route("/my-dashboard")
+def my_dashboard():
+    allowed, reason = require_page_access("My Dashboard")
     if not allowed:
-        return access_denied_response("Dashboard", reason)
+        return access_denied_response("My Dashboard", reason)
 
-    content = f"""
-    <div class="grid kpis">
-        <div class="card kpi">
-            <div class="label">App Status</div>
-            <div class="value">Online</div>
-            <div class="trend"><span class="badge green">Running</span></div>
-        </div>
-        <div class="card kpi">
-            <div class="label">Environment</div>
-            <div class="value">{h(APP_ENVIRONMENT)}</div>
-            <div class="trend">Azure App Service</div>
-        </div>
-        <div class="card kpi">
-            <div class="label">SQL Server</div>
-            <div class="value" style="font-size:17px;">Connected</div>
-            <div class="trend">{h(SQL_SERVER_NAME)}</div>
-        </div>
-        <div class="card kpi">
-            <div class="label">SQL Database</div>
-            <div class="value" style="font-size:19px;">{h(SQL_DATABASE_NAME)}</div>
-            <div class="trend">Live data source</div>
-        </div>
-        <div class="card kpi">
-            <div class="label">Connection String</div>
-            <div class="value">{"Yes" if SQL_CONNECTION else "No"}</div>
-            <div class="trend">PODASHBOARD_SQL</div>
-        </div>
-    </div>
+    access = get_user_access()
+    role = access["role"]
+    display_name = access["display_name"] or access["email"] or "User"
 
-    <div class="grid two">
+    try:
+        data = load_personal_dashboard_data()
+        overall = data["overall"]
+
+        vendor_rows = ""
+        for row in data["top_vendors"]:
+            vendor_rows += f"""
+            <tr>
+                <td>{h(row.VendorName)}</td>
+                <td class="right">{row.POCount}</td>
+                <td class="right">{currency(row.TotalLineAmount)}</td>
+            </tr>
+            """
+
+        if not vendor_rows:
+            vendor_rows = '<tr><td colspan="3">No vendor data found.</td></tr>'
+
+        project_rows = ""
+        for row in data["top_projects"]:
+            project_rows += f"""
+            <tr>
+                <td>{h(row.ProjectName)}</td>
+                <td class="right">{row.POCount}</td>
+                <td class="right">{currency(row.TotalLineAmount)}</td>
+            </tr>
+            """
+
+        if not project_rows:
+            project_rows = '<tr><td colspan="3">No project data found.</td></tr>'
+
+        import_rows = ""
+        for row in data["recent_imports"]:
+            badge_class = "green"
+            if row.ErrorCount and row.ErrorCount > 0:
+                badge_class = "amber"
+            if row.ImportStatus and "fail" in row.ImportStatus.lower():
+                badge_class = "red"
+
+            import_rows += f"""
+            <tr>
+                <td>{row.ImportBatchId}</td>
+                <td>{h(row.FileName)}</td>
+                <td>{h(row.UploadedAt)}</td>
+                <td>{row.TotalRows}</td>
+                <td>{row.SuccessCount}</td>
+                <td>{row.ErrorCount}</td>
+                <td><span class="badge {badge_class}">{h(row.ImportStatus)}</span></td>
+            </tr>
+            """
+
+        if not import_rows:
+            import_rows = '<tr><td colspan="7">No imports found.</td></tr>'
+
+        common_kpis = f"""
+        <div class="grid kpis">
+            <div class="card kpi">
+                <div class="label">Total POs</div>
+                <div class="value">{overall["total_pos"]}</div>
+                <div class="trend">Unique PO numbers</div>
+            </div>
+            <div class="card kpi">
+                <div class="label">Open POs</div>
+                <div class="value">{overall["open_pos"]}</div>
+                <div class="trend">Currently open</div>
+            </div>
+            <div class="card kpi">
+                <div class="label">Total PO Value</div>
+                <div class="value">{currency(overall["total_po_value"])}</div>
+                <div class="trend">Revised/original PO value</div>
+            </div>
+            <div class="card kpi">
+                <div class="label">Line Item Total</div>
+                <div class="value">{currency(overall["total_line_amount"])}</div>
+                <div class="trend">Imported line total</div>
+            </div>
+            <div class="card kpi">
+                <div class="label">Remaining</div>
+                <div class="value">{currency(overall["total_remaining_amount"])}</div>
+                <div class="trend">Current PO balance</div>
+            </div>
+        </div>
+        """
+
+        if role == "Admin":
+            role_content = f"""
+            {common_kpis}
+
+            <div class="grid two">
+                <div class="card">
+                    <h3>Admin Control Center</h3>
+                    <p class="card-subtitle">Security, user access, uploads, and exports.</p>
+                    <p><a class="button primary" href="/user-access">Manage User Access</a></p>
+                    <p><a class="button" href="/upload-po">Upload Issued POs</a></p>
+                    <p><a class="button" href="/import-history">Review Import History</a></p>
+                    <p><a class="button" href="/exports">Download CSV Exports</a></p>
+                </div>
+
+                <div class="card">
+                    <h3>Admin Health Snapshot</h3>
+                    <table>
+                        <tr><th>Active Dashboard Users</th><td>{data["active_user_count"]}</td></tr>
+                        <tr><th>Import Errors</th><td>{data["import_error_count"]}</td></tr>
+                        <tr><th>Amount Mismatch Flags</th><td>{overall["amount_mismatch_count"]}</td></tr>
+                        <tr><th>Signed-In Role</th><td>{h(role)}</td></tr>
+                    </table>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>Recent Imports</h3>
+                <p class="card-subtitle">Latest upload activity across the dashboard.</p>
+                <div class="table-wrap">
+                    <table>
+                        <tr>
+                            <th>Batch ID</th>
+                            <th>File Name</th>
+                            <th>Uploaded At</th>
+                            <th>Total Rows</th>
+                            <th>Success</th>
+                            <th>Errors</th>
+                            <th>Status</th>
+                        </tr>
+                        {import_rows}
+                    </table>
+                </div>
+            </div>
+            """
+
+        elif role == "Executive":
+            role_content = f"""
+            {common_kpis}
+
+            <div class="grid two">
+                <div class="card">
+                    <h3>Executive Actions</h3>
+                    <p class="card-subtitle">High-level procurement review tools.</p>
+                    <p><a class="button primary" href="/po-summary">Open PO Summary</a></p>
+                    <p><a class="button" href="/exceptions">Review Exceptions</a></p>
+                    <p><a class="button" href="/exports">Download Exports</a></p>
+                </div>
+
+                <div class="card">
+                    <h3>Risk Snapshot</h3>
+                    <table>
+                        <tr><th>Amount Mismatch Flags</th><td>{overall["amount_mismatch_count"]}</td></tr>
+                        <tr><th>Import Errors</th><td>{data["import_error_count"]}</td></tr>
+                        <tr><th>Open POs</th><td>{overall["open_pos"]}</td></tr>
+                        <tr><th>Closed POs</th><td>{overall["closed_pos"]}</td></tr>
+                    </table>
+                </div>
+            </div>
+            """
+
+        elif role == "Accounting":
+            role_content = f"""
+            {common_kpis}
+
+            <div class="grid two">
+                <div class="card">
+                    <h3>Accounting Workspace</h3>
+                    <p class="card-subtitle">Upload, review imports, resolve exceptions, and export records.</p>
+                    <p><a class="button primary" href="/upload-po">Upload Issued POs</a></p>
+                    <p><a class="button" href="/import-history">Review Import History</a></p>
+                    <p><a class="button" href="/exceptions">Review Exceptions</a></p>
+                    <p><a class="button" href="/exports">Download Exports</a></p>
+                </div>
+
+                <div class="card">
+                    <h3>Import Snapshot</h3>
+                    <table>
+                        <tr><th>Import Errors</th><td>{data["import_error_count"]}</td></tr>
+                        <tr><th>Amount Mismatch Flags</th><td>{overall["amount_mismatch_count"]}</td></tr>
+                        <tr><th>Total POs</th><td>{overall["total_pos"]}</td></tr>
+                        <tr><th>Open POs</th><td>{overall["open_pos"]}</td></tr>
+                    </table>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>Recent Imports</h3>
+                <div class="table-wrap">
+                    <table>
+                        <tr>
+                            <th>Batch ID</th>
+                            <th>File Name</th>
+                            <th>Uploaded At</th>
+                            <th>Total Rows</th>
+                            <th>Success</th>
+                            <th>Errors</th>
+                            <th>Status</th>
+                        </tr>
+                        {import_rows}
+                    </table>
+                </div>
+            </div>
+            """
+
+        elif role == "Project Manager":
+            role_content = f"""
+            {common_kpis}
+
+            <div class="grid two">
+                <div class="card">
+                    <h3>Project Manager Workspace</h3>
+                    <p class="card-subtitle">Review issued POs and drill into project/vendor details.</p>
+                    <p><a class="button primary" href="/po-list">Browse PO List</a></p>
+                    <p><a class="button" href="/po-detail">Search PO Detail</a></p>
+                    <p><a class="button" href="/po-summary">Open PO Summary</a></p>
+                </div>
+
+                <div class="card">
+                    <h3>Top Projects</h3>
+                    <div class="table-wrap">
+                        <table>
+                            <tr><th>Project</th><th class="right">POs</th><th class="right">Line Total</th></tr>
+                            {project_rows}
+                        </table>
+                    </div>
+                </div>
+            </div>
+            """
+
+        else:
+            role_content = f"""
+            {common_kpis}
+
+            <div class="grid two">
+                <div class="card">
+                    <h3>Viewer Dashboard</h3>
+                    <p class="card-subtitle">Read-only access to issued PO information.</p>
+                    <p><a class="button primary" href="/po-summary">Open PO Summary</a></p>
+                    <p><a class="button" href="/po-list">Browse PO List</a></p>
+                    <p><a class="button" href="/po-detail">Search PO Detail</a></p>
+                </div>
+
+                <div class="card">
+                    <h3>Top Vendors</h3>
+                    <div class="table-wrap">
+                        <table>
+                            <tr><th>Vendor</th><th class="right">POs</th><th class="right">Line Total</th></tr>
+                            {vendor_rows}
+                        </table>
+                    </div>
+                </div>
+            </div>
+            """
+
+        content = f"""
         <div class="card">
-            <h3>Procurement Workflow</h3>
-            <p class="card-subtitle">Current completed workflow for issued purchase orders.</p>
-            <table>
-                <tr><th>Step</th><th>Status</th></tr>
-                <tr><td>Microsoft login</td><td><span class="badge green">Working</span></td></tr>
-                <tr><td>SQL-backed roles</td><td><span class="badge green">Added</span></td></tr>
-                <tr><td>Upload issued PO spreadsheet</td><td><span class="badge green">Working</span></td></tr>
-                <tr><td>PO list and details</td><td><span class="badge green">Working</span></td></tr>
-                <tr><td>Exceptions and CSV exports</td><td><span class="badge green">Working</span></td></tr>
-                <tr><td>Expense upload</td><td><span class="badge amber">Later</span></td></tr>
-            </table>
+            <h3>Welcome, {h(display_name)}</h3>
+            <p class="card-subtitle">
+                This dashboard is customized for your role: <strong>{h(role)}</strong>.
+            </p>
         </div>
 
-        <div class="card">
-            <h3>Quick Actions</h3>
-            <p><a class="button primary" href="/upload-po">Upload Issued POs</a></p>
-            <p><a class="button" href="/po-summary">View PO Summary</a></p>
-            <p><a class="button" href="/po-list">Browse PO List</a></p>
-            <p><a class="button" href="/exceptions">Review Exceptions</a></p>
-            <p><a class="button" href="/user-access">Manage User Access</a></p>
-        </div>
-    </div>
-    """
+        {role_content}
 
-    return shell("Dashboard", "Live procurement dashboard connected to Azure SQL.", "Dashboard", content)
+        <div class="grid two">
+            <div class="card">
+                <h3>Top Vendors</h3>
+                <div class="table-wrap">
+                    <table>
+                        <tr><th>Vendor</th><th class="right">POs</th><th class="right">Line Total</th></tr>
+                        {vendor_rows}
+                    </table>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>Top Projects</h3>
+                <div class="table-wrap">
+                    <table>
+                        <tr><th>Project</th><th class="right">POs</th><th class="right">Line Total</th></tr>
+                        {project_rows}
+                    </table>
+                </div>
+            </div>
+        </div>
+        """
+
+        return shell(
+            title="My Dashboard",
+            subtitle=f"Personalized procurement dashboard for {role}.",
+            active="My Dashboard",
+            content=content,
+        )
+
+    except Exception as e:
+        content = f'<div class="notice error">Error loading personal dashboard: {h(e)}</div>'
+        return shell(
+            title="My Dashboard",
+            subtitle="Unable to load personalized dashboard.",
+            active="My Dashboard",
+            content=content,
+        ), 500
 
 
 @app.route("/po-summary")
@@ -1351,7 +1721,6 @@ def po_summary():
     except Exception as e:
         content = f'<div class="notice error">Error loading PO summary: {h(e)}</div>'
         return shell("PO Summary", "Unable to load summary.", "PO Summary", content), 500
-
 
 @app.route("/po-list")
 def po_list():
@@ -2198,317 +2567,3 @@ def export_issued_lines_csv():
         mimetype="text/csv",
         headers={"Content-Disposition": "attachment; filename=issued_po_lines_export.csv"},
     )
-
-
-@app.route("/user-access", methods=["GET", "POST"])
-def user_access():
-    allowed, reason = require_page_access("User Access")
-    if not allowed:
-        return access_denied_response("User Access", reason)
-
-    message_html = ""
-
-    if request.method == "POST":
-        email = clean_text(request.form.get("email"))
-        display_name = clean_text(request.form.get("display_name"))
-        role_name = clean_text(request.form.get("role_name"))
-        is_active_raw = clean_text(request.form.get("is_active"))
-
-        is_active = 1 if is_active_raw == "1" else 0
-
-        if not email or "@" not in email:
-            message_html = '<div class="notice error">Email is required.</div>'
-        elif role_name not in VALID_ROLES:
-            message_html = '<div class="notice error">Invalid role selected.</div>'
-        else:
-            try:
-                conn = get_sql_connection()
-                cursor = conn.cursor()
-
-                cursor.execute(
-                    """
-                    IF EXISTS (
-                        SELECT 1
-                        FROM dbo.DashboardUsers
-                        WHERE LOWER(Email) = LOWER(?)
-                    )
-                    BEGIN
-                        UPDATE dbo.DashboardUsers
-                        SET
-                            DisplayName = ?,
-                            RoleName = ?,
-                            IsActive = ?,
-                            UpdatedAt = SYSUTCDATETIME()
-                        WHERE LOWER(Email) = LOWER(?);
-                    END
-                    ELSE
-                    BEGIN
-                        INSERT INTO dbo.DashboardUsers
-                            (
-                                Email,
-                                DisplayName,
-                                RoleName,
-                                IsActive
-                            )
-                        VALUES
-                            (
-                                ?,
-                                ?,
-                                ?,
-                                ?
-                            );
-                    END
-                    """,
-                    email,
-                    display_name,
-                    role_name,
-                    is_active,
-                    email,
-                    email,
-                    display_name,
-                    role_name,
-                    is_active,
-                )
-
-                conn.commit()
-                conn.close()
-
-                message_html = '<div class="notice ok">User access was saved.</div>'
-
-            except Exception as e:
-                message_html = f'<div class="notice error">Error saving user access: {h(e)}</div>'
-
-    try:
-        conn = get_sql_connection()
-        cursor = conn.cursor()
-
-        cursor.execute(
-            """
-            SELECT
-                DashboardUserId,
-                Email,
-                DisplayName,
-                RoleName,
-                IsActive,
-                CreatedAt,
-                UpdatedAt
-            FROM dbo.DashboardUsers
-            ORDER BY Email;
-            """
-        )
-
-        users = cursor.fetchall()
-        conn.close()
-
-        user_rows = ""
-        for row in users:
-            active_badge = '<span class="badge green">Active</span>' if row.IsActive else '<span class="badge red">Inactive</span>'
-
-            user_rows += f"""
-            <tr>
-                <td>{h(row.Email)}</td>
-                <td>{h(row.DisplayName)}</td>
-                <td><span class="badge blue">{h(row.RoleName)}</span></td>
-                <td>{active_badge}</td>
-                <td>{h(row.UpdatedAt)}</td>
-            </tr>
-            """
-
-        role_options = ""
-        for role in VALID_ROLES:
-            role_options += f'<option value="{h(role)}">{h(role)}</option>'
-
-        content = f"""
-        {message_html}
-
-        <div class="card">
-            <h3>Add or Update User Access</h3>
-            <p class="card-subtitle">
-                Admins can add users or update their dashboard role. Use the exact Microsoft 365 email address.
-            </p>
-
-            <form method="post" action="/user-access">
-                <p>
-                    <label>Email</label><br>
-                    <input type="text" name="email" placeholder="person@c-diving.com" required>
-                </p>
-
-                <p>
-                    <label>Display Name</label><br>
-                    <input type="text" name="display_name" placeholder="Person Name">
-                </p>
-
-                <p>
-                    <label>Role</label><br>
-                    <select name="role_name" required>
-                        {role_options}
-                    </select>
-                </p>
-
-                <p>
-                    <label>Status</label><br>
-                    <select name="is_active">
-                        <option value="1">Active</option>
-                        <option value="0">Inactive</option>
-                    </select>
-                </p>
-
-                <p><button class="primary" type="submit">Save User Access</button></p>
-            </form>
-        </div>
-
-        <div class="card">
-            <h3>Current Dashboard Users</h3>
-            <p class="card-subtitle">Users listed here can be assigned roles for the procurement dashboard.</p>
-
-            <div class="table-wrap">
-                <table>
-                    <tr>
-                        <th>Email</th>
-                        <th>Display Name</th>
-                        <th>Role</th>
-                        <th>Status</th>
-                        <th>Updated At</th>
-                    </tr>
-                    {user_rows}
-                </table>
-            </div>
-        </div>
-
-        <div class="card">
-            <h3>Role Guide</h3>
-            <table>
-                <tr><th>Role</th><th>Access</th></tr>
-                <tr><td>Admin</td><td>Everything, including User Access</td></tr>
-                <tr><td>Executive</td><td>Summary, PO pages, Exceptions, Exports</td></tr>
-                <tr><td>Accounting</td><td>PO pages, Uploads, Import History, Exceptions, Exports</td></tr>
-                <tr><td>Project Manager</td><td>PO Summary, PO List, PO Detail</td></tr>
-                <tr><td>Viewer</td><td>PO Summary, PO List, PO Detail</td></tr>
-                <tr><td>No Access</td><td>Can sign in, but cannot view dashboard data</td></tr>
-            </table>
-        </div>
-        """
-
-        return shell("User Access", "Manage SQL-backed dashboard roles and permissions.", "User Access", content)
-
-    except Exception as e:
-        content = f'<div class="notice error">Error loading user access: {h(e)}</div>'
-        return shell("User Access", "Unable to load user access.", "User Access", content), 500
-
-
-@app.route("/whoami")
-def whoami():
-    user = get_current_user()
-    access = get_user_access()
-    principal = request.headers.get("X-MS-CLIENT-PRINCIPAL", "")
-
-    auth_status_badge = '<span class="badge green">Authenticated</span>' if user["is_authenticated"] else '<span class="badge amber">Not Detected</span>'
-    domain_status_badge = '<span class="badge green">Allowed Domain</span>' if user["is_allowed_domain"] else '<span class="badge amber">Domain Not Confirmed</span>'
-    sql_status_badge = '<span class="badge green">Found</span>' if access["found_in_sql"] else '<span class="badge amber">Not Found</span>'
-    active_badge = '<span class="badge green">Active</span>' if access["is_active"] else '<span class="badge red">Inactive / No Access</span>'
-
-    content = f"""
-    <div class="grid two">
-        <div class="card">
-            <h3>Signed-In User</h3>
-            <p class="card-subtitle">This page reads the Microsoft login headers provided by Azure App Service Authentication.</p>
-
-            <table>
-                <tr><th>Authentication Status</th><td>{auth_status_badge}</td></tr>
-                <tr><th>Email / User Principal Name</th><td>{h(user["email"])}</td></tr>
-                <tr><th>Email Domain</th><td>{h(user["email_domain"])}</td></tr>
-                <tr><th>Allowed Domain Setting</th><td>{h(user["allowed_domain"])}</td></tr>
-                <tr><th>Domain Check</th><td>{domain_status_badge}</td></tr>
-                <tr><th>Identity Provider</th><td>{h(user["identity_provider"])}</td></tr>
-                <tr><th>Azure User ID</th><td>{h(user["user_id"])}</td></tr>
-            </table>
-        </div>
-
-        <div class="card">
-            <h3>Dashboard Access</h3>
-            <p class="card-subtitle">This is the SQL-backed dashboard permission result.</p>
-
-            <table>
-                <tr><th>Found In DashboardUsers</th><td>{sql_status_badge}</td></tr>
-                <tr><th>Display Name</th><td>{h(access["display_name"])}</td></tr>
-                <tr><th>Role</th><td><span class="badge blue">{h(access["role"])}</span></td></tr>
-                <tr><th>Status</th><td>{active_badge}</td></tr>
-                <tr><th>Lookup Error</th><td>{h(access["lookup_error"])}</td></tr>
-            </table>
-        </div>
-    </div>
-
-    <div class="card">
-        <h3>Raw Azure Authentication Headers</h3>
-        <p class="card-subtitle">Useful for troubleshooting.</p>
-
-        <table>
-            <tr><th>Header</th><th>Value</th></tr>
-            <tr><td>X-MS-CLIENT-PRINCIPAL-NAME</td><td>{h(user["email"])}</td></tr>
-            <tr><td>X-MS-CLIENT-PRINCIPAL-ID</td><td>{h(user["user_id"])}</td></tr>
-            <tr><td>X-MS-CLIENT-PRINCIPAL-IDP</td><td>{h(user["identity_provider"])}</td></tr>
-            <tr><td>X-MS-CLIENT-PRINCIPAL</td><td>{h(principal[:500])}{"..." if len(principal) > 500 else ""}</td></tr>
-        </table>
-    </div>
-    """
-
-    return shell("Who Am I", "View the signed-in Microsoft user and SQL-backed dashboard role.", "Who Am I", content)
-
-
-@app.route("/access-denied")
-def access_denied():
-    return access_denied_response("Unknown", "Access denied.")
-
-
-@app.route("/health")
-def health():
-    return jsonify(
-        {
-            "status": "ok",
-            "environment": APP_ENVIRONMENT,
-            "sql_server": SQL_SERVER_NAME,
-            "database": SQL_DATABASE_NAME,
-            "connection_string_found": bool(SQL_CONNECTION),
-        }
-    )
-
-
-@app.route("/db-test")
-def db_test():
-    if not SQL_CONNECTION:
-        return jsonify(
-            {
-                "status": "error",
-                "step": "connection_string",
-                "message": "SQL connection string was not found.",
-            }
-        ), 500
-
-    try:
-        conn = get_sql_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT DB_NAME() AS DatabaseName, GETUTCDATE() AS ServerTime")
-        row = cursor.fetchone()
-        conn.close()
-
-        return jsonify(
-            {
-                "status": "success",
-                "database": row.DatabaseName,
-                "server_time_utc": str(row.ServerTime),
-            }
-        )
-
-    except Exception as e:
-        return jsonify(
-            {
-                "status": "error",
-                "step": "connect_to_sql",
-                "message": str(e),
-            }
-        ), 500
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", os.environ.get("HTTP_PLATFORM_PORT", 8000)))
-    app.run(host="0.0.0.0", port=port)
