@@ -875,11 +875,12 @@ code {
 
 def shell(title, subtitle, active, content):
     nav_items = [
-        ("Dashboard", "/", "📊"),
-        ("PO Summary", "/po-summary", "📋"),
-        ("Upload Issued POs", "/upload-po", "⬆️"),
-        ("Health", "/health", "🟢"),
-        ("DB Test", "/db-test", "🧪"),
+    ("Dashboard", "/", "📊"),
+    ("PO Summary", "/po-summary", "📋"),
+    ("Upload Issued POs", "/upload-po", "⬆️"),
+    ("Import History", "/import-history", "🕘"),
+    ("Health", "/health", "🟢"),
+    ("DB Test", "/db-test", "🧪"),
     ]
 
     nav_html = ""
@@ -1213,7 +1214,162 @@ def upload_po():
         content=content,
     )
 
+@app.route("/import-history")
+def import_history():
+    try:
+        conn = get_sql_connection()
+        cursor = conn.cursor()
 
+        cursor.execute(
+            """
+            SELECT TOP 50
+                ImportBatchId,
+                FileName,
+                SourceSystem,
+                UploadedBy,
+                UploadedAt,
+                TotalRows,
+                SuccessCount,
+                ErrorCount,
+                ImportStatus,
+                ErrorMessage
+            FROM dbo.ImportBatches
+            ORDER BY UploadedAt DESC;
+            """
+        )
+        batches = cursor.fetchall()
+
+        cursor.execute(
+            """
+            SELECT TOP 100
+                e.ImportErrorId,
+                e.ImportBatchId,
+                b.FileName,
+                e.RowNumber,
+                e.ErrorMessage,
+                e.RawRow,
+                e.CreatedAt
+            FROM dbo.ImportErrors e
+            LEFT JOIN dbo.ImportBatches b
+                ON e.ImportBatchId = b.ImportBatchId
+            ORDER BY e.CreatedAt DESC;
+            """
+        )
+        errors = cursor.fetchall()
+
+        conn.close()
+
+        batch_rows = ""
+        for row in batches:
+            status_badge = "green"
+            if row.ErrorCount and row.ErrorCount > 0:
+                status_badge = "amber"
+            if row.ImportStatus and "fail" in row.ImportStatus.lower():
+                status_badge = "red"
+
+            batch_rows += f"""
+            <tr>
+                <td>{row.ImportBatchId}</td>
+                <td>{row.FileName or ""}</td>
+                <td>{row.UploadedAt}</td>
+                <td>{row.SourceSystem or ""}</td>
+                <td>{row.UploadedBy or ""}</td>
+                <td>{row.TotalRows}</td>
+                <td>{row.SuccessCount}</td>
+                <td>{row.ErrorCount}</td>
+                <td><span class="badge {status_badge}">{row.ImportStatus or ""}</span></td>
+            </tr>
+            """
+
+        if not batch_rows:
+            batch_rows = """
+            <tr>
+                <td colspan="9">No import batches found yet.</td>
+            </tr>
+            """
+
+        error_rows = ""
+        for row in errors:
+            raw_row = row.RawRow or ""
+            if len(raw_row) > 300:
+                raw_row = raw_row[:300] + "..."
+
+            error_rows += f"""
+            <tr>
+                <td>{row.ImportErrorId}</td>
+                <td>{row.ImportBatchId}</td>
+                <td>{row.FileName or ""}</td>
+                <td>{row.RowNumber or ""}</td>
+                <td>{row.ErrorMessage or ""}</td>
+                <td>{raw_row}</td>
+                <td>{row.CreatedAt}</td>
+            </tr>
+            """
+
+        if not error_rows:
+            error_rows = """
+            <tr>
+                <td colspan="7">No import errors found.</td>
+            </tr>
+            """
+
+        content = f"""
+        <div class="card">
+            <h3>Import Batches</h3>
+            <p class="card-subtitle">Latest uploaded PO files and processing results.</p>
+            <div class="table-wrap">
+                <table>
+                    <tr>
+                        <th>Batch ID</th>
+                        <th>File Name</th>
+                        <th>Uploaded At</th>
+                        <th>Source</th>
+                        <th>Uploaded By</th>
+                        <th>Total Rows</th>
+                        <th>Success</th>
+                        <th>Errors</th>
+                        <th>Status</th>
+                    </tr>
+                    {batch_rows}
+                </table>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>Recent Import Errors</h3>
+            <p class="card-subtitle">Rows that failed validation or import processing.</p>
+            <div class="table-wrap">
+                <table>
+                    <tr>
+                        <th>Error ID</th>
+                        <th>Batch ID</th>
+                        <th>File Name</th>
+                        <th>Row Number</th>
+                        <th>Error Message</th>
+                        <th>Raw Row</th>
+                        <th>Created At</th>
+                    </tr>
+                    {error_rows}
+                </table>
+            </div>
+        </div>
+        """
+
+        return shell(
+            title="Import History",
+            subtitle="Review uploaded files, row counts, import status, and row-level errors.",
+            active="Import History",
+            content=content,
+        )
+
+    except Exception as e:
+        content = f'<div class="notice error">Error loading import history: {str(e)}</div>'
+        return shell(
+            title="Import History",
+            subtitle="Unable to load import history.",
+            active="Import History",
+            content=content,
+        ), 500
 @app.route("/health")
 def health():
     return jsonify(
