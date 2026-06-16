@@ -1470,6 +1470,293 @@ code { background:#f1f5f9; padding:8px 10px; display:block; border-radius:12px; 
 @media (max-width:1200px) { .project-bucket-grid, .forecast-row { grid-template-columns:1fr 1fr; } .mini-bar-row { grid-template-columns:1fr; } }
 @media (max-width:820px) { .project-bucket-grid, .forecast-row { grid-template-columns:1fr; } }
 
+
+/* Mobile off-canvas navigation and phone-friendly layout */
+.mobile-menu-button,
+.mobile-nav-close,
+.mobile-menu-overlay {
+  display: none;
+}
+
+@media (max-width: 820px) {
+  html, body {
+    max-width: 100%;
+    overflow-x: hidden;
+  }
+
+  body {
+    display: block;
+  }
+
+  .mobile-menu-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    min-height: 44px;
+    border: 1px solid var(--line);
+    background: #ffffff;
+    color: var(--text);
+    border-radius: 12px;
+    padding: 10px 13px;
+    font-weight: 900;
+    box-shadow: 0 8px 18px rgba(15, 23, 42, 0.08);
+  }
+
+  .mobile-nav-close {
+    display: grid;
+    place-items: center;
+    position: absolute;
+    top: 14px;
+    right: 14px;
+    width: 42px;
+    height: 42px;
+    border-radius: 12px;
+    border: 1px solid rgba(255,255,255,.22);
+    background: rgba(255,255,255,.08);
+    color: #ffffff;
+    font-size: 28px;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  .mobile-menu-overlay {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(2, 6, 23, 0.56);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .2s ease;
+    z-index: 998;
+  }
+
+  body.mobile-nav-open .mobile-menu-overlay {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: min(88vw, 330px);
+    min-height: 100vh;
+    z-index: 999;
+    transform: translateX(-104%);
+    transition: transform .22s ease;
+    overflow-y: auto;
+    padding: 22px 16px 18px;
+    box-shadow: 18px 0 44px rgba(2, 6, 23, 0.35);
+  }
+
+  body.mobile-nav-open .sidebar {
+    transform: translateX(0);
+  }
+
+  .brand {
+    padding-right: 48px;
+    margin-bottom: 18px;
+  }
+
+  .brand h1 {
+    font-size: 16px;
+  }
+
+  .brand p {
+    font-size: 11px;
+  }
+
+  .nav-section {
+    margin-top: 14px;
+  }
+
+  .nav-item {
+    min-height: 44px;
+    font-size: 15px;
+    margin: 5px 0;
+  }
+
+  .sync-card {
+    margin-top: 18px;
+  }
+
+  .main {
+    margin-left: 0;
+    width: 100%;
+    padding: 12px;
+  }
+
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: rgba(245, 247, 251, 0.94);
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(226, 232, 240, 0.85);
+    border-radius: 16px;
+    padding: 12px;
+    margin-bottom: 12px;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .topbar > div:first-of-type {
+    width: 100%;
+  }
+
+  .topbar h2 {
+    font-size: 22px;
+    line-height: 1.12;
+  }
+
+  .topbar p {
+    font-size: 13px;
+    margin-top: 5px;
+  }
+
+  .top-actions {
+    width: 100%;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+    font-size: 12px;
+  }
+
+  .grid,
+  .grid.kpis,
+  .grid.two,
+  .grid.three,
+  .grid.four,
+  .two,
+  .kpis,
+  .form-grid,
+  .project-bucket-grid,
+  .forecast-row,
+  .visual-chart-row {
+    grid-template-columns: 1fr !important;
+  }
+
+  .card,
+  .mini-chart-card,
+  .action-card,
+  .project-bucket-item,
+  .forecast-bucket {
+    padding: 14px;
+    border-radius: 14px;
+  }
+
+  .card h3 {
+    font-size: 15px;
+    margin-bottom: 11px;
+  }
+
+  .card-subtitle {
+    font-size: 12px;
+  }
+
+  .filterbar,
+  .filters,
+  .search-row,
+  .request-actions,
+  .role-buttons,
+  .filter-chip-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .filters select,
+  .filters input,
+  .search-row input,
+  .search-row select,
+  .form-field input,
+  .form-field select,
+  .form-field textarea,
+  button,
+  .primary,
+  .secondary,
+  .filter-chip {
+    width: 100%;
+    min-width: 0;
+    min-height: 44px;
+    font-size: 15px;
+  }
+
+  .form-field textarea {
+    min-height: 110px;
+  }
+
+  .table-wrap {
+    width: 100%;
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    border-radius: 14px;
+  }
+
+  .table-wrap table,
+  table {
+    min-width: 860px;
+  }
+
+  th, td {
+    padding: 9px 8px;
+    font-size: 12px;
+  }
+
+  .kpi {
+    min-height: 105px;
+  }
+
+  .kpi .value {
+    font-size: 23px;
+  }
+
+  .mini-bar-row,
+  .bar-row,
+  .waterfall-row,
+  .approval-item,
+  .detail-grid,
+  .other-items-header,
+  .other-item-row,
+  .issued-item-option {
+    grid-template-columns: 1fr !important;
+  }
+
+  .forecast-bucket {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+    min-height: 116px;
+  }
+
+  .forecast-bucket:last-child {
+    border-bottom: 0;
+  }
+
+  .project-bucket-item .donut {
+    width: 86px;
+    height: 86px;
+  }
+
+  .bucket-metric {
+    font-size: 12px;
+  }
+
+  .page-hero {
+    grid-template-columns: 44px 1fr;
+    padding: 14px;
+  }
+
+  .page-hero h2 {
+    font-size: 20px;
+  }
+
+  .page-hero p {
+    font-size: 12px;
+  }
+}
+
 </style>
 """
 
@@ -1530,7 +1817,8 @@ def shell(title, subtitle, active, content):
     {BRANDED_STYLE}
 </head>
 <body>
-    <aside class="sidebar">
+    <div class="mobile-menu-overlay" onclick="closeMobileMenu()" aria-hidden="true"></div>
+    <aside class="sidebar" id="sidebarNav">
         <div class="brand">
             <div class="logo"><img src="{CE_LOGO_DATA_URI}" alt="Coastal Engineering logo"></div>
             <div>
@@ -1538,6 +1826,7 @@ def shell(title, subtitle, active, content):
                 <p>Procurement App</p>
             </div>
         </div>
+        <button type="button" class="mobile-nav-close" onclick="closeMobileMenu()" aria-label="Close menu">&times;</button>
         <nav>{nav_html}</nav>
         <div class="sync-card">
             <div style="font-weight:800; font-size:13px; margin-bottom:10px;">Signed-In Role</div>
@@ -1551,6 +1840,7 @@ def shell(title, subtitle, active, content):
 
     <main class="main">
         <header class="topbar">
+            <button type="button" class="mobile-menu-button" onclick="toggleMobileMenu()" aria-label="Open menu">☰ Menu</button>
             <div>
                 <h2>{h(title)}</h2>
                 <p>{h(subtitle)}</p>
@@ -1563,6 +1853,20 @@ def shell(title, subtitle, active, content):
 
         {content}
     </main>
+    <script>
+        function toggleMobileMenu() {{
+            document.body.classList.toggle('mobile-nav-open');
+        }}
+        function closeMobileMenu() {{
+            document.body.classList.remove('mobile-nav-open');
+        }}
+        document.addEventListener('keydown', function(event) {{
+            if (event.key === 'Escape') closeMobileMenu();
+        }});
+        window.addEventListener('resize', function() {{
+            if (window.innerWidth > 820) closeMobileMenu();
+        }});
+    </script>
 </body>
 </html>
 """
