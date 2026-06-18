@@ -258,6 +258,24 @@ def get_user_access():
         return access
 
 
+def load_assignable_users():
+    """Return active named users for assignment dropdowns."""
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT Email, DisplayName, RoleName
+        FROM dbo.DashboardUsers
+        WHERE IsActive = 1
+        ORDER BY
+            CASE WHEN COALESCE(DisplayName, '') = '' THEN Email ELSE DisplayName END;
+        """
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+
 def role_can_access(role_name, page_name):
     allowed_roles = PAGE_ACCESS.get(page_name, [])
     return role_name in allowed_roles
@@ -1821,8 +1839,12 @@ code { background:#f1f5f9; padding:8px 10px; display:block; border-radius:12px; 
 .setup-table input, .setup-table select, .setup-table textarea { width:100%; min-width:150px; border:1px solid var(--line); border-radius:10px; padding:8px 9px; background:#fff; font-size:12px; }
 .setup-table textarea { min-width:220px; min-height:58px; resize:vertical; }
 .setup-table .po-number-cell { min-width:130px; font-weight:900; }
-.setup-table .payment-schedule-cell { min-width:260px; }
-.setup-table .notes-cell { min-width:220px; }
+.setup-table .payment-schedule-cell { min-width:520px; }
+.setup-table .assign-cell { min-width:240px; }
+.payment-schedule-builder { display:grid; gap:6px; }
+.payment-schedule-row { display:grid; grid-template-columns:128px 115px 1fr; gap:6px; align-items:center; }
+.payment-schedule-row input { min-width:0; }
+.payment-schedule-help { color:var(--muted); font-size:11px; line-height:1.35; }
 .inline-actions { display:grid; gap:7px; min-width:110px; }
 .inline-actions button { width:100%; padding:8px 9px; border-radius:9px; font-size:12px; }
 .action-required-card { border-left:5px solid #f59e0b; }
@@ -1831,7 +1853,7 @@ code { background:#f1f5f9; padding:8px 10px; display:block; border-radius:12px; 
 .status-pill-row { display:flex; flex-wrap:wrap; gap:8px; margin:10px 0 0; }
 .status-pill-row a { text-decoration:none; }
 .status-pill-row .active { box-shadow:0 0 0 3px rgba(37,99,235,.15); }
-@media (max-width:820px) { .setup-table table { min-width:1350px; } }
+@media (max-width:820px) { .setup-table table { min-width:1450px; } .payment-schedule-row { grid-template-columns:1fr; } }
 
 </style>
 """
@@ -2471,16 +2493,35 @@ def update_po_setup_info(form):
         raise ValueError("PO Number is required.")
 
     payment_type = clean_text(form.get("payment_type"))
-    expected_payment_date = clean_date(form.get("expected_payment_date"))
-    payment_schedule = clean_text(form.get("payment_schedule"))
     setup_status = clean_text(form.get("setup_status")) or "Needs Payment Schedule"
     setup_assigned_to = clean_text(form.get("setup_assigned_to"))
-    setup_notes = clean_text(form.get("setup_notes"))
     action = clean_text(form.get("setup_action")) or "save"
+
+    schedule_lines = []
+    first_expected_payment_date = None
+    for idx in range(1, 5):
+        date_raw = clean_text(form.get(f"payment_{idx}_date"))
+        amount_raw = clean_text(form.get(f"payment_{idx}_amount"))
+        note_raw = clean_text(form.get(f"payment_{idx}_note"))
+        date_value = clean_date(date_raw)
+        if date_value and first_expected_payment_date is None:
+            first_expected_payment_date = date_value
+        if date_raw or amount_raw or note_raw:
+            parts = []
+            if date_raw:
+                parts.append(date_raw)
+            if amount_raw:
+                parts.append(amount_raw)
+            if note_raw:
+                parts.append(note_raw)
+            schedule_lines.append(" - ".join(parts))
+
+    payment_schedule = "\n".join(schedule_lines) or clean_text(form.get("payment_schedule"))
+    expected_payment_date = first_expected_payment_date or clean_date(form.get("expected_payment_date"))
 
     if action == "assign":
         if not setup_assigned_to:
-            raise ValueError("Assigned To email is required when assigning this PO.")
+            raise ValueError("Assigned To is required when assigning this PO.")
         setup_status = "Assigned to PM"
 
     if action == "complete":
@@ -2499,7 +2540,6 @@ def update_po_setup_info(form):
                 PaymentSchedule = ?,
                 SetupStatus = ?,
                 SetupAssignedTo = ?,
-                SetupNotes = ?,
                 SetupUpdatedBy = ?,
                 SetupUpdatedAt = SYSUTCDATETIME(),
                 UpdatedAt = SYSUTCDATETIME()
@@ -2510,7 +2550,6 @@ def update_po_setup_info(form):
             payment_schedule,
             setup_status,
             setup_assigned_to,
-            setup_notes,
             user["email"] or "Unknown",
             po_number,
         )
@@ -3895,6 +3934,7 @@ def project_po_setup():
             assigned_filter = user["email"]
 
         rows = load_project_po_setup_items(status_filter=status_filter, assigned_filter=assigned_filter)
+        assignable_users = load_assignable_users()
 
         needs_schedule = sum(1 for r in rows if getattr(r, "MissingPaymentSchedule", 0))
         needs_type = sum(1 for r in rows if getattr(r, "MissingPaymentType", 0))
@@ -3914,7 +3954,7 @@ def project_po_setup():
             selected_status = clean_text(r.SetupStatus) or "Needs Payment Schedule"
             selected_type = clean_text(r.PaymentType) or ""
             payment_type_options = ""
-            for opt in ["", "Single Payment", "Deposit + Final", "Progress Payments", "Monthly", "Milestone", "Retainage", "Other"]:
+            for opt in ["", "Single Payment", "Multiple Payments", "Deposit + Final", "Progress Payments", "Monthly", "Milestone", "Retainage", "Other"]:
                 label = opt or "Select payment type"
                 sel = " selected" if opt == selected_type else ""
                 payment_type_options += f'<option value="{h(opt)}"{sel}>{h(label)}</option>'
@@ -3934,6 +3974,30 @@ def project_po_setup():
             missing_html = ", ".join(missing_bits) if missing_bits else "No required info missing"
 
             expected_payment_date = "" if not r.ExpectedPaymentDate else str(r.ExpectedPaymentDate)[:10]
+
+            existing_schedule_lines = [line.strip() for line in str(r.PaymentSchedule or "").splitlines() if line.strip()]
+            schedule_inputs = '<input type="hidden" name="expected_payment_date" value="' + h(expected_payment_date) + '">'
+            for idx in range(1, 5):
+                existing_line = existing_schedule_lines[idx - 1] if idx - 1 < len(existing_schedule_lines) else ""
+                schedule_inputs += f'''
+                    <div class="payment-schedule-row">
+                        <input type="date" name="payment_{idx}_date" aria-label="Payment {idx} date">
+                        <input type="text" name="payment_{idx}_amount" placeholder="Amount/%" aria-label="Payment {idx} amount or percent">
+                        <input type="text" name="payment_{idx}_note" value="{h(existing_line)}" placeholder="Payment {idx} note, milestone, or terms" aria-label="Payment {idx} note">
+                    </div>
+                '''
+            schedule_inputs += '<div class="payment-schedule-help">For single payment, use Payment 1 only. For multiple payments, enter each expected payment date and amount/percent. The first date is used for forecasting.</div>'
+
+            assigned_options = '<option value="">Unassigned</option>'
+            selected_assigned = clean_text(r.SetupAssignedTo)
+            for u in assignable_users:
+                user_email = clean_text(u.Email).lower()
+                display = clean_text(u.DisplayName) or user_email
+                role = clean_text(u.RoleName)
+                label_text = display + (f" ({role})" if role else "")
+                sel = " selected" if user_email == selected_assigned.lower() else ""
+                assigned_options += f'<option value="{h(user_email)}"{sel}>{h(label_text)}</option>'
+
             table_rows += f"""
             <tr>
                 <form method="post" action="/project-po-setup">
@@ -3943,11 +4007,9 @@ def project_po_setup():
                     <td>{h(r.VendorName)}<br><small>{currency(r.POValue)}</small></td>
                     <td><small>{h(missing_html)}</small></td>
                     <td><select name="payment_type">{payment_type_options}</select></td>
-                    <td><input type="date" name="expected_payment_date" value="{h(expected_payment_date)}"></td>
-                    <td class="payment-schedule-cell"><textarea name="payment_schedule" placeholder="Example: 30% deposit, 40% at delivery, 30% net 30 after completion">{h(r.PaymentSchedule)}</textarea></td>
-                    <td><input type="email" name="setup_assigned_to" value="{h(r.SetupAssignedTo)}" placeholder="pm@c-diving.com"></td>
+                    <td class="payment-schedule-cell"><div class="payment-schedule-builder">{schedule_inputs}</div></td>
+                    <td class="assign-cell"><select name="setup_assigned_to">{assigned_options}</select></td>
                     <td><select name="setup_status">{status_options}</select></td>
-                    <td class="notes-cell"><textarea name="setup_notes" placeholder="Notes for PM/accounting">{h(r.SetupNotes)}</textarea></td>
                     <td class="inline-actions">
                         <button class="primary" name="setup_action" value="save" type="submit">Update</button>
                         <button class="secondary" name="setup_action" value="assign" type="submit">Assign</button>
@@ -3958,7 +4020,7 @@ def project_po_setup():
             """
 
         if not table_rows:
-            table_rows = '<tr><td colspan="11"><div class="empty-state"><strong>No PO setup items found.</strong><span>POs missing payment schedules, payment type, or expected payment dates will appear here.</span></div></td></tr>'
+            table_rows = '<tr><td colspan="9"><div class="empty-state"><strong>No PO setup items found.</strong><span>POs missing payment schedules, payment type, or expected payment dates will appear here.</span></div></td></tr>'
 
         mine_link = ""
         if user["email"]:
@@ -3989,7 +4051,7 @@ def project_po_setup():
             <div class="table-wrap setup-table">
                 <table>
                     <tr>
-                        <th>PO</th><th>Project</th><th>Vendor / Amount</th><th>Missing Info</th><th>Payment Type</th><th>Expected Payment Date</th><th>Payment Schedule</th><th>Assigned To</th><th>Status</th><th>Notes</th><th>Actions</th>
+                        <th>PO</th><th>Project</th><th>Vendor / Amount</th><th>Missing Info</th><th>Payment Type</th><th>Payment Schedule</th><th>Assigned To</th><th>Status</th><th>Actions</th>
                     </tr>
                     {table_rows}
                 </table>
@@ -4000,7 +4062,7 @@ def project_po_setup():
             <div class="timeline">
                 <div class="timeline-item"><strong>Accounting imports issued POs</strong><span>PO rows land in the dashboard from the Upload Issued POs page.</span></div>
                 <div class="timeline-item"><strong>PO Info Review identifies missing planning data</strong><span>Missing payment schedule, payment type, and expected payment date appear here.</span></div>
-                <div class="timeline-item"><strong>Assign missing info to the PM</strong><span>Enter the PM email and click Assign. The PM will see assigned PO info tasks on My Dashboard.</span></div>
+                <div class="timeline-item"><strong>Assign missing info to the PM</strong><span>Choose the project manager or responsible user from the Assigned To dropdown and click Assign. They will see assigned PO info tasks on My Dashboard.</span></div>
                 <div class="timeline-item"><strong>PM/accounting updates the PO</strong><span>Once payment schedule and timing are entered, mark the item Complete.</span></div>
             </div>
         </div>
