@@ -78,7 +78,8 @@ PAGE_ACCESS = {
     "POs & Balances": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "Forecasting": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "Project PO Setup": ["Admin", "Executive", "Accounting", "Project Manager"],
-    "Missing PO Review": ["Admin", "Executive", "Accounting"],
+    "PO Info Review": ["Admin", "Executive", "Accounting", "Project Manager"],
+    "Missing PO Review": ["Admin", "Executive", "Accounting", "Project Manager"],
     "PO Summary": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "PO List": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "PO Detail": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
@@ -1815,6 +1816,23 @@ code { background:#f1f5f9; padding:8px 10px; display:block; border-radius:12px; 
 @media (max-width:1200px) { .status-card-grid, .setup-card-grid, .packet-meta, .approval-action-grid { grid-template-columns:1fr 1fr; } }
 @media (max-width:820px) { .status-card-grid, .setup-card-grid, .packet-meta, .approval-action-grid { grid-template-columns:1fr; } .packet-header { flex-direction:column; } }
 
+
+/* Functional PO setup / missing information review */
+.setup-table input, .setup-table select, .setup-table textarea { width:100%; min-width:150px; border:1px solid var(--line); border-radius:10px; padding:8px 9px; background:#fff; font-size:12px; }
+.setup-table textarea { min-width:220px; min-height:58px; resize:vertical; }
+.setup-table .po-number-cell { min-width:130px; font-weight:900; }
+.setup-table .payment-schedule-cell { min-width:260px; }
+.setup-table .notes-cell { min-width:220px; }
+.inline-actions { display:grid; gap:7px; min-width:110px; }
+.inline-actions button { width:100%; padding:8px 9px; border-radius:9px; font-size:12px; }
+.action-required-card { border-left:5px solid #f59e0b; }
+.info-callout { background:#eff6ff; border:1px solid #bfdbfe; color:#1e3a8a; border-radius:16px; padding:14px 16px; margin-bottom:16px; }
+.info-callout strong { display:block; margin-bottom:4px; }
+.status-pill-row { display:flex; flex-wrap:wrap; gap:8px; margin:10px 0 0; }
+.status-pill-row a { text-decoration:none; }
+.status-pill-row .active { box-shadow:0 0 0 3px rgba(37,99,235,.15); }
+@media (max-width:820px) { .setup-table table { min-width:1350px; } }
+
 </style>
 """
 
@@ -1830,13 +1848,12 @@ def shell(title, subtitle, active, content):
         ("Approver Queue", "/approver-queue", "✅"),
         ("POs & Balances", "/pos-balances", "💳"),
         ("Forecasting", "/forecasting", "📈"),
-        ("Project PO Setup", "/project-po-setup", "🧭"),
+        ("PO Info Review", "/project-po-setup", "🧭"),
     ]
 
     accounting_nav_items = [
         ("Upload Issued POs", "/upload-po", "⬆️"),
         ("Import History", "/import-history", "🕘"),
-        ("Missing PO Review", "/missing-po-review", "⚠️"),
         ("Exceptions", "/exceptions", "🚩"),
         ("Exports", "/exports", "⬇️"),
     ]
@@ -2319,46 +2336,190 @@ def load_po_packet_data(po_number):
     return po, lines
 
 
-def load_project_po_setup_items():
+def ensure_po_setup_columns(cursor):
+    setup_columns = [
+        ("PaymentType", "NVARCHAR(100) NULL"),
+        ("ExpectedPaymentDate", "DATE NULL"),
+        ("PaymentSchedule", "NVARCHAR(MAX) NULL"),
+        ("SetupStatus", "NVARCHAR(100) NULL"),
+        ("SetupAssignedTo", "NVARCHAR(255) NULL"),
+        ("SetupNotes", "NVARCHAR(MAX) NULL"),
+        ("SetupUpdatedBy", "NVARCHAR(255) NULL"),
+        ("SetupUpdatedAt", "DATETIME2 NULL"),
+    ]
+    for column_name, column_type in setup_columns:
+        cursor.execute(
+            f"""
+            IF COL_LENGTH('dbo.PurchaseOrders', '{column_name}') IS NULL
+            BEGIN
+                ALTER TABLE dbo.PurchaseOrders ADD {column_name} {column_type};
+            END
+            """
+        )
+
+
+def load_project_po_setup_items(status_filter=None, assigned_filter=None):
     conn = get_sql_connection()
     cursor = conn.cursor()
+    ensure_po_setup_columns(cursor)
+    conn.commit()
+
+    where_clauses = []
+    params = []
+
+    if status_filter and status_filter != "All":
+        where_clauses.append("COALESCE(NULLIF(po.SetupStatus, ''), CASE WHEN COALESCE(po.PaymentSchedule, '') = '' THEN 'Needs Payment Schedule' ELSE 'Complete' END) = ?")
+        params.append(status_filter)
+
+    if assigned_filter:
+        where_clauses.append("LOWER(COALESCE(po.SetupAssignedTo, '')) = LOWER(?)")
+        params.append(assigned_filter)
+
+    if not where_clauses:
+        where_clauses.append("(COALESCE(NULLIF(po.SetupStatus, ''), CASE WHEN COALESCE(po.PaymentSchedule, '') = '' THEN 'Needs Payment Schedule' ELSE 'Complete' END) <> 'Complete' OR COALESCE(po.PaymentSchedule, '') = '' OR COALESCE(po.PaymentType, '') = '' OR po.ExpectedPaymentDate IS NULL)")
+
+    where_sql = " AND ".join(where_clauses)
+
     cursor.execute(
-        """
-        WITH UniquePOs AS (
-            SELECT
-                PONumber,
-                MAX(VendorName) AS VendorName,
-                MAX(ProjectName) AS ProjectName,
-                MAX(Department) AS Department,
-                MAX(POStatus) AS POStatus,
-                MAX(PODate) AS PODate,
-                MAX(Requestor) AS Requestor,
-                MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
-                SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount,
-                MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount,
-                COUNT(*) AS LineCount
-            FROM dbo.IssuedPOLines
-            GROUP BY PONumber
-        )
-        SELECT TOP 100
-            *,
-            CASE
-                WHEN PODate IS NULL THEN 'Needs Forecast Date'
-                WHEN COALESCE(Requestor, '') = '' THEN 'Needs PM Info'
-                WHEN COALESCE(RemainingAmount, 0) > 0 THEN 'Open / Monitor'
-                ELSE 'Complete'
-            END AS SetupStatus
-        FROM UniquePOs
-        WHERE PODate IS NULL OR COALESCE(Requestor, '') = '' OR COALESCE(RemainingAmount, 0) > 0
+        f"""
+        SELECT TOP 250
+            po.PurchaseOrderId,
+            po.PONumber,
+            v.VendorName,
+            pr.ProjectName,
+            po.Department,
+            po.POStatus,
+            po.PODate,
+            po.Requestor,
+            COALESCE(po.RevisedAmount, po.OriginalAmount, 0) AS POValue,
+            po.RemainingAmount,
+            po.PaymentType,
+            po.ExpectedPaymentDate,
+            po.PaymentSchedule,
+            COALESCE(NULLIF(po.SetupStatus, ''), CASE WHEN COALESCE(po.PaymentSchedule, '') = '' THEN 'Needs Payment Schedule' ELSE 'Complete' END) AS SetupStatus,
+            po.SetupAssignedTo,
+            po.SetupNotes,
+            po.SetupUpdatedBy,
+            po.SetupUpdatedAt,
+            CASE WHEN COALESCE(po.PaymentSchedule, '') = '' THEN 1 ELSE 0 END AS MissingPaymentSchedule,
+            CASE WHEN COALESCE(po.PaymentType, '') = '' THEN 1 ELSE 0 END AS MissingPaymentType,
+            CASE WHEN po.ExpectedPaymentDate IS NULL THEN 1 ELSE 0 END AS MissingExpectedPaymentDate
+        FROM dbo.PurchaseOrders po
+        LEFT JOIN dbo.Vendors v ON po.VendorId = v.VendorId
+        LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
+        WHERE {where_sql}
         ORDER BY
-            CASE WHEN PODate IS NULL THEN 0 WHEN COALESCE(Requestor, '') = '' THEN 1 ELSE 2 END,
-            ProjectName,
-            PONumber;
-        """
+            CASE COALESCE(NULLIF(po.SetupStatus, ''), CASE WHEN COALESCE(po.PaymentSchedule, '') = '' THEN 'Needs Payment Schedule' ELSE 'Complete' END)
+                WHEN 'Needs Payment Schedule' THEN 0
+                WHEN 'Assigned to PM' THEN 1
+                WHEN 'In Progress' THEN 2
+                WHEN 'Needs Info' THEN 3
+                ELSE 4
+            END,
+            pr.ProjectName,
+            po.PONumber;
+        """,
+        *params,
     )
     rows = cursor.fetchall()
     conn.close()
     return rows
+
+
+def count_po_setup_actions_for_current_user():
+    user = get_current_user()
+    access = get_user_access()
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+    ensure_po_setup_columns(cursor)
+    conn.commit()
+
+    if access["role"] == "Project Manager" and user["email"]:
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS ActionCount
+            FROM dbo.PurchaseOrders
+            WHERE LOWER(COALESCE(SetupAssignedTo, '')) = LOWER(?)
+              AND COALESCE(NULLIF(SetupStatus, ''), 'Needs Payment Schedule') <> 'Complete';
+            """,
+            user["email"],
+        )
+    elif access["role"] in ["Admin", "Executive", "Accounting"]:
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS ActionCount
+            FROM dbo.PurchaseOrders
+            WHERE COALESCE(NULLIF(SetupStatus, ''), CASE WHEN COALESCE(PaymentSchedule, '') = '' THEN 'Needs Payment Schedule' ELSE 'Complete' END) <> 'Complete'
+               OR COALESCE(PaymentSchedule, '') = ''
+               OR COALESCE(PaymentType, '') = ''
+               OR ExpectedPaymentDate IS NULL;
+            """
+        )
+    else:
+        conn.close()
+        return 0
+
+    row = cursor.fetchone()
+    conn.close()
+    return int(row.ActionCount or 0) if row else 0
+
+
+def update_po_setup_info(form):
+    user = get_current_user()
+    po_number = clean_text(form.get("po_number"))
+    if not po_number:
+        raise ValueError("PO Number is required.")
+
+    payment_type = clean_text(form.get("payment_type"))
+    expected_payment_date = clean_date(form.get("expected_payment_date"))
+    payment_schedule = clean_text(form.get("payment_schedule"))
+    setup_status = clean_text(form.get("setup_status")) or "Needs Payment Schedule"
+    setup_assigned_to = clean_text(form.get("setup_assigned_to"))
+    setup_notes = clean_text(form.get("setup_notes"))
+    action = clean_text(form.get("setup_action")) or "save"
+
+    if action == "assign":
+        if not setup_assigned_to:
+            raise ValueError("Assigned To email is required when assigning this PO.")
+        setup_status = "Assigned to PM"
+
+    if action == "complete":
+        setup_status = "Complete"
+
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+    try:
+        ensure_po_setup_columns(cursor)
+        cursor.execute(
+            """
+            UPDATE dbo.PurchaseOrders
+            SET
+                PaymentType = ?,
+                ExpectedPaymentDate = ?,
+                PaymentSchedule = ?,
+                SetupStatus = ?,
+                SetupAssignedTo = ?,
+                SetupNotes = ?,
+                SetupUpdatedBy = ?,
+                SetupUpdatedAt = SYSUTCDATETIME(),
+                UpdatedAt = SYSUTCDATETIME()
+            WHERE PONumber = ?;
+            """,
+            payment_type,
+            expected_payment_date,
+            payment_schedule,
+            setup_status,
+            setup_assigned_to,
+            setup_notes,
+            user["email"] or "Unknown",
+            po_number,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def action_form(request_id, status, label, css_class="secondary", extra_fields=""):
@@ -2715,6 +2876,17 @@ def my_dashboard():
         data = load_personal_dashboard_data()
         overall = data["overall"]
         pr_stats = load_purchase_request_stats()
+        po_setup_action_count = count_po_setup_actions_for_current_user()
+
+        po_setup_action_card = ""
+        if po_setup_action_count:
+            po_setup_action_card = f"""
+            <div class="card action-required-card">
+                <h3>Actions Required</h3>
+                <p class="card-subtitle">You have <strong>{po_setup_action_count}</strong> PO information item(s) that need payment schedule or planning details.</p>
+                <p><a class="button primary" href="/project-po-setup?mine=1">Open My PO Info Tasks</a></p>
+            </div>
+            """
 
         vendor_rows = ""
         for row in data["top_vendors"]:
@@ -2786,7 +2958,8 @@ def my_dashboard():
                     <p><a class="button primary" href="/po-summary">Open PO Summary</a></p>
                     <p><a class="button" href="/purchase-requests">Review Purchase Requests</a></p>
                     <p><a class="button" href="/purchase-request">Create Purchase Request</a></p>
-                    <p><a class="button" href="/exceptions">Review Exceptions</a></p>
+                    <p><a class="button" href="/project-po-setup">PO Info Review</a></p>
+                    <p><a class="button" href="/exceptions">Review Data Exceptions</a></p>
                     <p><a class="button" href="/exports">Download Exports</a></p>
                 </div>
                 <div class="card">
@@ -2811,7 +2984,8 @@ def my_dashboard():
                     <p><a class="button" href="/purchase-requests">Review Purchase Requests</a></p>
                     <p><a class="button" href="/purchase-request">Create Purchase Request</a></p>
                     <p><a class="button" href="/import-history">Review Import History</a></p>
-                    <p><a class="button" href="/exceptions">Review Exceptions</a></p>
+                    <p><a class="button" href="/project-po-setup">PO Info Review</a></p>
+                    <p><a class="button" href="/exceptions">Review Data Exceptions</a></p>
                     <p><a class="button" href="/exports">Download Exports</a></p>
                 </div>
                 <div class="card">
@@ -2836,7 +3010,7 @@ def my_dashboard():
                     <p><a class="button primary" href="/purchase-request">Create Purchase Request</a></p>
                     <p><a class="button" href="/po-list">Browse PO List</a></p>
                     <p><a class="button" href="/po-detail">Search PO Detail</a></p>
-                    <p><a class="button" href="/po-summary">Open PO Summary</a></p>
+                    <p><a class="button" href="/pos-balances">Open POs & Balances</a></p>
                 </div>
                 <div class="card"><h3>Top Projects</h3><div class="table-wrap"><table><tr><th>Project</th><th class="right">POs</th><th class="right">Line Total</th></tr>{project_rows}</table></div></div>
             </div>
@@ -2849,7 +3023,7 @@ def my_dashboard():
                     <h3>Viewer Dashboard</h3>
                     <p class="card-subtitle">Submit requests and view read-only PO information.</p>
                     <p><a class="button primary" href="/purchase-request">Create Purchase Request</a></p>
-                    <p><a class="button" href="/po-summary">Open PO Summary</a></p>
+                    <p><a class="button" href="/pos-balances">Open POs & Balances</a></p>
                     <p><a class="button" href="/po-list">Browse PO List</a></p>
                     <p><a class="button" href="/po-detail">Search PO Detail</a></p>
                 </div>
@@ -2859,6 +3033,7 @@ def my_dashboard():
 
         content = f"""
         <div class="card"><h3>Welcome, {h(display_name)}</h3><p class="card-subtitle">This dashboard is customized for your role: <strong>{h(role)}</strong>.</p></div>
+        {po_setup_action_card}
         {role_content}
         <div class="grid two">
             <div class="card"><h3>Top Vendors</h3><div class="table-wrap"><table><tr><th>Vendor</th><th class="right">POs</th><th class="right">Line Total</th></tr>{vendor_rows}</table></div></div>
@@ -3698,60 +3873,143 @@ def po_packet(po_number):
         return shell("PO Packet", "Unable to load PO packet.", "POs & Balances", content), 500
 
 
-@app.route("/project-po-setup")
+@app.route("/project-po-setup", methods=["GET", "POST"])
 def project_po_setup():
     allowed, reason = require_page_access("Project PO Setup")
     if not allowed:
         return access_denied_response("Project PO Setup", reason)
 
+    user = get_current_user()
+
+    if request.method == "POST":
+        try:
+            update_po_setup_info(request.form)
+            return redirect("/project-po-setup?toast=" + quote_plus("PO setup information updated."))
+        except Exception as e:
+            return redirect("/project-po-setup?toast=" + quote_plus("Error updating PO setup: " + str(e)) + "&toast_type=error")
+
     try:
-        rows = load_project_po_setup_items()
-        needs_date = sum(1 for r in rows if r.SetupStatus == "Needs Forecast Date")
-        needs_pm = sum(1 for r in rows if r.SetupStatus == "Needs PM Info")
-        open_monitor = sum(1 for r in rows if r.SetupStatus == "Open / Monitor")
+        status_filter = clean_text(request.args.get("status")) or "All"
+        assigned_filter = None
+        if request.args.get("mine") == "1":
+            assigned_filter = user["email"]
+
+        rows = load_project_po_setup_items(status_filter=status_filter, assigned_filter=assigned_filter)
+
+        needs_schedule = sum(1 for r in rows if getattr(r, "MissingPaymentSchedule", 0))
+        needs_type = sum(1 for r in rows if getattr(r, "MissingPaymentType", 0))
+        needs_date = sum(1 for r in rows if getattr(r, "MissingExpectedPaymentDate", 0))
+        assigned = sum(1 for r in rows if (r.SetupAssignedTo or ""))
         total_amount = sum(Decimal(str(r.RemainingAmount or 0)) for r in rows)
 
-        cards = ""
-        for r in rows[:24]:
+        status_links = ""
+        for label in ["All", "Needs Payment Schedule", "Assigned to PM", "In Progress", "Needs Info", "Complete"]:
+            active_class = " active" if status_filter == label else ""
+            href = "/project-po-setup" if label == "All" else "/project-po-setup?status=" + quote_plus(label)
+            status_links += f'<a class="badge blue{active_class}" href="{href}">{h(label)}</a>'
+
+        table_rows = ""
+        for r in rows:
             packet_url = "/po-packet/" + quote_plus(str(r.PONumber or "")) + "?type=internal"
-            cards += f"""
-            <div class="setup-card">
-                <div>{status_chip(r.SetupStatus)}</div>
-                <h4>{h(r.PONumber)}</h4>
-                <div class="meta"><strong>{h(r.ProjectName)}</strong><br>{h(r.VendorName)}</div>
-                <div class="bucket-metric"><span>PO Value</span><strong>{currency(r.POValue)}</strong></div>
-                <div class="bucket-metric"><span>Remaining</span><strong>{currency(r.RemainingAmount)}</strong></div>
-                <div class="bucket-metric"><span>PO Date</span><strong>{h(r.PODate or 'Missing')}</strong></div>
-                <a class="secondary" href="{packet_url}">View Packet</a>
-            </div>
+            selected_status = clean_text(r.SetupStatus) or "Needs Payment Schedule"
+            selected_type = clean_text(r.PaymentType) or ""
+            payment_type_options = ""
+            for opt in ["", "Single Payment", "Deposit + Final", "Progress Payments", "Monthly", "Milestone", "Retainage", "Other"]:
+                label = opt or "Select payment type"
+                sel = " selected" if opt == selected_type else ""
+                payment_type_options += f'<option value="{h(opt)}"{sel}>{h(label)}</option>'
+
+            status_options = ""
+            for opt in ["Needs Payment Schedule", "Assigned to PM", "In Progress", "Needs Info", "Complete", "Not Required"]:
+                sel = " selected" if opt == selected_status else ""
+                status_options += f'<option value="{h(opt)}"{sel}>{h(opt)}</option>'
+
+            missing_bits = []
+            if getattr(r, "MissingPaymentSchedule", 0):
+                missing_bits.append("Payment schedule")
+            if getattr(r, "MissingPaymentType", 0):
+                missing_bits.append("Payment type")
+            if getattr(r, "MissingExpectedPaymentDate", 0):
+                missing_bits.append("Expected payment date")
+            missing_html = ", ".join(missing_bits) if missing_bits else "No required info missing"
+
+            expected_payment_date = "" if not r.ExpectedPaymentDate else str(r.ExpectedPaymentDate)[:10]
+            table_rows += f"""
+            <tr>
+                <form method="post" action="/project-po-setup">
+                    <input type="hidden" name="po_number" value="{h(r.PONumber)}">
+                    <td class="po-number-cell"><a href="{packet_url}">{h(r.PONumber)}</a><br><small>{status_chip(selected_status)}</small></td>
+                    <td>{h(r.ProjectName)}<br><small>{h(r.Department)}</small></td>
+                    <td>{h(r.VendorName)}<br><small>{currency(r.POValue)}</small></td>
+                    <td><small>{h(missing_html)}</small></td>
+                    <td><select name="payment_type">{payment_type_options}</select></td>
+                    <td><input type="date" name="expected_payment_date" value="{h(expected_payment_date)}"></td>
+                    <td class="payment-schedule-cell"><textarea name="payment_schedule" placeholder="Example: 30% deposit, 40% at delivery, 30% net 30 after completion">{h(r.PaymentSchedule)}</textarea></td>
+                    <td><input type="email" name="setup_assigned_to" value="{h(r.SetupAssignedTo)}" placeholder="pm@c-diving.com"></td>
+                    <td><select name="setup_status">{status_options}</select></td>
+                    <td class="notes-cell"><textarea name="setup_notes" placeholder="Notes for PM/accounting">{h(r.SetupNotes)}</textarea></td>
+                    <td class="inline-actions">
+                        <button class="primary" name="setup_action" value="save" type="submit">Update</button>
+                        <button class="secondary" name="setup_action" value="assign" type="submit">Assign</button>
+                        <button class="secondary" name="setup_action" value="complete" type="submit">Complete</button>
+                    </td>
+                </form>
+            </tr>
             """
-        if not cards:
-            cards = '<div class="empty-state"><strong>No setup items found.</strong><span>POs that need forecast dates, PM info, or balance monitoring will appear here.</span></div>'
+
+        if not table_rows:
+            table_rows = '<tr><td colspan="11"><div class="empty-state"><strong>No PO setup items found.</strong><span>POs missing payment schedules, payment type, or expected payment dates will appear here.</span></div></td></tr>'
+
+        mine_link = ""
+        if user["email"]:
+            mine_link = f'<a class="button secondary" href="/project-po-setup?mine=1">My Assigned PO Info Tasks</a>'
 
         content = f"""
+        <div class="info-callout">
+            <strong>PO Info Review replaces duplicate missing-info workflows.</strong>
+            Use this page for POs that are missing payment schedules, payment timing, payment type, or PM-provided details. The separate Exceptions page remains for data-quality problems like amount mismatches or closed POs with remaining balances.
+        </div>
         <div class="grid kpis">
-            <div class="card kpi"><div class="label">Setup Items</div><div class="value">{len(rows)}</div><div class="trend">POs needing setup or monitoring</div></div>
-            <div class="card kpi"><div class="label">Needs Forecast Date</div><div class="value">{needs_date}</div><div class="trend">Missing PO date</div></div>
-            <div class="card kpi"><div class="label">Needs PM Info</div><div class="value">{needs_pm}</div><div class="trend">Requester / PM info missing</div></div>
-            <div class="card kpi"><div class="label">Open Monitor</div><div class="value">{open_monitor}</div><div class="trend">Open balances to monitor</div></div>
-            <div class="card kpi"><div class="label">Remaining Exposure</div><div class="value">{currency(total_amount)}</div><div class="trend">From setup queue</div></div>
+            <div class="card kpi"><div class="label">Rows In View</div><div class="value">{len(rows)}</div><div class="trend">PO setup records</div></div>
+            <div class="card kpi"><div class="label">Missing Schedule</div><div class="value">{needs_schedule}</div><div class="trend">Need payment schedule</div></div>
+            <div class="card kpi"><div class="label">Missing Type</div><div class="value">{needs_type}</div><div class="trend">Need payment type</div></div>
+            <div class="card kpi"><div class="label">Missing Date</div><div class="value">{needs_date}</div><div class="trend">Need expected payment date</div></div>
+            <div class="card kpi"><div class="label">Assigned</div><div class="value">{assigned}</div><div class="trend">Assigned to PM/user</div></div>
+            <div class="card kpi"><div class="label">Remaining Exposure</div><div class="value">{currency(total_amount)}</div><div class="trend">Rows in current view</div></div>
         </div>
         <div class="card">
-            <h3>Project PO Setup Queue</h3>
-            <p class="card-subtitle">Use this page to identify POs that need PM/accounting cleanup, forecast dates, or monitoring. This version is read-only and does not require a new SQL table.</p>
-            <div class="timeline">
-                <div class="timeline-item"><strong>Accounting imports issued POs</strong><span>Rows are loaded through Upload Issued POs.</span></div>
-                <div class="timeline-item"><strong>PM/accounting fills gaps</strong><span>Missing dates, requestor details, or forecast timing can be reviewed here.</span></div>
-                <div class="timeline-item"><strong>PO becomes forecast-ready</strong><span>Packets and forecasting pages use cleaner setup data.</span></div>
+            <div style="display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap;">
+                <div>
+                    <h3>PO Info Review Table</h3>
+                    <p class="card-subtitle">Update missing payment schedule information directly, or assign the PO to a project manager so it appears as an action item on their dashboard.</p>
+                    <div class="status-pill-row">{status_links}</div>
+                </div>
+                <div>{mine_link}</div>
+            </div>
+            <div class="table-wrap setup-table">
+                <table>
+                    <tr>
+                        <th>PO</th><th>Project</th><th>Vendor / Amount</th><th>Missing Info</th><th>Payment Type</th><th>Expected Payment Date</th><th>Payment Schedule</th><th>Assigned To</th><th>Status</th><th>Notes</th><th>Actions</th>
+                    </tr>
+                    {table_rows}
+                </table>
             </div>
         </div>
-        <div class="setup-card-grid">{cards}</div>
+        <div class="card">
+            <h3>Recommended workflow</h3>
+            <div class="timeline">
+                <div class="timeline-item"><strong>Accounting imports issued POs</strong><span>PO rows land in the dashboard from the Upload Issued POs page.</span></div>
+                <div class="timeline-item"><strong>PO Info Review identifies missing planning data</strong><span>Missing payment schedule, payment type, and expected payment date appear here.</span></div>
+                <div class="timeline-item"><strong>Assign missing info to the PM</strong><span>Enter the PM email and click Assign. The PM will see assigned PO info tasks on My Dashboard.</span></div>
+                <div class="timeline-item"><strong>PM/accounting updates the PO</strong><span>Once payment schedule and timing are entered, mark the item Complete.</span></div>
+            </div>
+        </div>
         """
-        return shell("Project PO Setup", "Review issued POs that need PM information, forecast dates, or setup cleanup.", "Project PO Setup", content)
+        return shell("PO Info Review", "Update missing PO planning details and assign follow-up work.", "PO Info Review", content)
 
     except Exception as e:
-        content = f'<div class="notice error">Error loading Project PO Setup: {h(e)}</div>'
-        return shell("Project PO Setup", "Unable to load setup queue.", "Project PO Setup", content), 500
+        content = f'<div class="notice error">Error loading PO Info Review: {h(e)}</div>'
+        return shell("PO Info Review", "Unable to load setup queue.", "PO Info Review", content), 500
 
 
 @app.route("/missing-po-review")
@@ -3759,7 +4017,7 @@ def missing_po_review():
     allowed, reason = require_page_access("Missing PO Review")
     if not allowed:
         return access_denied_response("Missing PO Review", reason)
-    return redirect("/exceptions")
+    return redirect("/project-po-setup")
 
 @app.route("/download-issued-po-template.csv")
 def download_issued_po_template():
