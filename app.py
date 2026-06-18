@@ -3989,13 +3989,15 @@ def project_po_setup():
             schedule_inputs += '<div class="payment-schedule-help">For single payment, use Payment 1 only. For multiple payments, enter each expected payment date and amount/percent. The first date is used for forecasting.</div>'
 
             assigned_options = '<option value="">Unassigned</option>'
-            selected_assigned = clean_text(r.SetupAssignedTo)
+            selected_assigned = (clean_text(r.SetupAssignedTo) or "").lower()
             for u in assignable_users:
-                user_email = clean_text(u.Email).lower()
+                user_email = (clean_text(u.Email) or "").lower()
+                if not user_email:
+                    continue
                 display = clean_text(u.DisplayName) or user_email
                 role = clean_text(u.RoleName)
                 label_text = display + (f" ({role})" if role else "")
-                sel = " selected" if user_email == selected_assigned.lower() else ""
+                sel = " selected" if user_email == selected_assigned else ""
                 assigned_options += f'<option value="{h(user_email)}"{sel}>{h(label_text)}</option>'
 
             table_rows += f"""
