@@ -4080,16 +4080,15 @@ def project_po_setup():
             return ["Multiple Payments", "Deposit + Final", "Progress Payments", "Monthly", "Milestone", "Retainage"].includes(value || "");
         }
         function togglePaymentScheduleRows(selectEl) {
-            const form = selectEl.closest("form");
-            if (!form) return;
+            const rowContainer = selectEl.closest("tr") || selectEl.closest("form") || document;
             const requiresMultiple = poSetupPaymentTypeRequiresMultiple(selectEl.value);
-            form.querySelectorAll("[data-payment-row]").forEach(function(row) {
+            rowContainer.querySelectorAll("[data-payment-row]").forEach(function(row) {
                 const idx = Number(row.getAttribute("data-payment-row") || "1");
                 const show = idx === 1 || requiresMultiple;
-                row.style.display = show ? "" : "none";
-                if (!show) {
-                    row.querySelectorAll("input").forEach(function(input) { input.value = ""; });
-                }
+                row.style.display = show ? "grid" : "none";
+                row.querySelectorAll("input").forEach(function(input) {
+                    if (idx > 1 && !show) input.value = "";
+                });
             });
         }
         document.addEventListener("DOMContentLoaded", function() {
