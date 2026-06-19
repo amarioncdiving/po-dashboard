@@ -1842,7 +1842,8 @@ code { background:#f1f5f9; padding:8px 10px; display:block; border-radius:12px; 
 .setup-table .payment-schedule-cell { min-width:520px; }
 .setup-table .assign-cell { min-width:240px; }
 .payment-schedule-builder { display:grid; gap:6px; }
-.payment-schedule-row { display:grid; grid-template-columns:128px 115px 1fr; gap:6px; align-items:center; }
+.payment-schedule-row { display:grid; grid-template-columns:82px 128px 115px 1fr; gap:6px; align-items:center; }
+.payment-row-label { color:var(--muted); font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.04em; }
 .payment-schedule-row input { min-width:0; }
 .payment-schedule-help { color:var(--muted); font-size:11px; line-height:1.35; }
 .inline-actions { display:grid; gap:7px; min-width:110px; }
@@ -2492,7 +2493,7 @@ def update_po_setup_info(form):
     if not po_number:
         raise ValueError("PO Number is required.")
 
-    payment_type = clean_text(form.get("payment_type"))
+    payment_type = clean_text(form.get("payment_type")) or "Single Payment"
     setup_status = clean_text(form.get("setup_status")) or "Needs Payment Schedule"
     setup_assigned_to = clean_text(form.get("setup_assigned_to"))
     action = clean_text(form.get("setup_action")) or "save"
@@ -3952,12 +3953,12 @@ def project_po_setup():
         for r in rows:
             packet_url = "/po-packet/" + quote_plus(str(r.PONumber or "")) + "?type=internal"
             selected_status = clean_text(r.SetupStatus) or "Needs Payment Schedule"
-            selected_type = clean_text(r.PaymentType) or ""
+            selected_type = clean_text(r.PaymentType) or "Single Payment"
+            multi_payment_types = {"Multiple Payments", "Deposit + Final", "Progress Payments", "Monthly", "Milestone", "Retainage"}
             payment_type_options = ""
-            for opt in ["", "Single Payment", "Multiple Payments", "Deposit + Final", "Progress Payments", "Monthly", "Milestone", "Retainage", "Other"]:
-                label = opt or "Select payment type"
+            for opt in ["Single Payment", "Multiple Payments", "Deposit + Final", "Progress Payments", "Monthly", "Milestone", "Retainage", "Other"]:
                 sel = " selected" if opt == selected_type else ""
-                payment_type_options += f'<option value="{h(opt)}"{sel}>{h(label)}</option>'
+                payment_type_options += f'<option value="{h(opt)}"{sel}>{h(opt)}</option>'
 
             status_options = ""
             for opt in ["Needs Payment Schedule", "Assigned to PM", "In Progress", "Needs Info", "Complete", "Not Required"]:
@@ -3976,17 +3977,21 @@ def project_po_setup():
             expected_payment_date = "" if not r.ExpectedPaymentDate else str(r.ExpectedPaymentDate)[:10]
 
             existing_schedule_lines = [line.strip() for line in str(r.PaymentSchedule or "").splitlines() if line.strip()]
+            requires_multiple = selected_type in multi_payment_types or len(existing_schedule_lines) > 1
             schedule_inputs = '<input type="hidden" name="expected_payment_date" value="' + h(expected_payment_date) + '">'
             for idx in range(1, 5):
                 existing_line = existing_schedule_lines[idx - 1] if idx - 1 < len(existing_schedule_lines) else ""
+                row_style = "" if idx == 1 or requires_multiple else "display:none;"
+                date_value = expected_payment_date if idx == 1 and expected_payment_date else ""
                 schedule_inputs += f'''
-                    <div class="payment-schedule-row">
-                        <input type="date" name="payment_{idx}_date" aria-label="Payment {idx} date">
+                    <div class="payment-schedule-row" data-payment-row="{idx}" style="{row_style}">
+                        <div class="payment-row-label">Payment {idx}</div>
+                        <input type="date" name="payment_{idx}_date" value="{h(date_value if idx == 1 else '')}" aria-label="Payment {idx} date">
                         <input type="text" name="payment_{idx}_amount" placeholder="Amount/%" aria-label="Payment {idx} amount or percent">
-                        <input type="text" name="payment_{idx}_note" value="{h(existing_line)}" placeholder="Payment {idx} note, milestone, or terms" aria-label="Payment {idx} note">
+                        <input type="text" name="payment_{idx}_note" value="{h(existing_line)}" placeholder="Milestone or terms" aria-label="Payment {idx} note">
                     </div>
                 '''
-            schedule_inputs += '<div class="payment-schedule-help">For single payment, use Payment 1 only. For multiple payments, enter each expected payment date and amount/percent. The first date is used for forecasting.</div>'
+            schedule_inputs += '<div class="payment-schedule-help">Single Payment shows one payment date by default. Choose Multiple Payments, Deposit + Final, Progress Payments, Monthly, Milestone, or Retainage to add more payment rows. The first date is used for forecasting.</div>'
 
             assigned_options = '<option value="">Unassigned</option>'
             selected_assigned = (clean_text(r.SetupAssignedTo) or "").lower()
@@ -4008,7 +4013,7 @@ def project_po_setup():
                     <td>{h(r.ProjectName)}<br><small>{h(r.Department)}</small></td>
                     <td>{h(r.VendorName)}<br><small>{currency(r.POValue)}</small></td>
                     <td><small>{h(missing_html)}</small></td>
-                    <td><select name="payment_type">{payment_type_options}</select></td>
+                    <td><select name="payment_type" onchange="togglePaymentScheduleRows(this)">{payment_type_options}</select></td>
                     <td class="payment-schedule-cell"><div class="payment-schedule-builder">{schedule_inputs}</div></td>
                     <td class="assign-cell"><select name="setup_assigned_to">{assigned_options}</select></td>
                     <td><select name="setup_status">{status_options}</select></td>
@@ -4068,6 +4073,29 @@ def project_po_setup():
                 <div class="timeline-item"><strong>PM/accounting updates the PO</strong><span>Once payment schedule and timing are entered, mark the item Complete.</span></div>
             </div>
         </div>
+        """
+        content += """
+        <script>
+        function poSetupPaymentTypeRequiresMultiple(value) {
+            return ["Multiple Payments", "Deposit + Final", "Progress Payments", "Monthly", "Milestone", "Retainage"].includes(value || "");
+        }
+        function togglePaymentScheduleRows(selectEl) {
+            const form = selectEl.closest("form");
+            if (!form) return;
+            const requiresMultiple = poSetupPaymentTypeRequiresMultiple(selectEl.value);
+            form.querySelectorAll("[data-payment-row]").forEach(function(row) {
+                const idx = Number(row.getAttribute("data-payment-row") || "1");
+                const show = idx === 1 || requiresMultiple;
+                row.style.display = show ? "" : "none";
+                if (!show) {
+                    row.querySelectorAll("input").forEach(function(input) { input.value = ""; });
+                }
+            });
+        }
+        document.addEventListener("DOMContentLoaded", function() {
+            document.querySelectorAll('select[name="payment_type"]').forEach(togglePaymentScheduleRows);
+        });
+        </script>
         """
         return shell("PO Info Review", "Update missing PO planning details and assign follow-up work.", "PO Info Review", content)
 
