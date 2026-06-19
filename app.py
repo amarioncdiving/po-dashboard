@@ -2236,10 +2236,13 @@ def render_open_balance_buckets(projects):
 
 
 def parse_payment_schedule_for_forecast(payment_schedule, total_amount):
-    """Return dated payment schedule entries from the PO Info Review schedule text.
+    """Return dated payment schedule entries from PO Info Review.
 
-    Schedule lines are saved as: date - amount/% - note. This parser also
-    handles older text rows as long as a recognizable date is present.
+    The PO Info Review form saves one line per payment. Lines may be as simple
+    as a date, or they may include an amount/percent and a note, separated by
+    dashes or other text. If payment dates exist but no amounts are entered,
+    the open PO amount is allocated evenly across the dated rows so Forecasting
+    bucket totals move with the schedule.
     """
     text = str(payment_schedule or "").strip()
     if not text:
@@ -2258,20 +2261,35 @@ def parse_payment_schedule_for_forecast(payment_schedule, total_amount):
         if not schedule_date:
             continue
 
-        # Prefer the second dash-delimited part because our form saves rows as:
-        # payment date - payment amount/percent - note/milestone.
-        parts = [part.strip() for part in line.split(" - ")]
-        amount_text = parts[1] if len(parts) >= 2 else ""
-        schedule_amount = None
+        # Remove the date from the line before looking for an amount so we do
+        # not accidentally treat the year/month/day as the payment amount.
+        amount_source = line
+        if date_match:
+            amount_source = (line[:date_match.start()] + " " + line[date_match.end():]).strip()
 
-        percent_match = re.search(r"(\d+(?:\.\d+)?)\s*%", amount_text)
+        schedule_amount = None
+        percent_match = re.search(r"(\d+(?:\.\d+)?)\s*%", amount_source)
         if percent_match:
             try:
                 schedule_amount = total * Decimal(percent_match.group(1)) / Decimal("100")
             except Exception:
                 schedule_amount = None
         else:
-            schedule_amount = clean_decimal(amount_text)
+            # Prefer explicit currency-like amounts after the date. This handles
+            # entries such as "2026-07-01 - $10,000 - Deposit".
+            money_matches = re.findall(r"\$?\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)", amount_source)
+            if money_matches:
+                # Avoid tiny row labels like "1" or "2" when a real amount is present.
+                candidates = []
+                for m in money_matches:
+                    val = clean_decimal(m)
+                    if val is not None:
+                        candidates.append(val)
+                larger = [v for v in candidates if abs(v) >= Decimal("10")]
+                if larger:
+                    schedule_amount = larger[-1]
+                elif candidates:
+                    schedule_amount = candidates[-1]
 
         entries.append({
             "date": schedule_date,
@@ -2333,7 +2351,14 @@ def load_forecast_data():
             po.PaymentSchedule,
             COALESCE(NULLIF(po.SetupStatus, ''), po.POStatus) AS Status,
             NULL AS Priority,
-            COALESCE(po.RemainingAmount, po.RevisedAmount, po.OriginalAmount, 0) AS Amount,
+            COALESCE(
+                NULLIF(po.RemainingAmount, 0),
+                NULLIF(po.RevisedAmount, 0),
+                NULLIF(po.OriginalAmount, 0),
+                NULLIF(lines.TotalLineAmount, 0),
+                0
+            ) AS Amount,
+            COALESCE(lines.TotalLineAmount, 0) AS TotalLineAmount,
             CASE
                 WHEN COALESCE(po.PaymentSchedule, '') <> '' THEN po.PaymentSchedule
                 WHEN po.ExpectedPaymentDate IS NULL THEN 'Open PO balance without expected payment date'
@@ -2342,11 +2367,28 @@ def load_forecast_data():
         FROM dbo.PurchaseOrders po
         LEFT JOIN dbo.Vendors v ON po.VendorId = v.VendorId
         LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
-        WHERE COALESCE(po.RemainingAmount, po.RevisedAmount, po.OriginalAmount, 0) > 0
+        LEFT JOIN (
+            SELECT PONumber, SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount
+            FROM dbo.IssuedPOLines
+            GROUP BY PONumber
+        ) lines ON lines.PONumber = po.PONumber
+        WHERE COALESCE(
+                NULLIF(po.RemainingAmount, 0),
+                NULLIF(po.RevisedAmount, 0),
+                NULLIF(po.OriginalAmount, 0),
+                NULLIF(lines.TotalLineAmount, 0),
+                0
+            ) > 0
         ORDER BY
             CASE WHEN po.ExpectedPaymentDate IS NULL AND COALESCE(po.PaymentSchedule, '') = '' THEN 1 ELSE 0 END,
             po.ExpectedPaymentDate ASC,
-            COALESCE(po.RemainingAmount, po.RevisedAmount, po.OriginalAmount, 0) DESC;
+            COALESCE(
+                NULLIF(po.RemainingAmount, 0),
+                NULLIF(po.RevisedAmount, 0),
+                NULLIF(po.OriginalAmount, 0),
+                NULLIF(lines.TotalLineAmount, 0),
+                0
+            ) DESC;
         """
     )
     po_rows = cursor.fetchall()
