@@ -2256,32 +2256,33 @@ def load_forecast_data():
     )
     request_rows = cursor.fetchall()
 
+    ensure_po_setup_columns(cursor)
+    conn.commit()
+
     cursor.execute(
         """
-        WITH UniquePOs AS (
-            SELECT
-                PONumber,
-                MAX(ProjectName) AS ProjectName,
-                MAX(VendorName) AS VendorName,
-                MAX(POStatus) AS Status,
-                MAX(PODate) AS PODate,
-                MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
-            FROM dbo.IssuedPOLines
-            GROUP BY PONumber
-        )
         SELECT
-            PONumber AS SourceId,
+            po.PONumber AS SourceId,
             'Open PO Balance' AS SourceType,
-            ProjectName,
-            VendorName,
-            NULL AS ForecastDate,
-            Status,
+            pr.ProjectName,
+            v.VendorName,
+            po.ExpectedPaymentDate AS ForecastDate,
+            COALESCE(NULLIF(po.SetupStatus, ''), po.POStatus) AS Status,
             NULL AS Priority,
-            RemainingAmount AS Amount,
-            'Open PO balance without expected payment date' AS Description
-        FROM UniquePOs
-        WHERE COALESCE(RemainingAmount, 0) > 0
-        ORDER BY RemainingAmount DESC;
+            COALESCE(po.RemainingAmount, po.RevisedAmount, po.OriginalAmount, 0) AS Amount,
+            CASE
+                WHEN po.ExpectedPaymentDate IS NULL THEN 'Open PO balance without expected payment date'
+                WHEN COALESCE(po.PaymentSchedule, '') <> '' THEN po.PaymentSchedule
+                ELSE 'Open PO balance with expected payment date'
+            END AS Description
+        FROM dbo.PurchaseOrders po
+        LEFT JOIN dbo.Vendors v ON po.VendorId = v.VendorId
+        LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
+        WHERE COALESCE(po.RemainingAmount, po.RevisedAmount, po.OriginalAmount, 0) > 0
+        ORDER BY
+            CASE WHEN po.ExpectedPaymentDate IS NULL THEN 1 ELSE 0 END,
+            po.ExpectedPaymentDate ASC,
+            COALESCE(po.RemainingAmount, po.RevisedAmount, po.OriginalAmount, 0) DESC;
         """
     )
     po_rows = cursor.fetchall()
@@ -2359,30 +2360,52 @@ def aggregate_items(items, key_name):
 # Feature phase helpers: PO packets and project setup
 # ------------------------------------------------------------
 
+def render_payment_schedule_for_packet(payment_schedule):
+    lines = [line.strip() for line in str(payment_schedule or "").splitlines() if line.strip()]
+    if not lines:
+        return '<div class="empty-state"><strong>No payment schedule entered.</strong><span>Use PO Info Review to add expected payment dates and schedule details.</span></div>'
+    items = "".join(f'<div class="timeline-item"><strong>Payment {idx}</strong><span>{h(line)}</span></div>' for idx, line in enumerate(lines, start=1))
+    return f'<div class="timeline">{items}</div>'
+
+
 def load_po_packet_data(po_number):
     conn = get_sql_connection()
     cursor = conn.cursor()
+    ensure_po_setup_columns(cursor)
+    conn.commit()
     cursor.execute(
         """
-        WITH UniquePOs AS (
-            SELECT
-                PONumber,
-                MAX(VendorName) AS VendorName,
-                MAX(ProjectName) AS ProjectName,
-                MAX(Department) AS Department,
-                MAX(POStatus) AS POStatus,
-                MAX(PODate) AS PODate,
-                MAX(Requestor) AS Requestor,
-                MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
-                SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount,
-                MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount,
-                COUNT(*) AS LineCount
+        SELECT
+            po.PONumber,
+            v.VendorName,
+            pr.ProjectName,
+            po.Department,
+            po.POStatus,
+            po.PODate,
+            po.Requestor,
+            COALESCE(po.RevisedAmount, po.OriginalAmount, 0) AS POValue,
+            COALESCE(lines.TotalLineAmount, COALESCE(po.RevisedAmount, po.OriginalAmount, 0)) AS TotalLineAmount,
+            COALESCE(po.RemainingAmount, 0) AS RemainingAmount,
+            COALESCE(lines.LineCount, 0) AS LineCount,
+            po.PaymentType,
+            po.ExpectedPaymentDate,
+            po.PaymentSchedule,
+            po.SetupStatus,
+            po.SetupAssignedTo,
+            po.SetupUpdatedBy,
+            po.SetupUpdatedAt
+        FROM dbo.PurchaseOrders po
+        LEFT JOIN dbo.Vendors v ON po.VendorId = v.VendorId
+        LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
+        LEFT JOIN (
+            SELECT PONumber, SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount, COUNT(*) AS LineCount
             FROM dbo.IssuedPOLines
             WHERE PONumber = ?
             GROUP BY PONumber
-        )
-        SELECT * FROM UniquePOs;
+        ) lines ON lines.PONumber = po.PONumber
+        WHERE po.PONumber = ?;
         """,
+        po_number,
         po_number,
     )
     po = cursor.fetchone()
@@ -3948,9 +3971,16 @@ def po_packet(po_number):
                 <div class="packet-field"><span>Department</span><strong>{h(po.Department)}</strong></div>
                 <div class="packet-field"><span>PO Date</span><strong>{h(po.PODate)}</strong></div>
                 <div class="packet-field"><span>Status</span><strong>{status_chip(po.POStatus)}</strong></div>
+                <div class="packet-field"><span>Requestor</span><strong>{h(getattr(po, 'Requestor', '') or '')}</strong></div>
+                <div class="packet-field"><span>Payment Type</span><strong>{h(getattr(po, 'PaymentType', '') or 'Not set')}</strong></div>
+                <div class="packet-field"><span>Expected Payment Date</span><strong>{h(getattr(po, 'ExpectedPaymentDate', '') or 'Not set')}</strong></div>
                 <div class="packet-field"><span>PO Value</span><strong>{currency(po.POValue)}</strong></div>
                 {balance_fields}
             </div>
+        </div>
+        <div class="card">
+            <h3>Payment Schedule</h3>
+            {render_payment_schedule_for_packet(getattr(po, 'PaymentSchedule', '') or '')}
         </div>
         <div class="card">
             <h3>PO Line Items</h3>
@@ -4076,7 +4106,6 @@ def project_po_setup():
                     <td>{h(r.ProjectName)}<br><small>{h(r.Department)}</small></td>
                     <td>{('<input type="text" name="vendor_name" value="" placeholder="Enter vendor" aria-label="Vendor name">' if getattr(r, "MissingVendor", 0) else h(r.VendorName))}<br><small>{currency(r.POValue)}</small></td>
                     <td>{h(r.Requestor or '')}</td>
-                    <td><small>{h(missing_html)}</small></td>
                     <td><select name="payment_type" onchange="togglePaymentScheduleRows(this)">{payment_type_options}</select></td>
                     <td class="payment-schedule-cell"><div class="payment-schedule-builder">{schedule_inputs}</div></td>
                     <td class="assign-cell"><select name="setup_assigned_to">{assigned_options}</select></td>
@@ -4091,7 +4120,7 @@ def project_po_setup():
             """
 
         if not table_rows:
-            table_rows = '<tr><td colspan="10"><div class="empty-state"><strong>No PO setup items found.</strong><span>POs missing payment schedules, payment type, or expected payment dates will appear here.</span></div></td></tr>'
+            table_rows = '<tr><td colspan="9"><div class="empty-state"><strong>No PO setup items found.</strong><span>POs missing payment schedules, payment type, or expected payment dates will appear here.</span></div></td></tr>'
 
         mine_link = ""
         if user["email"]:
@@ -4128,7 +4157,7 @@ def project_po_setup():
                                 <div class="project-filter-head"><span>Project</span><button class="project-filter-button" type="button" onclick="togglePOProjectFilter()" title="Filter by project">▾</button></div>
                                 <select id="poProjectFilter" class="project-filter-select" onchange="filterPOInfoReviewByProject()">{project_filter_options}</select>
                             </th>
-                            <th>Vendor / Amount</th><th>Requestor</th><th>Missing Info</th><th>Payment Type</th><th>Payment Schedule</th><th>Assigned To</th><th>Status</th><th>Actions</th>
+                            <th>Vendor / Amount</th><th>Requestor</th><th>Payment Type</th><th>Payment Schedule</th><th>Assigned To</th><th>Status</th><th>Actions</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -4438,7 +4467,7 @@ def exceptions():
             """
 
         if not exception_rows:
-            exception_rows = '<tr><td colspan="10">No exceptions found. Your issued PO data looks clean.</td></tr>'
+            exception_rows = '<tr><td colspan="9">No exceptions found. Your issued PO data looks clean.</td></tr>'
 
         kpi_cards = ""
         if count_by_type:
