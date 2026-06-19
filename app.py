@@ -1872,6 +1872,38 @@ a, a:visited { color:#1d4ed8; }
 .status-pill-row .status-chip.all { background:#e2e8f0; color:#334155; }
 @media (max-width:820px) { .setup-table table { min-width:1550px; } .payment-schedule-row { grid-template-columns:1fr; } }
 
+
+.project-filter-th { min-width:220px; }
+.project-filter-head { display:flex; align-items:center; gap:8px; }
+.project-filter-button {
+  border:1px solid #cbd5e1;
+  background:#f8fafc;
+  color:#0f2e5c;
+  border-radius:8px;
+  width:28px;
+  height:28px;
+  display:inline-grid;
+  place-items:center;
+  cursor:pointer;
+  font-size:13px;
+}
+.project-filter-button:hover { background:#eaf4ff; border-color:#93c5fd; }
+.project-filter-select {
+  display:none;
+  margin-top:8px;
+  width:100%;
+  border:1px solid #cbd5e1;
+  border-radius:10px;
+  background:white;
+  padding:8px 10px;
+  min-height:38px;
+  font-size:12px;
+  text-transform:none;
+  letter-spacing:0;
+  color:#0f172a;
+}
+.project-filter-select.show { display:block; }
+
 </style>
 """
 
@@ -3971,6 +4003,15 @@ def project_po_setup():
             href = "/project-po-setup" if label == "All" else "/project-po-setup?status=" + quote_plus(label)
             status_links += f'<a class="{active_class.strip()}" href="{href}">{status_chip(label)}</a>'
 
+        project_names = []
+        for r in rows:
+            project_name = clean_text(getattr(r, "ProjectName", ""))
+            if project_name and project_name not in project_names:
+                project_names.append(project_name)
+        project_filter_options = '<option value="">All projects</option>'
+        for project_name in sorted(project_names):
+            project_filter_options += f'<option value="{h(project_name)}">{h(project_name)}</option>'
+
         table_rows = ""
         for r in rows:
             packet_url = "/po-packet/" + quote_plus(str(r.PONumber or "")) + "?type=internal"
@@ -4075,28 +4116,19 @@ def project_po_setup():
                 <div>
                     <h3>PO Info Review Table</h3>
                     <p class="card-subtitle">Update missing payment schedule information directly, or assign the PO to a project manager so it appears as an action item on their dashboard.</p>
-                    <div class="status-pill-row">{status_links}</div>
                 </div>
                 <div>{mine_link}</div>
             </div>
-            <div class="filter-hint"><span>Use the filters below each column heading to narrow the PO Info Review table. For example, type a project name or project number under Project.</span><button type="button" onclick="clearPOInfoReviewFilters()">Clear Filters</button></div>
             <div class="table-wrap setup-table">
                 <table id="poInfoReviewTable">
                     <thead>
                         <tr>
-                            <th>PO</th><th>Project</th><th>Vendor / Amount</th><th>Requestor</th><th>Missing Info</th><th>Payment Type</th><th>Payment Schedule</th><th>Assigned To</th><th>Status</th><th>Actions</th>
-                        </tr>
-                        <tr class="column-filter-row">
-                            <th><input data-col="0" oninput="filterPOInfoReviewTable()" placeholder="PO"></th>
-                            <th><input data-col="1" oninput="filterPOInfoReviewTable()" placeholder="Project"></th>
-                            <th><input data-col="2" oninput="filterPOInfoReviewTable()" placeholder="Vendor"></th>
-                            <th><input data-col="3" oninput="filterPOInfoReviewTable()" placeholder="Requestor"></th>
-                            <th><input data-col="4" oninput="filterPOInfoReviewTable()" placeholder="Missing info"></th>
-                            <th><input data-col="5" oninput="filterPOInfoReviewTable()" placeholder="Payment type"></th>
-                            <th><input data-col="6" oninput="filterPOInfoReviewTable()" placeholder="Schedule"></th>
-                            <th><input data-col="7" oninput="filterPOInfoReviewTable()" placeholder="Assigned to"></th>
-                            <th><input data-col="8" oninput="filterPOInfoReviewTable()" placeholder="Status"></th>
-                            <th><input data-col="9" oninput="filterPOInfoReviewTable()" placeholder="Actions"></th>
+                            <th>PO</th>
+                            <th class="project-filter-th">
+                                <div class="project-filter-head"><span>Project</span><button class="project-filter-button" type="button" onclick="togglePOProjectFilter()" title="Filter by project">▾</button></div>
+                                <select id="poProjectFilter" class="project-filter-select" onchange="filterPOInfoReviewByProject()">{project_filter_options}</select>
+                            </th>
+                            <th>Vendor / Amount</th><th>Requestor</th><th>Missing Info</th><th>Payment Type</th><th>Payment Schedule</th><th>Assigned To</th><th>Status</th><th>Actions</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -4132,33 +4164,27 @@ def project_po_setup():
                 });
             });
         }
-        function filterPOInfoReviewTable() {
+        function togglePOProjectFilter() {
+            const select = document.getElementById("poProjectFilter");
+            if (!select) return;
+            select.classList.toggle("show");
+            if (select.classList.contains("show")) select.focus();
+        }
+        function filterPOInfoReviewByProject() {
             const table = document.getElementById("poInfoReviewTable");
-            if (!table) return;
-            const filters = Array.from(table.querySelectorAll(".column-filter-row input")).map(function(input) {
-                return { col: Number(input.dataset.col), value: input.value.trim().toLowerCase() };
-            });
+            const select = document.getElementById("poProjectFilter");
+            if (!table || !select) return;
+            const selectedProject = (select.value || "").trim().toLowerCase();
             table.querySelectorAll("tbody tr").forEach(function(row) {
                 const cells = row.querySelectorAll("td");
                 if (!cells.length) return;
-                let visible = true;
-                filters.forEach(function(f) {
-                    if (!f.value) return;
-                    const cellText = (cells[f.col] ? cells[f.col].innerText : "").toLowerCase();
-                    if (!cellText.includes(f.value)) visible = false;
-                });
-                row.style.display = visible ? "" : "none";
+                const projectText = (cells[1] ? cells[1].innerText : "").toLowerCase();
+                row.style.display = (!selectedProject || projectText.includes(selectedProject)) ? "" : "none";
             });
-        }
-        function clearPOInfoReviewFilters() {
-            const table = document.getElementById("poInfoReviewTable");
-            if (!table) return;
-            table.querySelectorAll(".column-filter-row input").forEach(function(input) { input.value = ""; });
-            filterPOInfoReviewTable();
         }
         document.addEventListener("DOMContentLoaded", function() {
             document.querySelectorAll('select[name="payment_type"]').forEach(togglePaymentScheduleRows);
-            filterPOInfoReviewTable();
+            filterPOInfoReviewByProject();
         });
         </script>
         """
