@@ -4,6 +4,7 @@ import site
 import csv
 import io
 import html
+import re
 from datetime import datetime, date
 from decimal import Decimal, InvalidOperation
 from urllib.parse import quote_plus
@@ -2233,6 +2234,67 @@ def render_open_balance_buckets(projects):
     return "".join(html_parts)
 
 
+
+def parse_payment_schedule_for_forecast(payment_schedule, total_amount):
+    """Return dated payment schedule entries from the PO Info Review schedule text.
+
+    Schedule lines are saved as: date - amount/% - note. This parser also
+    handles older text rows as long as a recognizable date is present.
+    """
+    text = str(payment_schedule or "").strip()
+    if not text:
+        return []
+
+    total = Decimal(str(total_amount or 0))
+    entries = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        date_match = re.search(r"(\d{4}-\d{1,2}-\d{1,2}|\d{1,2}/\d{1,2}/\d{2,4})", line)
+        schedule_date = clean_date(date_match.group(1)) if date_match else None
+        if not schedule_date:
+            continue
+
+        # Prefer the second dash-delimited part because our form saves rows as:
+        # payment date - payment amount/percent - note/milestone.
+        parts = [part.strip() for part in line.split(" - ")]
+        amount_text = parts[1] if len(parts) >= 2 else ""
+        schedule_amount = None
+
+        percent_match = re.search(r"(\d+(?:\.\d+)?)\s*%", amount_text)
+        if percent_match:
+            try:
+                schedule_amount = total * Decimal(percent_match.group(1)) / Decimal("100")
+            except Exception:
+                schedule_amount = None
+        else:
+            schedule_amount = clean_decimal(amount_text)
+
+        entries.append({
+            "date": schedule_date,
+            "amount": schedule_amount,
+            "description": line,
+        })
+
+    if not entries:
+        return []
+
+    unspecified = [entry for entry in entries if entry["amount"] is None]
+    assigned_total = sum((entry["amount"] or Decimal("0")) for entry in entries)
+
+    if unspecified:
+        remaining = total - assigned_total
+        if remaining < 0:
+            remaining = Decimal("0")
+        even_amount = remaining / Decimal(len(unspecified)) if total else Decimal("0")
+        for entry in unspecified:
+            entry["amount"] = even_amount
+
+    return entries
+
 def load_forecast_data():
     conn = get_sql_connection()
     cursor = conn.cursor()
@@ -2267,12 +2329,14 @@ def load_forecast_data():
             pr.ProjectName,
             v.VendorName,
             po.ExpectedPaymentDate AS ForecastDate,
+            po.PaymentType,
+            po.PaymentSchedule,
             COALESCE(NULLIF(po.SetupStatus, ''), po.POStatus) AS Status,
             NULL AS Priority,
             COALESCE(po.RemainingAmount, po.RevisedAmount, po.OriginalAmount, 0) AS Amount,
             CASE
-                WHEN po.ExpectedPaymentDate IS NULL THEN 'Open PO balance without expected payment date'
                 WHEN COALESCE(po.PaymentSchedule, '') <> '' THEN po.PaymentSchedule
+                WHEN po.ExpectedPaymentDate IS NULL THEN 'Open PO balance without expected payment date'
                 ELSE 'Open PO balance with expected payment date'
             END AS Description
         FROM dbo.PurchaseOrders po
@@ -2280,7 +2344,7 @@ def load_forecast_data():
         LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
         WHERE COALESCE(po.RemainingAmount, po.RevisedAmount, po.OriginalAmount, 0) > 0
         ORDER BY
-            CASE WHEN po.ExpectedPaymentDate IS NULL THEN 1 ELSE 0 END,
+            CASE WHEN po.ExpectedPaymentDate IS NULL AND COALESCE(po.PaymentSchedule, '') = '' THEN 1 ELSE 0 END,
             po.ExpectedPaymentDate ASC,
             COALESCE(po.RemainingAmount, po.RevisedAmount, po.OriginalAmount, 0) DESC;
         """
@@ -2289,7 +2353,8 @@ def load_forecast_data():
     conn.close()
 
     items = []
-    for row in list(request_rows) + list(po_rows):
+
+    for row in request_rows:
         forecast_date = getattr(row, "ForecastDate", None)
         bucket = forecast_bucket(forecast_date)
         items.append({
@@ -2304,6 +2369,42 @@ def load_forecast_data():
             "description": row.Description,
             "bucket": bucket,
         })
+
+    for row in po_rows:
+        po_amount = Decimal(str(row.Amount or 0))
+        schedule_entries = parse_payment_schedule_for_forecast(getattr(row, "PaymentSchedule", ""), po_amount)
+
+        if schedule_entries:
+            for idx, entry in enumerate(schedule_entries, start=1):
+                forecast_date = entry["date"]
+                bucket = forecast_bucket(forecast_date)
+                items.append({
+                    "source_id": f"{row.SourceId} Pmt {idx}",
+                    "source_type": "Scheduled PO Payment",
+                    "project": row.ProjectName,
+                    "vendor": row.VendorName,
+                    "forecast_date": forecast_date,
+                    "status": row.Status,
+                    "priority": row.Priority,
+                    "amount": entry["amount"] or Decimal("0"),
+                    "description": entry["description"],
+                    "bucket": bucket,
+                })
+        else:
+            forecast_date = getattr(row, "ForecastDate", None)
+            bucket = forecast_bucket(forecast_date)
+            items.append({
+                "source_id": row.SourceId,
+                "source_type": row.SourceType,
+                "project": row.ProjectName,
+                "vendor": row.VendorName,
+                "forecast_date": forecast_date,
+                "status": row.Status,
+                "priority": row.Priority,
+                "amount": row.Amount or 0,
+                "description": row.Description,
+                "bucket": bucket,
+            })
 
     return items
 
