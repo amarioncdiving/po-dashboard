@@ -1429,9 +1429,10 @@ code { background:#f1f5f9; padding:8px 10px; display:block; border-radius:12px; 
 .submit-status-box.error { background:#fee2e2; border:1px solid #fecaca; color:#991b1b; }
 @media (max-width:820px) { .form-grid, .issued-item-option, .other-items-header, .other-item-row { grid-template-columns:1fr; } }
 
-/* Keep visited text links on-brand instead of browser purple */
-a:visited { color:#64748b; }
-.sidebar a:visited, a.button:visited, .button:visited, .status-card:visited, .action-card:visited, .filter-chip:visited, .status-pill-row a:visited { color:inherit; }
+/* Keep links visually consistent after click; no purple/gray visited-state shift */
+a, a:visited { color:#1d4ed8; }
+.sidebar a, .sidebar a:visited, a.button, a.button:visited, .button, .button:visited, .status-card, .status-card:visited, .action-card, .action-card:visited, .filter-chip, .filter-chip:visited, .status-pill-row a, .status-pill-row a:visited { color:inherit; }
+.po-review-id .po-link, .po-review-id .po-link:visited { color:#1d4ed8; }
 
 
 /* Consolidated dashboard and forecasting additions */
@@ -1851,7 +1852,6 @@ a:visited { color:#64748b; }
 .setup-table .po-number-cell { min-width:145px; font-weight:900; }
 .po-review-id { display:grid; gap:8px; align-items:start; }
 .po-review-id .po-link { font-size:15px; font-weight:950; color:#1d4ed8; text-decoration:underline; text-underline-offset:2px; }
-.po-review-id .po-link:visited { color:#64748b; }
 .po-review-id .po-status-row { display:block; }
 .po-review-id .status-chip { white-space:normal; text-align:left; max-width:120px; justify-content:center; }
 .setup-table .payment-schedule-cell { min-width:520px; }
@@ -1867,8 +1867,9 @@ a:visited { color:#64748b; }
 .info-callout { background:#eff6ff; border:1px solid #bfdbfe; color:#1e3a8a; border-radius:16px; padding:14px 16px; margin-bottom:16px; }
 .info-callout strong { display:block; margin-bottom:4px; }
 .status-pill-row { display:flex; flex-wrap:wrap; gap:8px; margin:10px 0 0; }
-.status-pill-row a { text-decoration:none; }
-.status-pill-row .active { box-shadow:0 0 0 3px rgba(37,99,235,.15); }
+.status-pill-row a { text-decoration:none; display:inline-flex; }
+.status-pill-row a.active .status-chip { box-shadow:0 0 0 3px rgba(37,99,235,.15); }
+.status-pill-row .status-chip.all { background:#e2e8f0; color:#334155; }
 @media (max-width:820px) { .setup-table table { min-width:1550px; } .payment-schedule-row { grid-template-columns:1fr; } }
 
 </style>
@@ -1991,7 +1992,7 @@ def shell(title, subtitle, active, content):
 def status_chip(value):
     text = value or "Unknown"
     cls = str(text).lower().replace(" ", "-").replace("/", "-")
-    allowed = {"submitted", "under-review", "needs-more-info", "pending-approval", "approved", "converted-to-po", "rejected", "open", "closed", "needs-pm-info", "needs-forecast-date", "needs-payment-schedule", "assigned-to-pm", "in-progress", "needs-info", "complete", "not-required"}
+    allowed = {"all", "submitted", "under-review", "needs-more-info", "pending-approval", "approved", "converted-to-po", "rejected", "open", "closed", "needs-pm-info", "needs-forecast-date", "needs-payment-schedule", "assigned-to-pm", "in-progress", "needs-info", "complete", "not-required"}
     if cls not in allowed:
         cls = "default"
     return f'<span class="status-chip {cls}">{h(text)}</span>'
@@ -2414,7 +2415,7 @@ def load_project_po_setup_items(status_filter=None, assigned_filter=None):
         params.append(assigned_filter)
 
     if not where_clauses:
-        where_clauses.append("(COALESCE(NULLIF(po.SetupStatus, ''), CASE WHEN COALESCE(po.PaymentSchedule, '') = '' THEN 'Needs Payment Schedule' ELSE 'Complete' END) <> 'Complete' OR COALESCE(po.PaymentSchedule, '') = '' OR COALESCE(po.PaymentType, '') = '' OR po.ExpectedPaymentDate IS NULL)")
+        where_clauses.append("(COALESCE(NULLIF(po.SetupStatus, ''), CASE WHEN COALESCE(po.PaymentSchedule, '') = '' THEN 'Needs Payment Schedule' ELSE 'Complete' END) <> 'Complete' OR COALESCE(po.PaymentSchedule, '') = '' OR COALESCE(po.PaymentType, '') = '' OR po.ExpectedPaymentDate IS NULL OR COALESCE(v.VendorName, '') = '')")
 
     where_sql = " AND ".join(where_clauses)
 
@@ -2441,7 +2442,8 @@ def load_project_po_setup_items(status_filter=None, assigned_filter=None):
             po.SetupUpdatedAt,
             CASE WHEN COALESCE(po.PaymentSchedule, '') = '' THEN 1 ELSE 0 END AS MissingPaymentSchedule,
             CASE WHEN COALESCE(po.PaymentType, '') = '' THEN 1 ELSE 0 END AS MissingPaymentType,
-            CASE WHEN po.ExpectedPaymentDate IS NULL THEN 1 ELSE 0 END AS MissingExpectedPaymentDate
+            CASE WHEN po.ExpectedPaymentDate IS NULL THEN 1 ELSE 0 END AS MissingExpectedPaymentDate,
+            CASE WHEN COALESCE(v.VendorName, '') = '' THEN 1 ELSE 0 END AS MissingVendor
         FROM dbo.PurchaseOrders po
         LEFT JOIN dbo.Vendors v ON po.VendorId = v.VendorId
         LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
@@ -2511,6 +2513,7 @@ def update_po_setup_info(form):
     payment_type = clean_text(form.get("payment_type")) or "Single Payment"
     setup_status = clean_text(form.get("setup_status")) or "Needs Payment Schedule"
     setup_assigned_to = clean_text(form.get("setup_assigned_to"))
+    vendor_name = clean_text(form.get("vendor_name"))
     action = clean_text(form.get("setup_action")) or "save"
 
     schedule_lines = []
@@ -2547,10 +2550,12 @@ def update_po_setup_info(form):
     cursor = conn.cursor()
     try:
         ensure_po_setup_columns(cursor)
+        vendor_id = get_or_create_vendor(cursor, vendor_name) if vendor_name else None
         cursor.execute(
             """
             UPDATE dbo.PurchaseOrders
             SET
+                VendorId = COALESCE(?, VendorId),
                 PaymentType = ?,
                 ExpectedPaymentDate = ?,
                 PaymentSchedule = ?,
@@ -2561,6 +2566,7 @@ def update_po_setup_info(form):
                 UpdatedAt = SYSUTCDATETIME()
             WHERE PONumber = ?;
             """,
+            vendor_id,
             payment_type,
             expected_payment_date,
             payment_schedule,
@@ -3955,6 +3961,7 @@ def project_po_setup():
         needs_schedule = sum(1 for r in rows if getattr(r, "MissingPaymentSchedule", 0))
         needs_type = sum(1 for r in rows if getattr(r, "MissingPaymentType", 0))
         needs_date = sum(1 for r in rows if getattr(r, "MissingExpectedPaymentDate", 0))
+        needs_vendor = sum(1 for r in rows if getattr(r, "MissingVendor", 0))
         assigned = sum(1 for r in rows if (r.SetupAssignedTo or ""))
         total_amount = sum(Decimal(str(r.RemainingAmount or 0)) for r in rows)
 
@@ -3962,7 +3969,7 @@ def project_po_setup():
         for label in ["All", "Needs Payment Schedule", "Assigned to PM", "In Progress", "Needs Info", "Complete"]:
             active_class = " active" if status_filter == label else ""
             href = "/project-po-setup" if label == "All" else "/project-po-setup?status=" + quote_plus(label)
-            status_links += f'<a class="badge blue{active_class}" href="{href}">{h(label)}</a>'
+            status_links += f'<a class="{active_class.strip()}" href="{href}">{status_chip(label)}</a>'
 
         table_rows = ""
         for r in rows:
@@ -3981,6 +3988,8 @@ def project_po_setup():
                 status_options += f'<option value="{h(opt)}"{sel}>{h(opt)}</option>'
 
             missing_bits = []
+            if getattr(r, "MissingVendor", 0):
+                missing_bits.append("Vendor")
             if getattr(r, "MissingPaymentSchedule", 0):
                 missing_bits.append("Payment schedule")
             if getattr(r, "MissingPaymentType", 0):
@@ -4024,7 +4033,7 @@ def project_po_setup():
                     <input type="hidden" name="po_number" value="{h(r.PONumber)}">
                     <td class="po-number-cell"><div class="po-review-id"><a class="po-link" href="{packet_url}">{h(r.PONumber)}</a><span class="po-status-row">{status_chip(selected_status)}</span></div></td>
                     <td>{h(r.ProjectName)}<br><small>{h(r.Department)}</small></td>
-                    <td>{h(r.VendorName)}<br><small>{currency(r.POValue)}</small></td>
+                    <td>{('<input type="text" name="vendor_name" value="" placeholder="Enter vendor" aria-label="Vendor name">' if getattr(r, "MissingVendor", 0) else h(r.VendorName))}<br><small>{currency(r.POValue)}</small></td>
                     <td>{h(r.Requestor or '')}</td>
                     <td><small>{h(missing_html)}</small></td>
                     <td><select name="payment_type" onchange="togglePaymentScheduleRows(this)">{payment_type_options}</select></td>
@@ -4057,6 +4066,7 @@ def project_po_setup():
             <div class="card kpi"><div class="label">Missing Schedule</div><div class="value">{needs_schedule}</div><div class="trend">Need payment schedule</div></div>
             <div class="card kpi"><div class="label">Missing Type</div><div class="value">{needs_type}</div><div class="trend">Need payment type</div></div>
             <div class="card kpi"><div class="label">Missing Date</div><div class="value">{needs_date}</div><div class="trend">Need expected payment date</div></div>
+            <div class="card kpi"><div class="label">Missing Vendor</div><div class="value">{needs_vendor}</div><div class="trend">Need vendor name</div></div>
             <div class="card kpi"><div class="label">Assigned</div><div class="value">{assigned}</div><div class="trend">Assigned to PM/user</div></div>
             <div class="card kpi"><div class="label">Remaining Exposure</div><div class="value">{currency(total_amount)}</div><div class="trend">Rows in current view</div></div>
         </div>
@@ -4069,12 +4079,29 @@ def project_po_setup():
                 </div>
                 <div>{mine_link}</div>
             </div>
+            <div class="filter-hint"><span>Use the filters below each column heading to narrow the PO Info Review table. For example, type a project name or project number under Project.</span><button type="button" onclick="clearPOInfoReviewFilters()">Clear Filters</button></div>
             <div class="table-wrap setup-table">
-                <table>
-                    <tr>
-                        <th>PO</th><th>Project</th><th>Vendor / Amount</th><th>Requestor</th><th>Missing Info</th><th>Payment Type</th><th>Payment Schedule</th><th>Assigned To</th><th>Status</th><th>Actions</th>
-                    </tr>
+                <table id="poInfoReviewTable">
+                    <thead>
+                        <tr>
+                            <th>PO</th><th>Project</th><th>Vendor / Amount</th><th>Requestor</th><th>Missing Info</th><th>Payment Type</th><th>Payment Schedule</th><th>Assigned To</th><th>Status</th><th>Actions</th>
+                        </tr>
+                        <tr class="column-filter-row">
+                            <th><input data-col="0" oninput="filterPOInfoReviewTable()" placeholder="PO"></th>
+                            <th><input data-col="1" oninput="filterPOInfoReviewTable()" placeholder="Project"></th>
+                            <th><input data-col="2" oninput="filterPOInfoReviewTable()" placeholder="Vendor"></th>
+                            <th><input data-col="3" oninput="filterPOInfoReviewTable()" placeholder="Requestor"></th>
+                            <th><input data-col="4" oninput="filterPOInfoReviewTable()" placeholder="Missing info"></th>
+                            <th><input data-col="5" oninput="filterPOInfoReviewTable()" placeholder="Payment type"></th>
+                            <th><input data-col="6" oninput="filterPOInfoReviewTable()" placeholder="Schedule"></th>
+                            <th><input data-col="7" oninput="filterPOInfoReviewTable()" placeholder="Assigned to"></th>
+                            <th><input data-col="8" oninput="filterPOInfoReviewTable()" placeholder="Status"></th>
+                            <th><input data-col="9" oninput="filterPOInfoReviewTable()" placeholder="Actions"></th>
+                        </tr>
+                    </thead>
+                    <tbody>
                     {table_rows}
+                    </tbody>
                 </table>
             </div>
         </div>
@@ -4105,8 +4132,33 @@ def project_po_setup():
                 });
             });
         }
+        function filterPOInfoReviewTable() {
+            const table = document.getElementById("poInfoReviewTable");
+            if (!table) return;
+            const filters = Array.from(table.querySelectorAll(".column-filter-row input")).map(function(input) {
+                return { col: Number(input.dataset.col), value: input.value.trim().toLowerCase() };
+            });
+            table.querySelectorAll("tbody tr").forEach(function(row) {
+                const cells = row.querySelectorAll("td");
+                if (!cells.length) return;
+                let visible = true;
+                filters.forEach(function(f) {
+                    if (!f.value) return;
+                    const cellText = (cells[f.col] ? cells[f.col].innerText : "").toLowerCase();
+                    if (!cellText.includes(f.value)) visible = false;
+                });
+                row.style.display = visible ? "" : "none";
+            });
+        }
+        function clearPOInfoReviewFilters() {
+            const table = document.getElementById("poInfoReviewTable");
+            if (!table) return;
+            table.querySelectorAll(".column-filter-row input").forEach(function(input) { input.value = ""; });
+            filterPOInfoReviewTable();
+        }
         document.addEventListener("DOMContentLoaded", function() {
             document.querySelectorAll('select[name="payment_type"]').forEach(togglePaymentScheduleRows);
+            filterPOInfoReviewTable();
         });
         </script>
         """
