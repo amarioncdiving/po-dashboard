@@ -1429,6 +1429,10 @@ code { background:#f1f5f9; padding:8px 10px; display:block; border-radius:12px; 
 .submit-status-box.error { background:#fee2e2; border:1px solid #fecaca; color:#991b1b; }
 @media (max-width:820px) { .form-grid, .issued-item-option, .other-items-header, .other-item-row { grid-template-columns:1fr; } }
 
+/* Keep visited text links on-brand instead of browser purple */
+a:visited { color:#64748b; }
+.sidebar a:visited, a.button:visited, .button:visited, .status-card:visited, .action-card:visited, .filter-chip:visited, .status-pill-row a:visited { color:inherit; }
+
 
 /* Consolidated dashboard and forecasting additions */
 .action-card {
@@ -1485,11 +1489,17 @@ code { background:#f1f5f9; padding:8px 10px; display:block; border-radius:12px; 
 .filter-chip-row { display:flex; gap:8px; flex-wrap:wrap; margin:10px 0 14px; }
 .filter-chip { border:1px solid var(--line); background:white; color:var(--text); border-radius:999px; padding:7px 10px; font-size:12px; font-weight:800; text-decoration:none; }
 .filter-chip:hover { border-color:#93c5fd; }
-.status-chip { border-radius:999px; padding:4px 8px; font-size:11px; font-weight:900; display:inline-flex; }
+.status-chip { border-radius:999px; padding:4px 8px; font-size:11px; font-weight:900; display:inline-flex; align-items:center; gap:4px; line-height:1.2; }
 .status-chip.submitted, .status-chip.under-review, .status-chip.pending-approval { background:#fef3c7; color:#92400e; }
-.status-chip.approved, .status-chip.converted-to-po { background:#dcfce7; color:#166534; }
-.status-chip.rejected { background:#fee2e2; color:#991b1b; }
-.status-chip.default { background:#dbeafe; color:#1e40af; }
+.status-chip.approved, .status-chip.converted-to-po, .status-chip.complete { background:#dcfce7; color:#166534; }
+.status-chip.rejected, .status-chip.needs-info { background:#fee2e2; color:#991b1b; }
+.status-chip.needs-payment-schedule { background:#ffedd5; color:#9a3412; }
+.status-chip.assigned-to-pm { background:#dbeafe; color:#1e40af; }
+.status-chip.in-progress { background:#ede9fe; color:#5b21b6; }
+.status-chip.not-required { background:#e2e8f0; color:#334155; }
+.status-chip.open { background:#ecfeff; color:#155e75; }
+.status-chip.closed { background:#e2e8f0; color:#334155; }
+.status-chip.default { background:#f1f5f9; color:#334155; }
 @media (max-width:1200px) { .project-bucket-grid, .forecast-row { grid-template-columns:1fr 1fr; } .mini-bar-row { grid-template-columns:1fr; } }
 @media (max-width:820px) { .project-bucket-grid, .forecast-row { grid-template-columns:1fr; } }
 
@@ -1838,7 +1848,12 @@ code { background:#f1f5f9; padding:8px 10px; display:block; border-radius:12px; 
 /* Functional PO setup / missing information review */
 .setup-table input, .setup-table select, .setup-table textarea { width:100%; min-width:150px; border:1px solid var(--line); border-radius:10px; padding:8px 9px; background:#fff; font-size:12px; }
 .setup-table textarea { min-width:220px; min-height:58px; resize:vertical; }
-.setup-table .po-number-cell { min-width:130px; font-weight:900; }
+.setup-table .po-number-cell { min-width:145px; font-weight:900; }
+.po-review-id { display:grid; gap:8px; align-items:start; }
+.po-review-id .po-link { font-size:15px; font-weight:950; color:#1d4ed8; text-decoration:underline; text-underline-offset:2px; }
+.po-review-id .po-link:visited { color:#64748b; }
+.po-review-id .po-status-row { display:block; }
+.po-review-id .status-chip { white-space:normal; text-align:left; max-width:120px; justify-content:center; }
 .setup-table .payment-schedule-cell { min-width:520px; }
 .setup-table .assign-cell { min-width:240px; }
 .payment-schedule-builder { display:grid; gap:6px; }
@@ -1854,7 +1869,7 @@ code { background:#f1f5f9; padding:8px 10px; display:block; border-radius:12px; 
 .status-pill-row { display:flex; flex-wrap:wrap; gap:8px; margin:10px 0 0; }
 .status-pill-row a { text-decoration:none; }
 .status-pill-row .active { box-shadow:0 0 0 3px rgba(37,99,235,.15); }
-@media (max-width:820px) { .setup-table table { min-width:1450px; } .payment-schedule-row { grid-template-columns:1fr; } }
+@media (max-width:820px) { .setup-table table { min-width:1550px; } .payment-schedule-row { grid-template-columns:1fr; } }
 
 </style>
 """
@@ -1976,7 +1991,7 @@ def shell(title, subtitle, active, content):
 def status_chip(value):
     text = value or "Unknown"
     cls = str(text).lower().replace(" ", "-").replace("/", "-")
-    allowed = {"submitted", "under-review", "needs-more-info", "pending-approval", "approved", "converted-to-po", "rejected", "open", "closed", "needs-pm-info", "needs-forecast-date"}
+    allowed = {"submitted", "under-review", "needs-more-info", "pending-approval", "approved", "converted-to-po", "rejected", "open", "closed", "needs-pm-info", "needs-forecast-date", "needs-payment-schedule", "assigned-to-pm", "in-progress", "needs-info", "complete", "not-required"}
     if cls not in allowed:
         cls = "default"
     return f'<span class="status-chip {cls}">{h(text)}</span>'
@@ -3991,8 +4006,6 @@ def project_po_setup():
                         <input type="text" name="payment_{idx}_note" value="{h(existing_line)}" placeholder="Milestone or terms" aria-label="Payment {idx} note">
                     </div>
                 '''
-            schedule_inputs += '<div class="payment-schedule-help">Single Payment shows one payment date by default. Choose Multiple Payments, Deposit + Final, Progress Payments, Monthly, Milestone, or Retainage to add more payment rows. The first date is used for forecasting.</div>'
-
             assigned_options = '<option value="">Unassigned</option>'
             selected_assigned = (clean_text(r.SetupAssignedTo) or "").lower()
             for u in assignable_users:
@@ -4009,9 +4022,10 @@ def project_po_setup():
             <tr>
                 <form method="post" action="/project-po-setup">
                     <input type="hidden" name="po_number" value="{h(r.PONumber)}">
-                    <td class="po-number-cell"><a href="{packet_url}">{h(r.PONumber)}</a><br><small>{status_chip(selected_status)}</small></td>
+                    <td class="po-number-cell"><div class="po-review-id"><a class="po-link" href="{packet_url}">{h(r.PONumber)}</a><span class="po-status-row">{status_chip(selected_status)}</span></div></td>
                     <td>{h(r.ProjectName)}<br><small>{h(r.Department)}</small></td>
                     <td>{h(r.VendorName)}<br><small>{currency(r.POValue)}</small></td>
+                    <td>{h(r.Requestor or '')}</td>
                     <td><small>{h(missing_html)}</small></td>
                     <td><select name="payment_type" onchange="togglePaymentScheduleRows(this)">{payment_type_options}</select></td>
                     <td class="payment-schedule-cell"><div class="payment-schedule-builder">{schedule_inputs}</div></td>
@@ -4027,7 +4041,7 @@ def project_po_setup():
             """
 
         if not table_rows:
-            table_rows = '<tr><td colspan="9"><div class="empty-state"><strong>No PO setup items found.</strong><span>POs missing payment schedules, payment type, or expected payment dates will appear here.</span></div></td></tr>'
+            table_rows = '<tr><td colspan="10"><div class="empty-state"><strong>No PO setup items found.</strong><span>POs missing payment schedules, payment type, or expected payment dates will appear here.</span></div></td></tr>'
 
         mine_link = ""
         if user["email"]:
@@ -4058,7 +4072,7 @@ def project_po_setup():
             <div class="table-wrap setup-table">
                 <table>
                     <tr>
-                        <th>PO</th><th>Project</th><th>Vendor / Amount</th><th>Missing Info</th><th>Payment Type</th><th>Payment Schedule</th><th>Assigned To</th><th>Status</th><th>Actions</th>
+                        <th>PO</th><th>Project</th><th>Vendor / Amount</th><th>Requestor</th><th>Missing Info</th><th>Payment Type</th><th>Payment Schedule</th><th>Assigned To</th><th>Status</th><th>Actions</th>
                     </tr>
                     {table_rows}
                 </table>
