@@ -79,7 +79,7 @@ PAGE_ACCESS = {
     "POs & Balances": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "Forecasting": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "Project PO Setup": ["Admin", "Executive", "Accounting", "Project Manager"],
-    "PO Info Review": ["Admin", "Executive", "Accounting", "Project Manager"],
+    "PO Setup Review": ["Admin", "Executive", "Accounting", "Project Manager"],
     "Missing PO Review": ["Admin", "Executive", "Accounting", "Project Manager"],
     "PO Summary": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "PO List": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
@@ -796,8 +796,161 @@ def ensure_expense_review_tables():
         END;
         """
     )
+    # Add rollout balance-posting/audit columns to existing databases.
+    rollout_columns = [
+        ("ExpenseReviewItems", "ExpenseUniqueKey", "NVARCHAR(500) NULL"),
+        ("ExpenseReviewItems", "ReviewerEmail", "NVARCHAR(255) NULL"),
+        ("ExpenseReviewItems", "ReviewedAt", "DATETIME2 NULL"),
+        ("ExpenseReviewItems", "PostedToPO", "BIT NOT NULL CONSTRAINT DF_ExpenseReviewItems_PostedToPO DEFAULT 0"),
+        ("ExpenseReviewItems", "PostedPONumber", "NVARCHAR(100) NULL"),
+        ("ExpenseReviewItems", "PostedAmount", "DECIMAL(18,2) NULL"),
+        ("ExpenseReviewItems", "PostedAt", "DATETIME2 NULL"),
+        ("ExpenseReviewItems", "PostedBy", "NVARCHAR(255) NULL"),
+        ("ExpenseReviewItems", "PostingBatchId", "INT NULL"),
+        ("ExpenseReviewItems", "IsDuplicate", "BIT NOT NULL CONSTRAINT DF_ExpenseReviewItems_IsDuplicate DEFAULT 0"),
+        ("ExpenseUploadBatches", "DuplicateCount", "INT NOT NULL CONSTRAINT DF_ExpenseUploadBatches_DuplicateCount DEFAULT 0"),
+        ("ExpenseUploadBatches", "PostedCount", "INT NOT NULL CONSTRAINT DF_ExpenseUploadBatches_PostedCount DEFAULT 0"),
+        ("ExpenseUploadBatches", "PostedAmount", "DECIMAL(18,2) NOT NULL CONSTRAINT DF_ExpenseUploadBatches_PostedAmount DEFAULT 0"),
+    ]
+    for table_name, column_name, column_type in rollout_columns:
+        cursor.execute(f"""
+            IF COL_LENGTH('dbo.{table_name}', '{column_name}') IS NULL
+            BEGIN
+                ALTER TABLE dbo.{table_name} ADD {column_name} {column_type};
+            END
+        """)
+
+    cursor.execute("""
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ExpenseReviewItems_PostedPO' AND object_id = OBJECT_ID('dbo.ExpenseReviewItems'))
+        BEGIN
+            CREATE INDEX IX_ExpenseReviewItems_PostedPO ON dbo.ExpenseReviewItems(PostedToPO, PostedPONumber);
+        END;
+        IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ExpenseReviewItems_UniqueKey' AND object_id = OBJECT_ID('dbo.ExpenseReviewItems'))
+        BEGIN
+            CREATE INDEX IX_ExpenseReviewItems_UniqueKey ON dbo.ExpenseReviewItems(ExpenseUniqueKey);
+        END;
+    """)
+
+    # Backfill existing reviewed/auto-matched rows so current uploaded expenses begin reducing balances after deployment.
+    cursor.execute("""
+        UPDATE dbo.ExpenseReviewItems
+        SET PostedToPO = 1,
+            PostedPONumber = COALESCE(NULLIF(CorrectPONumber, ''), NULLIF(MatchedPONumber, '')),
+            PostedAmount = COALESCE(Amount, 0),
+            PostedAt = COALESCE(PostedAt, UpdatedAt, SYSUTCDATETIME()),
+            PostedBy = COALESCE(NULLIF(ReviewerEmail, ''), 'System Backfill'),
+            UpdatedAt = SYSUTCDATETIME()
+        WHERE COALESCE(PostedToPO, 0) = 0
+          AND COALESCE(NULLIF(CorrectPONumber, ''), NULLIF(MatchedPONumber, '')) IS NOT NULL
+          AND (
+                ReviewDecision = 'Matched to PO'
+                OR (
+                    MatchStatus = 'Auto Matched'
+                    AND LOWER(COALESCE(TxType, '')) NOT LIKE '%time sheet%'
+                    AND LOWER(COALESCE(TxType, '')) NOT LIKE '%labor%'
+                    AND LOWER(COALESCE(TxType, '')) NOT LIKE '%per diem%'
+                    AND LOWER(COALESCE(TxType, '')) NOT LIKE '%perdiem%'
+                    AND LOWER(COALESCE(TxType, '')) NOT LIKE '%mileage%'
+                    AND LOWER(COALESCE(TxType, '')) NOT LIKE '%travel stipend%'
+                    AND (LOWER(COALESCE(TxType, '')) LIKE '%purchase%' OR LOWER(COALESCE(TxType, '')) LIKE '%disbursement%')
+                )
+          );
+    """)
     conn.commit()
     conn.close()
+
+
+def expense_unique_key(project_name, tx_date, tx_type, vendor_name, amount, expense_id, pm_comments):
+    parts = [
+        compact_match_text(project_name),
+        str(tx_date or ''),
+        compact_match_text(tx_type),
+        compact_match_text(vendor_name),
+        str(clean_decimal(amount) or Decimal('0')),
+        compact_match_text(expense_id),
+        compact_match_text(str(pm_comments or '')[:80]),
+    ]
+    return '|'.join(parts)[:500]
+
+
+def expense_type_auto_posts(tx_type):
+    text = str(tx_type or '').strip().lower()
+    if not text:
+        return False
+    excluded = ['time sheet', 'labor', 'per diem', 'perdiem', 'mileage', 'travel stipend']
+    if any(term in text for term in excluded):
+        return False
+    return any(term in text for term in ['purchase', 'disbursement'])
+
+
+def sync_expense_posting(cursor, item_id, posted_by=None):
+    """Synchronize whether one expense review item reduces an app PO balance.
+
+    POs are uploaded once at project setup. From that point forward, current app
+    balance is calculated as issued PO amount minus review items where PostedToPO=1.
+    This function is idempotent and prevents the same review row from being counted
+    more than once.
+    """
+    posted_by = posted_by or (get_current_user().get('email') or 'System')
+    cursor.execute(
+        """
+        SELECT ExpenseReviewItemId, TxType, Amount, MatchedPONumber, CorrectPONumber,
+               MatchStatus, ReviewDecision, PostedToPO
+        FROM dbo.ExpenseReviewItems
+        WHERE ExpenseReviewItemId = ?;
+        """,
+        item_id,
+    )
+    row = cursor.fetchone()
+    if not row:
+        return False
+
+    decision = clean_text(row.ReviewDecision) or 'Pending Review'
+    match_status = clean_text(row.MatchStatus) or ''
+    correct_po = clean_text(row.CorrectPONumber)
+    matched_po = clean_text(row.MatchedPONumber)
+    po_to_post = correct_po or matched_po
+
+    should_post = False
+    if decision == 'Matched to PO' and po_to_post:
+        # Manual review decisions are allowed to post, including reimbursables if Accounting deliberately matches them.
+        should_post = True
+    elif match_status == 'Auto Matched' and po_to_post and expense_type_auto_posts(row.TxType):
+        # Safe automatic posting: a non-labor Purchase/Disbursement found an exact PO in PM comments.
+        should_post = True
+
+    if should_post:
+        cursor.execute(
+            """
+            UPDATE dbo.ExpenseReviewItems
+            SET PostedToPO = 1,
+                PostedPONumber = ?,
+                PostedAmount = COALESCE(Amount, 0),
+                PostedAt = COALESCE(PostedAt, SYSUTCDATETIME()),
+                PostedBy = COALESCE(PostedBy, ?),
+                UpdatedAt = SYSUTCDATETIME()
+            WHERE ExpenseReviewItemId = ?;
+            """,
+            po_to_post,
+            posted_by,
+            item_id,
+        )
+        return True
+
+    cursor.execute(
+        """
+        UPDATE dbo.ExpenseReviewItems
+        SET PostedToPO = 0,
+            PostedPONumber = NULL,
+            PostedAmount = NULL,
+            PostedAt = NULL,
+            PostedBy = NULL,
+            UpdatedAt = SYSUTCDATETIME()
+        WHERE ExpenseReviewItemId = ?;
+        """,
+        item_id,
+    )
+    return False
 
 
 def load_po_match_candidates(cursor):
@@ -899,6 +1052,9 @@ def import_expense_rows(rows, filename):
         )
         batch_id = cursor.fetchone().ExpenseBatchId
         counts = {"Auto Matched": 0, "Needs Review": 0, "No Match": 0}
+        duplicate_count = 0
+        posted_count = 0
+        posted_amount = Decimal("0")
 
         for index, row in enumerate(rows, start=2):
             expense_id = clean_text(row_value(row, ["ExpenseId", "Expense ID", "Transaction ID", "Tx ID", "Track No."]))
@@ -910,6 +1066,20 @@ def import_expense_rows(rows, filename):
             amount = clean_decimal(row_value(row, ["Amount", "Transaction Amount", "Cost", "Total"]));
             pm_comments = clean_text(row_value(row, ["PMComments", "PM Comments", "Project Manager Comments", "Comments"]));
 
+            unique_key = expense_unique_key(project_name, tx_date, tx_type, vendor_name, amount, expense_id, pm_comments)
+            cursor.execute(
+                """
+                SELECT TOP 1 ExpenseReviewItemId
+                FROM dbo.ExpenseReviewItems
+                WHERE ExpenseUniqueKey = ? AND COALESCE(IsDuplicate, 0) = 0;
+                """,
+                unique_key,
+            )
+            existing = cursor.fetchone()
+            if existing:
+                duplicate_count += 1
+                continue
+
             match = choose_expense_match(project_name, vendor_name, amount, pm_comments, po_candidates)
             counts[match["status"]] = counts.get(match["status"], 0) + 1
             review_decision = "Matched to PO" if match["status"] == "Auto Matched" else "Pending Review"
@@ -917,14 +1087,16 @@ def import_expense_rows(rows, filename):
             cursor.execute(
                 """
                 INSERT INTO dbo.ExpenseReviewItems
-                    (ExpenseBatchId, SourceRowNumber, ExpenseId, ProjectName, TxDate, TxType, VendorName,
+                    (ExpenseBatchId, SourceRowNumber, ExpenseId, ExpenseUniqueKey, ProjectName, TxDate, TxType, VendorName,
                      Description, Amount, PMComments, ExtractedPONumber, MatchedPONumber, MatchStatus,
                      MatchConfidence, MatchReason, ReviewDecision, CorrectPONumber)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                OUTPUT INSERTED.ExpenseReviewItemId
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 batch_id,
                 index,
                 expense_id,
+                unique_key,
                 project_name,
                 tx_date,
                 tx_type,
@@ -940,20 +1112,28 @@ def import_expense_rows(rows, filename):
                 review_decision,
                 match["matched_po"] if match["status"] == "Auto Matched" else None,
             )
+            new_item_id = cursor.fetchone().ExpenseReviewItemId
+            if sync_expense_posting(cursor, new_item_id, posted_by=get_current_user()["email"] or "Manual Upload"):
+                posted_count += 1
+                posted_amount += Decimal(str(amount or 0))
 
         cursor.execute(
             """
             UPDATE dbo.ExpenseUploadBatches
-            SET AutoMatchedCount = ?, NeedsReviewCount = ?, NoMatchCount = ?
+            SET AutoMatchedCount = ?, NeedsReviewCount = ?, NoMatchCount = ?,
+                DuplicateCount = ?, PostedCount = ?, PostedAmount = ?
             WHERE ExpenseBatchId = ?
             """,
             counts.get("Auto Matched", 0),
             counts.get("Needs Review", 0),
             counts.get("No Match", 0),
+            duplicate_count,
+            posted_count,
+            posted_amount,
             batch_id,
         )
         conn.commit()
-        return {"batch_id": batch_id, "total_rows": len(rows), "auto": counts.get("Auto Matched", 0), "review": counts.get("Needs Review", 0), "no_match": counts.get("No Match", 0)}
+        return {"batch_id": batch_id, "total_rows": len(rows), "auto": counts.get("Auto Matched", 0), "review": counts.get("Needs Review", 0), "no_match": counts.get("No Match", 0), "duplicates": duplicate_count, "posted": posted_count, "posted_amount": posted_amount}
     except Exception:
         conn.rollback()
         raise
@@ -973,7 +1153,9 @@ def load_expense_upload_page_data(status_filter="All"):
             SUM(CASE WHEN MatchStatus = 'Manually Matched' THEN 1 ELSE 0 END) AS ManuallyMatched,
             SUM(CASE WHEN MatchStatus = 'Needs Review' THEN 1 ELSE 0 END) AS NeedsReview,
             SUM(CASE WHEN MatchStatus = 'No Match' THEN 1 ELSE 0 END) AS NoMatch,
-            SUM(CASE WHEN ReviewDecision IS NOT NULL AND ReviewDecision <> 'Pending Review' THEN 1 ELSE 0 END) AS ReviewedRows
+            SUM(CASE WHEN ReviewDecision IS NOT NULL AND ReviewDecision <> 'Pending Review' THEN 1 ELSE 0 END) AS ReviewedRows,
+            SUM(CASE WHEN COALESCE(PostedToPO, 0) = 1 THEN 1 ELSE 0 END) AS PostedRows,
+            SUM(CASE WHEN COALESCE(PostedToPO, 0) = 1 THEN COALESCE(PostedAmount, Amount, 0) ELSE 0 END) AS PostedAmount
         FROM dbo.ExpenseReviewItems;
         """
     )
@@ -990,7 +1172,7 @@ def load_expense_upload_page_data(status_filter="All"):
         SELECT TOP 250
             ExpenseReviewItemId, ExpenseBatchId, ExpenseId, ProjectName, TxDate, TxType, VendorName,
             Description, Amount, PMComments, ExtractedPONumber, MatchedPONumber, MatchStatus,
-            MatchConfidence, MatchReason, ReviewDecision, CorrectPONumber, ReviewerNotes, CreatedAt, UpdatedAt
+            MatchConfidence, MatchReason, ReviewDecision, CorrectPONumber, ReviewerNotes, PostedToPO, PostedPONumber, PostedAmount, CreatedAt, UpdatedAt
         FROM dbo.ExpenseReviewItems
         {where}
         ORDER BY CreatedAt DESC, ExpenseReviewItemId DESC;
@@ -1002,7 +1184,7 @@ def load_expense_upload_page_data(status_filter="All"):
     cursor.execute(
         """
         SELECT TOP 6 ExpenseBatchId, FileName, UploadedAt, UploadedBy, TotalRows,
-               AutoMatchedCount, NeedsReviewCount, NoMatchCount, ImportStatus
+               AutoMatchedCount, NeedsReviewCount, NoMatchCount, DuplicateCount, PostedCount, PostedAmount, ImportStatus
         FROM dbo.ExpenseUploadBatches
         ORDER BY UploadedAt DESC;
         """
@@ -1470,6 +1652,7 @@ def update_purchase_request_status(form):
 
     purchase_request_id = clean_text(form.get("purchase_request_id"))
     request_status = clean_text(form.get("request_status"))
+    reviewer_email = clean_text(form.get("reviewer_email")) or user["email"]
     review_notes = clean_text(form.get("review_notes"))
     converted_po_number = clean_text(form.get("converted_po_number"))
 
@@ -1484,6 +1667,9 @@ def update_purchase_request_status(form):
 
     if request_status not in valid_statuses:
         raise ValueError("Invalid request status.")
+
+    if request_status != "Converted to PO":
+        converted_po_number = ""
 
     if not purchase_request_id:
         raise ValueError("Purchase Request ID is required.")
@@ -1505,7 +1691,7 @@ def update_purchase_request_status(form):
             WHERE PurchaseRequestId = ?;
             """,
             request_status,
-            user["email"],
+            reviewer_email,
             review_notes,
             converted_po_number,
             purchase_request_id,
@@ -2238,6 +2424,63 @@ a, a:visited { color:#1d4ed8; }
 .status-chip.needs-pm-review { background:#ede9fe; color:#5b21b6; }
 @media (max-width:1000px) { .expense-upload-layout { grid-template-columns:1fr; } }
 
+
+.purchase-review-panel {
+    display: grid;
+    gap: 7px;
+    min-width: 230px;
+}
+.purchase-review-panel label {
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+}
+.purchase-review-panel select,
+.purchase-review-panel input,
+.purchase-review-panel textarea {
+    width: 100%;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 8px 9px;
+    background: #fff;
+    font-size: 12px;
+}
+.purchase-review-panel textarea {
+    min-height: 76px;
+    resize: vertical;
+}
+.purchase-review-panel button {
+    border: 0;
+    background: var(--blue);
+    color: #fff;
+    border-radius: 10px;
+    padding: 9px 10px;
+    font-weight: 900;
+    cursor: pointer;
+}
+.notice.info {
+    background: #eff6ff;
+    border-color: #bfdbfe;
+    color: #1e3a8a;
+}
+
+.rollout-filter-bar { border:1px solid var(--line); border-radius:16px; background:#fff; padding:14px; margin:0 0 16px; box-shadow:var(--shadow); }
+.rollout-filter-fields { display:grid; grid-template-columns:repeat(5, minmax(140px, 1fr)); gap:10px; }
+.rollout-filter-fields label { display:grid; gap:5px; color:var(--muted); font-size:11px; font-weight:900; text-transform:uppercase; letter-spacing:.04em; }
+.rollout-filter-fields input, .rollout-filter-fields select { border:1px solid var(--line); border-radius:10px; padding:9px 10px; background:#fff; color:var(--text); text-transform:none; letter-spacing:0; font-weight:600; }
+.rollout-filter-actions { display:flex; gap:10px; justify-content:flex-end; margin-top:12px; flex-wrap:wrap; }
+.data-freshness-banner { margin-bottom:16px; }
+.posting-audit-cell { min-width:210px; font-size:12px; color:var(--muted); line-height:1.35; }
+.status-chip.posted { background:#dcfce7; color:#166534; }
+.status-chip.not-posted { background:#e2e8f0; color:#334155; }
+.status-chip.duplicate { background:#fee2e2; color:#991b1b; }
+.readiness-list { display:grid; gap:8px; margin-top:10px; }
+.readiness-item { display:flex; justify-content:space-between; gap:12px; border:1px solid var(--line); border-radius:12px; padding:10px; background:#f8fafc; }
+@media (max-width:1100px) { .rollout-filter-fields { grid-template-columns:repeat(2, minmax(0, 1fr)); } }
+@media (max-width:760px) { .rollout-filter-fields { grid-template-columns:1fr; } }
+
 </style>
 """
 
@@ -2250,10 +2493,8 @@ def shell(title, subtitle, active, content):
         ("My Dashboard", "/my-dashboard", "🏠"),
         ("New Purchase Request", "/purchase-request", "📝"),
         ("Purchase Requests", "/purchase-requests", "📋"),
-        ("Approver Queue", "/approver-queue", "✅"),
         ("POs & Balances", "/pos-balances", "💳"),
-        ("Forecasting", "/forecasting", "📈"),
-        ("PO Info Review", "/project-po-setup", "🧭"),
+        ("PO Setup Review", "/project-po-setup", "🧭"),
     ]
 
     accounting_nav_items = [
@@ -2264,8 +2505,8 @@ def shell(title, subtitle, active, content):
         ("Vendors", "/vendors", "🏢"),
         ("POs in PM Comments", "/pos-in-pm-comments", "🔎"),
         ("Import History", "/import-history", "🕘"),
-        ("Exceptions", "/exceptions", "🚩"),
-        ("Exports", "/exports", "⬇️"),
+        # Dormant for July 1 rollout: Exceptions and Exports hidden from main navigation.
+
     ]
 
     admin_nav_items = [
@@ -2363,7 +2604,7 @@ def shell(title, subtitle, active, content):
 def status_chip(value):
     text = value or "Unknown"
     cls = str(text).lower().replace(" ", "-").replace("/", "-")
-    allowed = {"all", "submitted", "under-review", "needs-more-info", "pending-approval", "approved", "converted-to-po", "rejected", "open", "closed", "needs-pm-info", "needs-forecast-date", "needs-payment-schedule", "assigned-to-pm", "in-progress", "needs-info", "complete", "not-required", "auto-matched", "manually-matched", "needs-review", "no-match", "no-po-needed", "needs-pm-review"}
+    allowed = {"all", "submitted", "under-review", "needs-more-info", "pending-approval", "approved", "converted-to-po", "rejected", "open", "closed", "needs-pm-info", "needs-forecast-date", "needs-payment-schedule", "assigned-to-pm", "in-progress", "needs-info", "complete", "not-required", "auto-matched", "manually-matched", "needs-review", "no-match", "no-po-needed", "needs-pm-review", "posted", "not-posted", "duplicate"}
     if cls not in allowed:
         cls = "default"
     return f'<span class="status-chip {cls}">{h(text)}</span>'
@@ -2376,13 +2617,110 @@ def percent(value):
         return "0.0%"
 
 
+def build_simple_filter_bar(filters, action, fields):
+    """Reusable rollout filter form for high-volume operational pages."""
+    pieces = []
+    for name, label, placeholder in fields:
+        value = filters.get(name) or ""
+        pieces.append(f'<label><span>{h(label)}</span><input name="{h(name)}" value="{h(value)}" placeholder="{h(placeholder)}"></label>')
+    return (
+        f'<form class="rollout-filter-bar" method="get" action="{h(action)}">'
+        f'<div class="rollout-filter-fields">{"".join(pieces)}</div>'
+        f'<div class="rollout-filter-actions"><button class="primary" type="submit">Apply Filters</button><a class="button secondary" href="{h(action)}">Clear</a></div>'
+        f'</form>'
+    )
+
+
+def add_like_filter(where, params, column_sql, value):
+    value = clean_text(value)
+    if value:
+        where.append(f"LOWER(COALESCE({column_sql}, '')) LIKE LOWER(?)")
+        params.append(f"%{value}%")
+
+
+def latest_data_freshness_banner():
+    """Show users whether PO and expense data are current enough to trust."""
+    po_bits = "PO upload: no upload found"
+    expense_bits = "Expense upload: no upload found"
+    try:
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT TOP 1 FileName, UploadedAt, UploadedBy, TotalRows, SuccessCount, ErrorCount, ImportStatus
+            FROM dbo.ImportBatches
+            ORDER BY UploadedAt DESC;
+        """)
+        r = cursor.fetchone()
+        if r:
+            po_bits = f"PO upload: {h(r.FileName)} · {h(r.UploadedAt)} · {h(r.TotalRows)} rows · {h(r.ImportStatus)}"
+        try:
+            cursor.execute("""
+                SELECT TOP 1 FileName, UploadedAt, UploadedBy, TotalRows, AutoMatchedCount, NeedsReviewCount, NoMatchCount, ImportStatus
+                FROM dbo.ExpenseUploadBatches
+                ORDER BY UploadedAt DESC;
+            """)
+            e = cursor.fetchone()
+            if e:
+                expense_bits = f"Expense upload: {h(e.FileName)} · {h(e.UploadedAt)} · {h(e.TotalRows)} rows · {h(e.ImportStatus)}"
+        except Exception:
+            pass
+        conn.close()
+    except Exception:
+        pass
+    return (
+        f'<div class="notice info data-freshness-banner">'
+        f'<strong>Data freshness:</strong> {po_bits}<br>{expense_bits}<br>'
+        f'<small>Rollout balance method: current app balance equals issued PO amount minus posted matched expenses. The app does not write back to Unanet or the ERP.</small>'
+        f'</div>'
+    )
+
+
+def posting_status_chip(row):
+    posted = bool(getattr(row, "PostedToPO", 0))
+    duplicate = bool(getattr(row, "IsDuplicate", 0))
+    if posted:
+        return status_chip("Posted")
+    if duplicate:
+        return status_chip("Duplicate")
+    return status_chip("Not Posted")
+
+
+def posting_reason(row):
+    if bool(getattr(row, "PostedToPO", 0)):
+        if (clean_text(getattr(row, "ReviewDecision", "")) or "") == "Matched to PO":
+            return "Posted after manual review."
+        return "Auto-posted from a valid PO match."
+    if bool(getattr(row, "IsDuplicate", 0)):
+        return "Not posted because this looks like a duplicate uploaded expense."
+    decision = clean_text(getattr(row, "ReviewDecision", "")) or "Pending Review"
+    if decision == "No PO Needed":
+        return "Not posted because reviewer marked No PO Needed."
+    if decision in ["Needs PM Review", "Hold for More Info", "Pending Review"]:
+        return "Not posted because review is not final."
+    if not (clean_text(getattr(row, "CorrectPONumber", "")) or clean_text(getattr(row, "MatchedPONumber", "")) or clean_text(getattr(row, "ExtractedPONumber", ""))):
+        return "Not posted because no valid PO number is linked."
+    return "Not posted because posting rules were not met."
+
+
 def load_pos_balances_data():
+    ensure_expense_review_tables()
     conn = get_sql_connection()
     cursor = conn.cursor()
 
-    cursor.execute(
-        """
-        WITH UniquePOs AS (
+    posted_cte = """
+        PostedExpenses AS (
+            SELECT
+                PostedPONumber AS PONumber,
+                SUM(COALESCE(PostedAmount, Amount, 0)) AS PostedExpenseAmount,
+                COUNT(*) AS PostedExpenseCount
+            FROM dbo.ExpenseReviewItems
+            WHERE COALESCE(PostedToPO, 0) = 1 AND COALESCE(PostedPONumber, '') <> ''
+            GROUP BY PostedPONumber
+        )
+    """
+
+    unique_po_cte = f"""
+        WITH LinePOs AS (
             SELECT
                 PONumber,
                 MAX(VendorName) AS VendorName,
@@ -2392,17 +2730,36 @@ def load_pos_balances_data():
                 MAX(PODate) AS PODate,
                 MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
                 SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount,
-                MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount,
+                MAX(COALESCE(RemainingAmount, 0)) AS UploadedRemainingAmount,
                 COUNT(*) AS LineCount
             FROM dbo.IssuedPOLines
             GROUP BY PONumber
+        ),
+        {posted_cte},
+        UniquePOs AS (
+            SELECT
+                l.*,
+                COALESCE(pe.PostedExpenseAmount, 0) AS PostedExpenseAmount,
+                COALESCE(pe.PostedExpenseCount, 0) AS PostedExpenseCount,
+                CASE
+                    WHEN COALESCE(l.POValue, 0) - COALESCE(pe.PostedExpenseAmount, 0) < 0 THEN 0
+                    ELSE COALESCE(l.POValue, 0) - COALESCE(pe.PostedExpenseAmount, 0)
+                END AS CurrentAppBalance
+            FROM LinePOs l
+            LEFT JOIN PostedExpenses pe ON pe.PONumber = l.PONumber
         )
+    """
+
+    cursor.execute(
+        unique_po_cte + """
         SELECT
             COUNT(*) AS TotalPOs,
             SUM(CASE WHEN UPPER(COALESCE(POStatus, '')) = 'OPEN' THEN 1 ELSE 0 END) AS OpenPOs,
             SUM(POValue) AS TotalPOValue,
             SUM(TotalLineAmount) AS TotalLineAmount,
-            SUM(RemainingAmount) AS TotalRemainingAmount,
+            SUM(UploadedRemainingAmount) AS UploadedRemainingAmount,
+            SUM(PostedExpenseAmount) AS PostedExpenseAmount,
+            SUM(CurrentAppBalance) AS TotalRemainingAmount,
             SUM(CASE WHEN ABS(COALESCE(POValue, 0) - COALESCE(TotalLineAmount, 0)) > 0.01 THEN 1 ELSE 0 END) AS AmountMismatchCount
         FROM UniquePOs;
         """
@@ -2413,29 +2770,23 @@ def load_pos_balances_data():
         "open_pos": row.OpenPOs or 0,
         "total_po_value": row.TotalPOValue or 0,
         "total_line_amount": row.TotalLineAmount or 0,
+        "uploaded_remaining_amount": getattr(row, "UploadedRemainingAmount", 0) or 0,
+        "posted_expense_amount": getattr(row, "PostedExpenseAmount", 0) or 0,
         "total_remaining_amount": row.TotalRemainingAmount or 0,
         "amount_mismatch_count": row.AmountMismatchCount or 0,
     }
 
     cursor.execute(
-        """
-        WITH UniquePOs AS (
-            SELECT
-                PONumber,
-                MAX(ProjectName) AS ProjectName,
-                MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
-                SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount,
-                MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
-            FROM dbo.IssuedPOLines
-            GROUP BY PONumber
-        )
+        unique_po_cte + """
         SELECT
             ProjectName,
             COUNT(*) AS POCount,
             SUM(POValue) AS POValue,
             SUM(TotalLineAmount) AS TotalLineAmount,
-            SUM(RemainingAmount) AS RemainingAmount,
-            CASE WHEN SUM(POValue) = 0 THEN 0 ELSE SUM(RemainingAmount) / SUM(POValue) END AS PercentOpen
+            SUM(UploadedRemainingAmount) AS UploadedRemainingAmount,
+            SUM(PostedExpenseAmount) AS PostedExpenseAmount,
+            SUM(CurrentAppBalance) AS RemainingAmount,
+            CASE WHEN SUM(POValue) = 0 THEN 0 ELSE SUM(CurrentAppBalance) / SUM(POValue) END AS PercentOpen
         FROM UniquePOs
         GROUP BY ProjectName
         ORDER BY POValue DESC;
@@ -2444,23 +2795,15 @@ def load_pos_balances_data():
     projects = cursor.fetchall()
 
     cursor.execute(
-        """
-        WITH UniquePOs AS (
-            SELECT
-                PONumber,
-                MAX(VendorName) AS VendorName,
-                MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
-                SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount,
-                MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
-            FROM dbo.IssuedPOLines
-            GROUP BY PONumber
-        )
+        unique_po_cte + """
         SELECT TOP 10
             VendorName,
             COUNT(*) AS POCount,
             SUM(POValue) AS POValue,
             SUM(TotalLineAmount) AS TotalLineAmount,
-            SUM(RemainingAmount) AS RemainingAmount
+            SUM(UploadedRemainingAmount) AS UploadedRemainingAmount,
+            SUM(PostedExpenseAmount) AS PostedExpenseAmount,
+            SUM(CurrentAppBalance) AS RemainingAmount
         FROM UniquePOs
         GROUP BY VendorName
         ORDER BY POValue DESC;
@@ -2469,22 +2812,7 @@ def load_pos_balances_data():
     vendors = cursor.fetchall()
 
     cursor.execute(
-        """
-        WITH UniquePOs AS (
-            SELECT
-                PONumber,
-                MAX(VendorName) AS VendorName,
-                MAX(ProjectName) AS ProjectName,
-                MAX(Department) AS Department,
-                MAX(POStatus) AS POStatus,
-                MAX(PODate) AS PODate,
-                MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
-                SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount,
-                MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount,
-                COUNT(*) AS LineCount
-            FROM dbo.IssuedPOLines
-            GROUP BY PONumber
-        )
+        unique_po_cte + """
         SELECT
             PONumber,
             VendorName,
@@ -2495,7 +2823,10 @@ def load_pos_balances_data():
             LineCount,
             POValue,
             TotalLineAmount,
-            RemainingAmount,
+            UploadedRemainingAmount,
+            PostedExpenseAmount,
+            PostedExpenseCount,
+            CurrentAppBalance AS RemainingAmount,
             CASE WHEN ABS(COALESCE(POValue, 0) - COALESCE(TotalLineAmount, 0)) > 0.01 THEN 1 ELSE 0 END AS AmountMismatch
         FROM UniquePOs
         ORDER BY PODate DESC, PONumber DESC;
@@ -2530,7 +2861,6 @@ def load_pos_balances_data():
         "pos": pos,
         "lines": lines,
     }
-
 
 def open_balance_bucket_rows(projects):
     definitions = [
@@ -2844,7 +3174,7 @@ def aggregate_items(items, key_name):
 def render_payment_schedule_for_packet(payment_schedule):
     lines = [line.strip() for line in str(payment_schedule or "").splitlines() if line.strip()]
     if not lines:
-        return '<div class="empty-state"><strong>No payment schedule entered.</strong><span>Use PO Info Review to add expected payment dates and schedule details.</span></div>'
+        return '<div class="empty-state"><strong>No payment schedule entered.</strong><span>Use PO Setup Review to add expected payment dates and schedule details.</span></div>'
     items = "".join(f'<div class="timeline-item"><strong>Payment {idx}</strong><span>{h(line)}</span></div>' for idx, line in enumerate(lines, start=1))
     return f'<div class="timeline">{items}</div>'
 
@@ -2866,7 +3196,9 @@ def load_po_packet_data(po_number):
             po.Requestor,
             COALESCE(po.RevisedAmount, po.OriginalAmount, 0) AS POValue,
             COALESCE(lines.TotalLineAmount, COALESCE(po.RevisedAmount, po.OriginalAmount, 0)) AS TotalLineAmount,
-            COALESCE(po.RemainingAmount, 0) AS RemainingAmount,
+            COALESCE(posted.PostedExpenseAmount, 0) AS PostedExpenseAmount,
+            COALESCE(posted.PostedExpenseCount, 0) AS PostedExpenseCount,
+            CASE WHEN COALESCE(po.RevisedAmount, po.OriginalAmount, 0) - COALESCE(posted.PostedExpenseAmount, 0) < 0 THEN 0 ELSE COALESCE(po.RevisedAmount, po.OriginalAmount, 0) - COALESCE(posted.PostedExpenseAmount, 0) END AS RemainingAmount,
             COALESCE(lines.LineCount, 0) AS LineCount,
             po.PaymentType,
             po.ExpectedPaymentDate,
@@ -2884,8 +3216,15 @@ def load_po_packet_data(po_number):
             WHERE PONumber = ?
             GROUP BY PONumber
         ) lines ON lines.PONumber = po.PONumber
+        LEFT JOIN (
+            SELECT PostedPONumber, SUM(COALESCE(PostedAmount, Amount, 0)) AS PostedExpenseAmount, COUNT(*) AS PostedExpenseCount
+            FROM dbo.ExpenseReviewItems
+            WHERE COALESCE(PostedToPO, 0) = 1 AND PostedPONumber = ?
+            GROUP BY PostedPONumber
+        ) posted ON posted.PostedPONumber = po.PONumber
         WHERE po.PONumber = ?;
         """,
+        po_number,
         po_number,
         po_number,
     )
@@ -2907,8 +3246,19 @@ def load_po_packet_data(po_number):
         po_number,
     )
     lines = cursor.fetchall()
+    cursor.execute(
+        """
+        SELECT TOP 200 ExpenseReviewItemId, ExpenseId, TxDate, TxType, VendorName, Description,
+               Amount, PostedAmount, PostedAt, PostedBy, ReviewDecision, ReviewerEmail, PMComments
+        FROM dbo.ExpenseReviewItems
+        WHERE COALESCE(PostedToPO, 0) = 1 AND PostedPONumber = ?
+        ORDER BY COALESCE(PostedAt, UpdatedAt) DESC, ExpenseReviewItemId DESC;
+        """,
+        po_number,
+    )
+    posted_expenses = cursor.fetchall()
     conn.close()
-    return po, lines
+    return po, lines, posted_expenses
 
 
 def ensure_po_setup_columns(cursor):
@@ -3086,6 +3436,27 @@ def update_po_setup_info(form):
     cursor = conn.cursor()
     try:
         ensure_po_setup_columns(cursor)
+        cursor.execute("""
+            SELECT po.PONumber, v.VendorName
+            FROM dbo.PurchaseOrders po
+            LEFT JOIN dbo.Vendors v ON po.VendorId = v.VendorId
+            WHERE po.PONumber = ?;
+        """, po_number)
+        current_po = cursor.fetchone()
+        existing_vendor = clean_text(current_po.VendorName) if current_po else None
+        effective_vendor = vendor_name or existing_vendor
+        if setup_status == "Complete":
+            missing = []
+            if not effective_vendor:
+                missing.append("vendor")
+            if not payment_type:
+                missing.append("payment type")
+            if not payment_schedule:
+                missing.append("payment schedule")
+            if not expected_payment_date:
+                missing.append("expected payment date")
+            if missing:
+                raise ValueError("Cannot mark Complete. Missing: " + ", ".join(missing) + ".")
         vendor_id = get_or_create_vendor(cursor, vendor_name) if vendor_name else None
         cursor.execute(
             """
@@ -3342,6 +3713,7 @@ def purchase_requests():
     try:
         stats = load_purchase_request_stats()
         requests = load_purchase_requests()
+        reviewer_users = load_assignable_users()
         selected_status = clean_text(request.args.get("status")) or "All"
 
         def status_card(label, value, status_filter, tone, trend):
@@ -3354,6 +3726,13 @@ def purchase_requests():
                 <div class="trend">{h(trend)}</div>
             </a>
             """
+
+        manual_review_notice = """
+        <div class="notice info">
+            <strong>Manual purchase request review for July 1 rollout.</strong><br>
+            Purchase requests are reviewed manually by Accounting/Admin for the July 1 rollout. Approval in this app records the decision, but does not automatically create a PO.
+        </div>
+        """
 
         dashboard_cards = f"""
         <div class="status-card-grid">
@@ -3381,13 +3760,36 @@ def purchase_requests():
 
             review_form = ""
             if can_review_purchase_requests(role):
+                reviewer_value = clean_text(row.ReviewerEmail) or access["email"]
+                reviewer_options = ""
+                seen_reviewers = set()
+                for reviewer in reviewer_users:
+                    reviewer_email = clean_text(reviewer.Email)
+                    if not reviewer_email:
+                        continue
+                    reviewer_label = clean_text(reviewer.DisplayName) or reviewer_email
+                    reviewer_role = clean_text(reviewer.RoleName)
+                    label = reviewer_label + (f" ({reviewer_role})" if reviewer_role else "")
+                    selected = " selected" if reviewer_email.lower() == reviewer_value.lower() else ""
+                    reviewer_options += f'<option value="{h(reviewer_email)}"{selected}>{h(label)}</option>'
+                    seen_reviewers.add(reviewer_email.lower())
+                if reviewer_value and reviewer_value.lower() not in seen_reviewers:
+                    reviewer_options = f'<option value="{h(reviewer_value)}" selected>{h(reviewer_value)}</option>' + reviewer_options
+                converted_display = "block" if (row.RequestStatus or "Submitted") == "Converted to PO" else "none"
                 review_form = f"""
-                <form method="post" action="/purchase-requests">
+                <form method="post" action="/purchase-requests" class="purchase-review-panel">
                     <input type="hidden" name="purchase_request_id" value="{h(row.PurchaseRequestId)}">
-                    <p><select name="request_status">{status_options}</select></p>
-                    <p><input type="text" name="converted_po_number" value="{h(row.ConvertedPONumber)}" placeholder="PO number if converted"></p>
-                    <p><textarea name="review_notes" placeholder="Review notes">{h(row.ReviewNotes)}</textarea></p>
-                    <p><button type="submit">Update</button></p>
+                    <label>Status</label>
+                    <select name="request_status" onchange="toggleConvertedPOField(this)">{status_options}</select>
+                    <label>Reviewer</label>
+                    <select name="reviewer_email">{reviewer_options}</select>
+                    <div class="converted-po-field" style="display:{converted_display};">
+                        <label>Converted PO Number</label>
+                        <input type="text" name="converted_po_number" value="{h(row.ConvertedPONumber)}" placeholder="Enter issued PO number">
+                    </div>
+                    <label>Review Notes</label>
+                    <textarea name="review_notes" placeholder="Add review notes, approval comments, rejection reason, or follow-up needed">{h(row.ReviewNotes)}</textarea>
+                    <button type="submit">Save Review</button>
                 </form>
                 """
 
@@ -3412,6 +3814,7 @@ def purchase_requests():
 
         total_requests = max(stats["total_requests"], 1)
         content = f"""
+        {manual_review_notice}
         {dashboard_cards}
 
         <div class="grid two visual-chart-row">
@@ -3449,6 +3852,17 @@ def purchase_requests():
             rows.forEach(row => {{ const cells = Array.from(row.children); const show = filters.every(filter => {{ if (!filter.value) return true; const cell = cells[filter.col]; return cell && cell.textContent.toLowerCase().includes(filter.value); }}); row.style.display = show ? '' : 'none'; }});
         }}
         function clearRequestDashboardFilters() {{ const table = document.getElementById('requestDashboardTable'); if (!table) return; table.querySelectorAll('.column-filter-row input').forEach(input => input.value = ''); filterRequestDashboard(); }}
+        function toggleConvertedPOField(select) {{
+            const form = select.closest('form');
+            if (!form) return;
+            const field = form.querySelector('.converted-po-field');
+            if (!field) return;
+            const input = field.querySelector('input');
+            const show = select.value === 'Converted to PO';
+            field.style.display = show ? 'block' : 'none';
+            if (!show && input) input.value = '';
+        }}
+        document.querySelectorAll('.purchase-review-panel select[name="request_status"]').forEach(toggleConvertedPOField);
         </script>
         """
 
@@ -3999,6 +4413,7 @@ def pos_balances():
                 <td class="right">{row.POCount}</td>
                 <td class="right">{currency(row.POValue)}</td>
                 <td class="right">{currency(row.TotalLineAmount)}</td>
+                <td class="right">{currency(getattr(row, 'PostedExpenseAmount', 0))}</td>
                 <td class="right">{currency(row.RemainingAmount)}</td>
                 <td class="right">{percent(row.PercentOpen)}</td>
                 <td><div class="bar-track"><div class="bar-fill" style="width:{bar_width}%"></div></div></td>
@@ -4035,6 +4450,7 @@ def pos_balances():
                 <td class="right">{row.LineCount}</td>
                 <td class="right">{currency(row.POValue)}</td>
                 <td class="right">{currency(row.TotalLineAmount)}</td>
+                <td class="right">{currency(getattr(row, 'PostedExpenseAmount', 0))}<br><small>{int(getattr(row, 'PostedExpenseCount', 0) or 0)} expense(s)</small></td>
                 <td class="right">{currency(row.RemainingAmount)}</td>
                 <td>{flag}</td>
                 <td><a class="secondary" href="{internal_packet_url}">Internal</a><br><a class="secondary" href="{vendor_packet_url}">Vendor</a></td>
@@ -4062,14 +4478,17 @@ def pos_balances():
             line_rows = '<tr><td colspan="9">No line items found.</td></tr>'
 
         content = f"""
+        {latest_data_freshness_banner()}
         <div class="grid kpis">
             <a class="card kpi action-card blue" href="#posBalancesPOListTable"><div class="label">Issued PO Count</div><div class="value">{overall['total_pos']}</div><div class="trend">Unique issued POs</div></a>
             <a class="card kpi action-card green" href="#posBalancesPOListTable"><div class="label">Open POs</div><div class="value">{overall['open_pos']}</div><div class="trend">Currently open</div></a>
             <div class="card kpi"><div class="label">Issued PO Amount</div><div class="value">{currency(overall['total_po_value'])}</div><div class="trend">Revised/original value</div></div>
-            <div class="card kpi"><div class="label">Line Item Total</div><div class="value">{currency(overall['total_line_amount'])}</div><div class="trend">Imported line total</div></div>
-            <a class="card kpi action-card amber" href="/project-po-setup"><div class="label">Open PO Balance</div><div class="value">{currency(overall['total_remaining_amount'])}</div><div class="trend">Remaining amount</div></a>
+            <div class="card kpi"><div class="label">Posted Expenses</div><div class="value">{currency(overall.get('posted_expense_amount', 0))}</div><div class="trend">Matched expenses reducing balances</div></div>
+            <a class="card kpi action-card amber" href="/project-po-setup"><div class="label">Current App Balance</div><div class="value">{currency(overall['total_remaining_amount'])}</div><div class="trend">Issued POs minus posted matched expenses</div></a>
             <div class="card kpi"><div class="label">Review Flags</div><div class="value">{overall['amount_mismatch_count']}</div><div class="trend">PO value vs. line total</div></div>
         </div>
+
+        <div class="notice info"><strong>Balance method:</strong> PO balances are app-calculated as issued PO amount minus expenses posted through the PO matching workflow. The app does not write balances back to Unanet or the ERP.</div>
 
         <div class="card project-bucket-card">
             <h3>Project Open Balance Buckets</h3>
@@ -4362,6 +4781,34 @@ def approver_queue():
 
 
 
+def posted_expense_card(rows):
+    table_rows = ""
+    for r in rows:
+        table_rows += f"""
+        <tr>
+            <td><strong>{h(r.ExpenseId or r.ExpenseReviewItemId)}</strong><br><small>{h(r.TxDate)}</small></td>
+            <td>{h(r.TxType)}</td>
+            <td>{h(r.VendorName)}</td>
+            <td>{h(r.Description)}<br><small>{h(r.PMComments)}</small></td>
+            <td class="right">{currency(r.PostedAmount or r.Amount)}</td>
+            <td>{h(r.ReviewDecision)}<br><small>{h(r.PostedBy or r.ReviewerEmail)}</small></td>
+            <td>{h(r.PostedAt)}</td>
+        </tr>
+        """
+    if not table_rows:
+        table_rows = '<tr><td colspan="7"><div class="empty-state"><strong>No posted expenses yet.</strong><span>Matched expenses will appear here once they reduce this PO balance.</span></div></td></tr>'
+    return f"""
+    <div class="card">
+        <h3>Posted Expenses Reducing This PO</h3>
+        <p class="card-subtitle">These reviewed expense rows reduce the current app PO balance. They do not write back to Unanet or the ERP.</p>
+        <div class="table-wrap"><table>
+            <tr><th>Expense</th><th>Type</th><th>Vendor / Purchaser</th><th>Description / PM Comments</th><th class="right">Posted Amount</th><th>Decision / Posted By</th><th>Posted At</th></tr>
+            {table_rows}
+        </table></div>
+    </div>
+    """
+
+
 @app.route("/po-packet/<path:po_number>")
 def po_packet(po_number):
     allowed, reason = require_page_access("POs & Balances")
@@ -4373,7 +4820,7 @@ def po_packet(po_number):
         packet_type = "internal"
 
     try:
-        po, lines = load_po_packet_data(po_number)
+        po, lines, posted_expenses = load_po_packet_data(po_number)
         if not po:
             content = '<div class="notice error">PO was not found.</div>'
             return shell("PO Packet", "Unable to find this PO.", "POs & Balances", content), 404
@@ -4411,7 +4858,8 @@ def po_packet(po_number):
         subtitle = "Vendor-facing purchase order packet" if packet_type == "vendor" else "Internal purchase order packet with balances and audit context"
         balance_fields = "" if packet_type == "vendor" else f"""
             <div class="packet-field"><span>Total Line Amount</span><strong>{currency(po.TotalLineAmount)}</strong></div>
-            <div class="packet-field"><span>Remaining Balance</span><strong>{currency(po.RemainingAmount)}</strong></div>
+            <div class="packet-field"><span>Posted Expenses</span><strong>{currency(getattr(po, 'PostedExpenseAmount', 0))}</strong></div>
+            <div class="packet-field"><span>Current App Balance</span><strong>{currency(po.RemainingAmount)}</strong></div>
             <div class="packet-field"><span>Line Count</span><strong>{h(po.LineCount)}</strong></div>
         """
         internal_timeline = "" if packet_type == "vendor" else f"""
@@ -4467,6 +4915,7 @@ def po_packet(po_number):
             <h3>PO Line Items</h3>
             <div class="table-wrap"><table><tr>{line_headers}</tr>{line_rows}</table></div>
         </div>
+        {posted_expense_card(posted_expenses) if packet_type == 'internal' else ''}
         {internal_timeline}
         """
         page_title = "Vendor PO Packet" if packet_type == "vendor" else "Internal PO Packet"
@@ -4479,9 +4928,9 @@ def po_packet(po_number):
 
 @app.route("/project-po-setup", methods=["GET", "POST"])
 def project_po_setup():
-    allowed, reason = require_page_access("Project PO Setup")
+    allowed, reason = require_page_access("PO Setup Review")
     if not allowed:
-        return access_denied_response("Project PO Setup", reason)
+        return access_denied_response("PO Setup Review", reason)
 
     user = get_current_user()
 
@@ -4608,8 +5057,9 @@ def project_po_setup():
             mine_link = f'<a class="button secondary" href="/project-po-setup?mine=1">My Assigned PO Info Tasks</a>'
 
         content = f"""
+        {latest_data_freshness_banner()}
         <div class="info-callout">
-            <strong>PO Info Review replaces duplicate missing-info workflows.</strong>
+            <strong>PO Setup Review replaces duplicate missing-info workflows.</strong>
             Use this page for POs that are missing payment schedules, payment timing, payment type, or PM-provided details. The separate Exceptions page remains for data-quality problems like amount mismatches or closed POs with remaining balances.
         </div>
         <div class="grid kpis">
@@ -4624,7 +5074,7 @@ def project_po_setup():
         <div class="card">
             <div style="display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap;">
                 <div>
-                    <h3>PO Info Review Table</h3>
+                    <h3>PO Setup Review Table</h3>
                     <p class="card-subtitle">Update missing payment schedule information directly, or assign the PO to a project manager so it appears as an action item on their dashboard.</p>
                 </div>
                 <div>{mine_link}</div>
@@ -4651,7 +5101,7 @@ def project_po_setup():
             <h3>Recommended workflow</h3>
             <div class="timeline">
                 <div class="timeline-item"><strong>Accounting imports issued POs</strong><span>PO rows land in the dashboard from the Upload Issued POs page.</span></div>
-                <div class="timeline-item"><strong>PO Info Review identifies missing planning data</strong><span>Missing payment schedule, payment type, and expected payment date appear here.</span></div>
+                <div class="timeline-item"><strong>PO Setup Review identifies missing planning data</strong><span>Missing payment schedule, payment type, and expected payment date appear here.</span></div>
                 <div class="timeline-item"><strong>Assign missing info to the PM</strong><span>Choose the project manager or responsible user from the Assigned To dropdown and click Assign. They will see assigned PO info tasks on My Dashboard.</span></div>
                 <div class="timeline-item"><strong>PM/accounting updates the PO</strong><span>Once payment schedule and timing are entered, mark the item Complete.</span></div>
             </div>
@@ -4698,11 +5148,11 @@ def project_po_setup():
         });
         </script>
         """
-        return shell("PO Info Review", "Update missing PO planning details and assign follow-up work.", "PO Info Review", content)
+        return shell("PO Setup Review", "Update missing PO planning details and assign follow-up work.", "PO Setup Review", content)
 
     except Exception as e:
         content = f'<div class="notice error">Error loading PO Info Review: {h(e)}</div>'
-        return shell("PO Info Review", "Unable to load setup queue.", "PO Info Review", content), 500
+        return shell("PO Setup Review", "Unable to load setup queue.", "PO Setup Review", content), 500
 
 
 @app.route("/expenses")
@@ -4712,27 +5162,54 @@ def expenses_page():
         return access_denied_response("Expenses", reason)
     try:
         ensure_expense_review_tables()
+        filters = {
+            "project": clean_text(request.args.get("project")) or "",
+            "vendor": clean_text(request.args.get("vendor")) or "",
+            "type": clean_text(request.args.get("type")) or "",
+            "status": clean_text(request.args.get("status")) or "",
+            "decision": clean_text(request.args.get("decision")) or "",
+            "po": clean_text(request.args.get("po")) or "",
+            "search": clean_text(request.args.get("search")) or "",
+        }
+        where = []
+        params = []
+        add_like_filter(where, params, "ProjectName", filters["project"])
+        add_like_filter(where, params, "VendorName", filters["vendor"])
+        add_like_filter(where, params, "TxType", filters["type"])
+        add_like_filter(where, params, "MatchStatus", filters["status"])
+        add_like_filter(where, params, "ReviewDecision", filters["decision"])
+        if filters["po"]:
+            where.append("LOWER(COALESCE(CorrectPONumber, MatchedPONumber, ExtractedPONumber, '')) LIKE LOWER(?)")
+            params.append("%" + filters["po"] + "%")
+        if filters["search"]:
+            where.append("LOWER(CONCAT(COALESCE(ExpenseId,''), ' ', COALESCE(ProjectName,''), ' ', COALESCE(TxType,''), ' ', COALESCE(VendorName,''), ' ', COALESCE(Description,''), ' ', COALESCE(PMComments,''))) LIKE LOWER(?)")
+            params.append("%" + filters["search"] + "%")
+        where_sql = "WHERE " + " AND ".join(where) if where else ""
+
         conn = get_sql_connection()
         cursor = conn.cursor()
-        cursor.execute(
-            """
+        cursor.execute("""
             SELECT
                 COUNT(*) AS TotalRows,
                 SUM(CASE WHEN MatchStatus IN ('Auto Matched','Manually Matched') THEN 1 ELSE 0 END) AS MatchedRows,
                 SUM(CASE WHEN MatchStatus IN ('Needs Review','No Match') THEN 1 ELSE 0 END) AS ReviewRows,
-                SUM(COALESCE(Amount, 0)) AS TotalAmount
+                SUM(CASE WHEN COALESCE(PostedToPO, 0) = 1 THEN 1 ELSE 0 END) AS PostedRows,
+                SUM(COALESCE(Amount, 0)) AS TotalAmount,
+                SUM(CASE WHEN COALESCE(PostedToPO, 0) = 1 THEN COALESCE(PostedAmount, Amount, 0) ELSE 0 END) AS PostedAmount
             FROM dbo.ExpenseReviewItems;
-            """
-        )
+        """)
         stats = cursor.fetchone()
         cursor.execute(
-            """
+            f"""
             SELECT TOP 750 ExpenseReviewItemId, ExpenseId, ProjectName, TxDate, TxType, VendorName,
                    Description, Amount, PMComments, ExtractedPONumber, MatchedPONumber, MatchStatus,
-                   MatchConfidence, ReviewDecision, CorrectPONumber
+                   MatchConfidence, ReviewDecision, CorrectPONumber, PostedToPO, PostedPONumber,
+                   PostedAmount, PostedAt, PostedBy, ReviewerEmail, ReviewedAt, IsDuplicate
             FROM dbo.ExpenseReviewItems
+            {where_sql}
             ORDER BY TxDate DESC, ExpenseReviewItemId DESC;
-            """
+            """,
+            *params,
         )
         rows = cursor.fetchall()
         conn.close()
@@ -4741,10 +5218,18 @@ def expenses_page():
         for r in rows:
             status_class = str(r.MatchStatus or "").lower().replace(" ", "-")
             po_number = r.CorrectPONumber or r.MatchedPONumber or r.ExtractedPONumber or ""
-            po_link = f'<a href="/po-detail?po_number={quote_plus(str(po_number))}">{h(po_number)}</a>' if po_number else ""
+            posted_po = r.PostedPONumber or po_number
+            po_link = f'<a href="/po-detail?po_number={quote_plus(str(posted_po))}">{h(posted_po)}</a>' if posted_po else ""
+            unpost_button = ""
+            if getattr(r, "PostedToPO", 0):
+                unpost_button = (
+                    f'<form method="post" action="/expense-review/unpost" onsubmit="return confirm(\'Reverse this posted expense from the PO balance?\');">'
+                    f'<input type="hidden" name="item_id" value="{h(r.ExpenseReviewItemId)}">'
+                    f'<button class="secondary" type="submit">Unpost</button></form>'
+                )
             table_rows += f"""
             <tr>
-                <td><span class="status-chip {h(status_class)}">{h(r.MatchStatus)}</span><br><small>{h(r.MatchConfidence)}</small></td>
+                <td><span class="status-chip {h(status_class)}">{h(r.MatchStatus)}</span><br>{posting_status_chip(r)}<br><small>{h(r.MatchConfidence)}</small></td>
                 <td><strong>{h(r.ExpenseId or r.ExpenseReviewItemId)}</strong><br><small>{h(r.TxDate)}</small></td>
                 <td>{h(r.ProjectName)}</td>
                 <td>{h(r.TxType)}</td>
@@ -4753,23 +5238,36 @@ def expenses_page():
                 <td>{h(r.Description)}<br><small>{h(r.PMComments)}</small></td>
                 <td>{po_link}</td>
                 <td>{h(r.ReviewDecision)}</td>
+                <td class="posting-audit-cell">{h(posting_reason(r))}<br><strong>{currency(getattr(r, 'PostedAmount', 0)) if getattr(r, 'PostedToPO', 0) else ''}</strong><br><small>{h(getattr(r, 'PostedBy', '') or '')} {h(getattr(r, 'PostedAt', '') or '')}</small>{unpost_button}</td>
             </tr>
             """
         if not table_rows:
-            table_rows = '<tr><td colspan="9"><div class="empty-state"><strong>No expenses loaded yet.</strong><span>Upload a Unanet expense file from Expense Upload / PO Matching.</span></div></td></tr>'
+            table_rows = '<tr><td colspan="10"><div class="empty-state"><strong>No expenses found.</strong><span>Adjust filters or upload a Unanet expense file.</span></div></td></tr>'
 
+        filter_bar = build_simple_filter_bar(filters, "/expenses", [
+            ("project", "Project", "Project name/code"),
+            ("vendor", "Vendor", "Vendor or purchaser"),
+            ("type", "Type", "Purchase, Disbursement..."),
+            ("status", "Match Status", "Auto Matched, No Match..."),
+            ("decision", "Decision", "Matched to PO, No PO Needed..."),
+            ("po", "PO", "PO number"),
+            ("search", "Search", "Description or comments"),
+        ])
         content = f"""
+        {latest_data_freshness_banner()}
         <div class="grid kpis">
             <a class="card kpi status-card" href="/expense-upload"><div class="label">Expense Rows</div><div class="value">{int(stats.TotalRows or 0)}</div><div class="trend">Imported from Unanet uploads</div></a>
             <a class="card kpi status-card" href="/expenses"><div class="label">Expense Amount</div><div class="value">{currency(stats.TotalAmount)}</div><div class="trend">Total uploaded expense value</div></a>
             <a class="card kpi status-card" href="/pos-in-pm-comments"><div class="label">Matched / Linked</div><div class="value">{int(stats.MatchedRows or 0)}</div><div class="trend">Auto or manually matched rows</div></a>
             <a class="card kpi status-card" href="/missing-po-review"><div class="label">Needs Review</div><div class="value">{int(stats.ReviewRows or 0)}</div><div class="trend">Rows needing PO decision</div></a>
+            <a class="card kpi status-card" href="/pos-balances"><div class="label">Posted to POs</div><div class="value">{currency(stats.PostedAmount)}</div><div class="trend">{int(stats.PostedRows or 0)} rows reducing balances</div></a>
         </div>
+        {filter_bar}
         <div class="card">
             <h3>Expenses</h3>
-            <p class="card-subtitle">Imported Unanet expense rows. Use this page as the full expense ledger view; use Expense Upload / PO Matching for upload and row-level matching decisions.</p>
+            <p class="card-subtitle">Imported Unanet expense rows with match status, posting status, and audit detail. Posted rows reduce Current App Balance.</p>
             <div class="table-wrap"><table id="expensesTable">
-                <tr><th>Status</th><th>Expense</th><th>Project</th><th>Type</th><th>Vendor / Purchaser</th><th class="right">Amount</th><th>Description / PM Comments</th><th>PO</th><th>Decision</th></tr>
+                <tr><th>Status</th><th>Expense</th><th>Project</th><th>Type</th><th>Vendor / Purchaser</th><th class="right">Amount</th><th>Description / PM Comments</th><th>PO</th><th>Decision</th><th>Posting Audit</th></tr>
                 {table_rows}
             </table></div>
         </div>
@@ -4786,33 +5284,49 @@ def missing_po_review():
         return access_denied_response("Missing PO Review", reason)
     try:
         ensure_expense_review_tables()
+        filters = {
+            "project": clean_text(request.args.get("project")) or "",
+            "vendor": clean_text(request.args.get("vendor")) or "",
+            "type": clean_text(request.args.get("type")) or "",
+            "status": clean_text(request.args.get("status")) or "",
+            "decision": clean_text(request.args.get("decision")) or "",
+            "search": clean_text(request.args.get("search")) or "",
+        }
+        where = ["(COALESCE(ReviewDecision, 'Pending Review') IN ('Pending Review','Needs PM Review','Hold for More Info') OR MatchStatus IN ('Needs Review','No Match'))"]
+        params = []
+        add_like_filter(where, params, "ProjectName", filters["project"])
+        add_like_filter(where, params, "VendorName", filters["vendor"])
+        add_like_filter(where, params, "TxType", filters["type"])
+        add_like_filter(where, params, "MatchStatus", filters["status"])
+        add_like_filter(where, params, "ReviewDecision", filters["decision"])
+        if filters["search"]:
+            where.append("LOWER(CONCAT(COALESCE(ExpenseId,''), ' ', COALESCE(ProjectName,''), ' ', COALESCE(VendorName,''), ' ', COALESCE(Description,''), ' ', COALESCE(PMComments,''), ' ', COALESCE(MatchReason,''))) LIKE LOWER(?)")
+            params.append("%" + filters["search"] + "%")
+        where_sql = "WHERE " + " AND ".join(where)
         conn = get_sql_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT PONumber FROM dbo.PurchaseOrders WHERE PONumber IS NOT NULL ORDER BY PONumber")
         po_numbers = [row.PONumber for row in cursor.fetchall()]
         cursor.execute(
-            """
+            f"""
             SELECT TOP 500 ExpenseReviewItemId, ExpenseId, ProjectName, TxDate, TxType, VendorName,
                    Description, Amount, PMComments, ExtractedPONumber, MatchedPONumber, MatchStatus,
-                   MatchConfidence, MatchReason, ReviewDecision, CorrectPONumber, ReviewerNotes
+                   MatchConfidence, MatchReason, ReviewDecision, CorrectPONumber, ReviewerNotes,
+                   PostedToPO, PostedPONumber, PostedAmount, PostedAt, PostedBy, ReviewerEmail, ReviewedAt, IsDuplicate
             FROM dbo.ExpenseReviewItems
-            WHERE COALESCE(ReviewDecision, 'Pending Review') IN ('Pending Review','Needs PM Review','Hold for More Info')
-               OR MatchStatus IN ('Needs Review','No Match')
-            ORDER BY
-                CASE WHEN MatchStatus = 'No Match' THEN 0 WHEN MatchStatus = 'Needs Review' THEN 1 ELSE 2 END,
-                ABS(COALESCE(Amount,0)) DESC,
-                ExpenseReviewItemId DESC;
-            """
+            {where_sql}
+            ORDER BY CASE WHEN MatchStatus = 'No Match' THEN 0 WHEN MatchStatus = 'Needs Review' THEN 1 ELSE 2 END,
+                     ABS(COALESCE(Amount,0)) DESC, ExpenseReviewItemId DESC;
+            """,
+            *params,
         )
         rows = cursor.fetchall()
         cursor.execute(
             """
-            SELECT
-                COUNT(*) AS TotalOpen,
-                SUM(CASE WHEN MatchStatus = 'No Match' THEN 1 ELSE 0 END) AS NoMatch,
-                SUM(CASE WHEN MatchStatus = 'Needs Review' THEN 1 ELSE 0 END) AS NeedsReview,
-                SUM(CASE WHEN ABS(COALESCE(Amount,0)) >= 1000 THEN 1 ELSE 0 END) AS HighDollar,
-                SUM(COALESCE(Amount, 0)) AS OpenAmount
+            SELECT COUNT(*) AS TotalOpen,
+                   SUM(CASE WHEN MatchStatus = 'No Match' THEN 1 ELSE 0 END) AS NoMatch,
+                   SUM(CASE WHEN MatchStatus = 'Needs Review' THEN 1 ELSE 0 END) AS NeedsReview,
+                   SUM(COALESCE(Amount, 0)) AS OpenAmount
             FROM dbo.ExpenseReviewItems
             WHERE COALESCE(ReviewDecision, 'Pending Review') IN ('Pending Review','Needs PM Review','Hold for More Info')
                OR MatchStatus IN ('Needs Review','No Match');
@@ -4828,13 +5342,14 @@ def missing_po_review():
             status_class = str(r.MatchStatus or "").lower().replace(" ", "-")
             row_html += f"""
             <tr>
-                <td><span class="status-chip {h(status_class)}">{h(r.MatchStatus)}</span><br><small>{h(r.MatchConfidence)}</small></td>
+                <td><span class="status-chip {h(status_class)}">{h(r.MatchStatus)}</span><br>{posting_status_chip(r)}<br><small>{h(r.MatchConfidence)}</small></td>
                 <td><strong>{h(r.ExpenseId or r.ExpenseReviewItemId)}</strong><br><small>{h(r.TxDate)}</small></td>
                 <td>{h(r.ProjectName)}</td>
                 <td>{h(r.VendorName)}<br><small>{h(r.TxType)}</small></td>
                 <td class="right">{currency(r.Amount)}</td>
                 <td>{h(r.Description)}<br><small>{h(r.PMComments)}</small></td>
                 <td>{h(suggested)}<br><small>{h(r.MatchReason)}</small></td>
+                <td class="posting-audit-cell">{h(posting_reason(r))}<br><small>{h(r.PostedPONumber or '')} {currency(r.PostedAmount) if r.PostedToPO else ''}</small></td>
                 <td class="expense-action-cell">
                     <form class="expense-match-form" method="post" action="/expense-review/update">
                         <input type="hidden" name="item_id" value="{h(r.ExpenseReviewItemId)}">
@@ -4853,21 +5368,24 @@ def missing_po_review():
             </tr>
             """
         if not row_html:
-            row_html = '<tr><td colspan="8"><div class="empty-state"><strong>No missing PO review items.</strong><span>Rows needing PO decisions will appear here after expense uploads.</span></div></td></tr>'
-
+            row_html = '<tr><td colspan="9"><div class="empty-state"><strong>No missing PO review items.</strong><span>Rows needing PO decisions will appear here after expense uploads.</span></div></td></tr>'
+        filter_bar = build_simple_filter_bar(filters, "/missing-po-review", [("project", "Project", "Project name/code"), ("vendor", "Vendor", "Vendor or purchaser"), ("type", "Type", "Purchase, Disbursement..."), ("status", "Match Status", "No Match, Needs Review..."), ("decision", "Decision", "Pending Review..."), ("search", "Search", "Description or comments")])
         content = f"""
+        {latest_data_freshness_banner()}
+        <div class="notice info"><strong>Missing PO Review:</strong> Use this page to review expenses that may need a PO or corrected PO reference. Rows only reduce PO balances after they are posted as valid matches.</div>
         <div class="grid kpis">
             <a class="card kpi status-card" href="/missing-po-review"><div class="label">Open Review Items</div><div class="value">{int(stats.TotalOpen or 0)}</div><div class="trend">Rows needing PO decision</div></a>
-            <a class="card kpi status-card" href="/missing-po-review"><div class="label">No Match</div><div class="value">{int(stats.NoMatch or 0)}</div><div class="trend">No clear PO found</div></a>
-            <a class="card kpi status-card" href="/missing-po-review"><div class="label">Needs Review</div><div class="value">{int(stats.NeedsReview or 0)}</div><div class="trend">Suggested match needs validation</div></a>
+            <a class="card kpi status-card" href="/missing-po-review?status=No+Match"><div class="label">No Match</div><div class="value">{int(stats.NoMatch or 0)}</div><div class="trend">No clear PO found</div></a>
+            <a class="card kpi status-card" href="/missing-po-review?status=Needs+Review"><div class="label">Needs Review</div><div class="value">{int(stats.NeedsReview or 0)}</div><div class="trend">Suggested match needs validation</div></a>
             <a class="card kpi status-card" href="/missing-po-review"><div class="label">Review Amount</div><div class="value">{currency(stats.OpenAmount)}</div><div class="trend">Open review dollar value</div></a>
         </div>
+        {filter_bar}
         <div class="card" id="review-table">
             <h3>Missing PO Review</h3>
-            <p class="card-subtitle">Review expense rows where a PO is missing, uncertain, or needs PM confirmation. This is separate from Data Quality Exceptions.</p>
+            <p class="card-subtitle">PMs can help identify the correct PO; Accounting/Admin controls upload and posting oversight.</p>
             <datalist id="poNumberList">{po_options}</datalist>
             <div class="table-wrap expense-review-table"><table>
-                <tr><th>Status</th><th>Expense</th><th>Project</th><th>Vendor / Purchaser</th><th class="right">Amount</th><th>Description / PM Comments</th><th>Suggested PO</th><th>Review Action</th></tr>
+                <tr><th>Status</th><th>Expense</th><th>Project</th><th>Vendor / Purchaser</th><th class="right">Amount</th><th>Description / PM Comments</th><th>Suggested PO</th><th>Posting</th><th>Review Action</th></tr>
                 {row_html}
             </table></div>
         </div>
@@ -4958,22 +5476,23 @@ def pos_in_pm_comments_page():
         return access_denied_response("POs in PM Comments", reason)
     try:
         ensure_expense_review_tables()
-        conn = get_sql_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT TOP 500 ExpenseReviewItemId, ExpenseId, ProjectName, TxDate, TxType, VendorName,
-                   Amount, PMComments, ExtractedPONumber, MatchedPONumber, CorrectPONumber, MatchStatus,
-                   MatchConfidence, ReviewDecision
-            FROM dbo.ExpenseReviewItems
-            WHERE (COALESCE(ExtractedPONumber, '') <> '' OR COALESCE(MatchedPONumber, '') <> '' OR PMComments LIKE '%PO%')
-              AND COALESCE(PMComments, '') <> ''
-            ORDER BY TxDate DESC, ExpenseReviewItemId DESC;
-            """
-        )
-        rows = cursor.fetchall()
-        conn.close()
-
+        filters = {"project": clean_text(request.args.get("project")) or "", "vendor": clean_text(request.args.get("vendor")) or "", "po": clean_text(request.args.get("po")) or "", "status": clean_text(request.args.get("status")) or "", "decision": clean_text(request.args.get("decision")) or "", "search": clean_text(request.args.get("search")) or ""}
+        where = ["(COALESCE(ExtractedPONumber, '') <> '' OR COALESCE(MatchedPONumber, '') <> '' OR PMComments LIKE '%PO%')", "COALESCE(PMComments, '') <> ''"]
+        params = []
+        add_like_filter(where, params, "ProjectName", filters["project"])
+        add_like_filter(where, params, "VendorName", filters["vendor"])
+        add_like_filter(where, params, "MatchStatus", filters["status"])
+        add_like_filter(where, params, "ReviewDecision", filters["decision"])
+        if filters["po"]:
+            where.append("LOWER(COALESCE(CorrectPONumber, MatchedPONumber, ExtractedPONumber, '')) LIKE LOWER(?)")
+            params.append("%" + filters["po"] + "%")
+        if filters["search"]:
+            where.append("LOWER(CONCAT(COALESCE(ExpenseId,''), ' ', COALESCE(ProjectName,''), ' ', COALESCE(VendorName,''), ' ', COALESCE(PMComments,''))) LIKE LOWER(?)")
+            params.append("%" + filters["search"] + "%")
+        where_sql = "WHERE " + " AND ".join(where)
+        conn = get_sql_connection(); cursor = conn.cursor()
+        cursor.execute(f"""SELECT TOP 500 ExpenseReviewItemId, ExpenseId, ProjectName, TxDate, TxType, VendorName, Amount, PMComments, ExtractedPONumber, MatchedPONumber, CorrectPONumber, MatchStatus, MatchConfidence, ReviewDecision, PostedToPO, PostedPONumber, PostedAmount, PostedAt, PostedBy, IsDuplicate FROM dbo.ExpenseReviewItems {where_sql} ORDER BY TxDate DESC, ExpenseReviewItemId DESC;""", *params)
+        rows = cursor.fetchall(); conn.close()
         total_amount = sum(float(r.Amount or 0) for r in rows)
         unique_pos = len(set(str(r.CorrectPONumber or r.MatchedPONumber or r.ExtractedPONumber or '').strip() for r in rows if str(r.CorrectPONumber or r.MatchedPONumber or r.ExtractedPONumber or '').strip()))
         table_rows = ""
@@ -4981,29 +5500,16 @@ def pos_in_pm_comments_page():
             po_number = r.CorrectPONumber or r.MatchedPONumber or r.ExtractedPONumber or ""
             po_link = f'<a href="/po-detail?po_number={quote_plus(str(po_number))}">{h(po_number)}</a>' if po_number else ""
             status_class = str(r.MatchStatus or "").lower().replace(" ", "-")
-            table_rows += f"""
-            <tr>
-                <td><span class="status-chip {h(status_class)}">{h(r.MatchStatus)}</span><br><small>{h(r.MatchConfidence)}</small></td>
-                <td><strong>{h(r.ExpenseId or r.ExpenseReviewItemId)}</strong><br><small>{h(r.TxDate)}</small></td>
-                <td>{h(r.ProjectName)}</td>
-                <td>{h(r.VendorName)}<br><small>{h(r.TxType)}</small></td>
-                <td class="right">{currency(r.Amount)}</td>
-                <td>{h(r.PMComments)}</td>
-                <td>{po_link}</td>
-                <td>{h(r.ReviewDecision)}</td>
-            </tr>
-            """
+            table_rows += f"""<tr><td><span class="status-chip {h(status_class)}">{h(r.MatchStatus)}</span><br>{posting_status_chip(r)}<br><small>{h(r.MatchConfidence)}</small></td><td><strong>{h(r.ExpenseId or r.ExpenseReviewItemId)}</strong><br><small>{h(r.TxDate)}</small></td><td>{h(r.ProjectName)}</td><td>{h(r.VendorName)}<br><small>{h(r.TxType)}</small></td><td class="right">{currency(r.Amount)}</td><td>{h(r.PMComments)}</td><td>{po_link}</td><td>{h(r.ReviewDecision)}</td><td class="posting-audit-cell">{h(posting_reason(r))}<br><small>{h(r.PostedBy or '')} {h(r.PostedAt or '')}</small></td></tr>"""
         if not table_rows:
-            table_rows = '<tr><td colspan="8"><div class="empty-state"><strong>No PO references found in PM comments yet.</strong><span>Rows will appear after expense uploads identify PO numbers in PM Comments.</span></div></td></tr>'
-
+            table_rows = '<tr><td colspan="9"><div class="empty-state"><strong>No PO references found in PM comments.</strong><span>Adjust filters or upload expenses with PM comments.</span></div></td></tr>'
+        filter_bar = build_simple_filter_bar(filters, "/pos-in-pm-comments", [("project", "Project", "Project name/code"), ("vendor", "Vendor", "Vendor or purchaser"), ("po", "PO", "PO number"), ("status", "Match Status", "Auto Matched..."), ("decision", "Decision", "Matched to PO..."), ("search", "Search", "PM comments")])
         content = f"""
-        <div class="grid kpis">
-            <div class="card kpi"><div class="label">Rows Found</div><div class="value">{len(rows)}</div><div class="trend">PM comments with PO-like references</div></div>
-            <div class="card kpi"><div class="label">Unique POs</div><div class="value">{unique_pos}</div><div class="trend">Referenced or matched POs</div></div>
-            <div class="card kpi"><div class="label">Referenced Amount</div><div class="value">{currency(total_amount)}</div><div class="trend">Expense rows shown below</div></div>
-            <a class="card kpi status-card" href="/missing-po-review"><div class="label">Review Queue</div><div class="value">Open</div><div class="trend">Validate uncertain matches</div></a>
-        </div>
-        <div class="card"><h3>POs in PM Comments</h3><p class="card-subtitle">Expense rows where PO numbers or PO-like references were found in PM Comments.</p><div class="table-wrap"><table><tr><th>Status</th><th>Expense</th><th>Project</th><th>Vendor / Purchaser</th><th class="right">Amount</th><th>PM Comments</th><th>PO Reference</th><th>Decision</th></tr>{table_rows}</table></div></div>
+        {latest_data_freshness_banner()}
+        <div class="notice info"><strong>PM Comment PO references:</strong> This page shows possible PO references found in PM Comments. Validate uncertain rows before relying on them for balance reporting.</div>
+        <div class="grid kpis"><div class="card kpi"><div class="label">Rows Found</div><div class="value">{len(rows)}</div><div class="trend">PM comments with PO-like references</div></div><div class="card kpi"><div class="label">Unique POs</div><div class="value">{unique_pos}</div><div class="trend">Referenced or matched POs</div></div><div class="card kpi"><div class="label">Referenced Amount</div><div class="value">{currency(total_amount)}</div><div class="trend">Filtered expense rows</div></div><a class="card kpi status-card" href="/missing-po-review"><div class="label">Review Queue</div><div class="value">Open</div><div class="trend">Validate uncertain matches</div></a></div>
+        {filter_bar}
+        <div class="card"><h3>POs in PM Comments</h3><p class="card-subtitle">Expense rows where PO numbers or PO-like references were found in PM Comments.</p><div class="table-wrap"><table><tr><th>Status</th><th>Expense</th><th>Project</th><th>Vendor / Purchaser</th><th class="right">Amount</th><th>PM Comments</th><th>PO Reference</th><th>Decision</th><th>Posting</th></tr>{table_rows}</table></div></div>
         """
         return shell("POs in PM Comments", "Rows where PO references were found in PM Comments.", "POs in PM Comments", content)
     except Exception as e:
@@ -5030,7 +5536,9 @@ def download_expense_upload_template():
 def expense_review_update():
     allowed, reason = require_page_access("Expense Upload / PO Matching")
     if not allowed:
-        return access_denied_response("Expense Upload / PO Matching", reason)
+        allowed, reason = require_page_access("Missing PO Review")
+    if not allowed:
+        return access_denied_response("Missing PO Review", reason)
     ensure_expense_review_tables()
     item_id = request.form.get("item_id")
     decision = clean_text(request.form.get("review_decision")) or "Pending Review"
@@ -5050,21 +5558,55 @@ def expense_review_update():
 
     conn = get_sql_connection()
     cursor = conn.cursor()
+    reviewer_email = get_current_user()["email"] or "Manual Review"
     cursor.execute(
         """
         UPDATE dbo.ExpenseReviewItems
-        SET ReviewDecision = ?, CorrectPONumber = ?, ReviewerNotes = ?, MatchStatus = ?, UpdatedAt = SYSUTCDATETIME()
+        SET ReviewDecision = ?, CorrectPONumber = ?, ReviewerNotes = ?, MatchStatus = ?,
+            ReviewerEmail = ?, ReviewedAt = SYSUTCDATETIME(), UpdatedAt = SYSUTCDATETIME()
         WHERE ExpenseReviewItemId = ?;
         """,
         decision,
         correct_po,
         notes,
         new_status,
+        reviewer_email,
+        item_id,
+    )
+    sync_expense_posting(cursor, item_id, posted_by=reviewer_email)
+    conn.commit()
+    conn.close()
+    return redirect(request.headers.get("Referer") or "/expense-upload?saved=1#review-table")
+
+
+@app.route("/expense-review/unpost", methods=["POST"])
+def expense_review_unpost():
+    allowed, reason = require_page_access("Expense Upload / PO Matching")
+    if not allowed:
+        return access_denied_response("Expense Upload / PO Matching", reason)
+    ensure_expense_review_tables()
+    item_id = request.form.get("item_id")
+    reviewer_email = get_current_user()["email"] or "Manual Review"
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE dbo.ExpenseReviewItems
+        SET PostedToPO = 0,
+            PostedPONumber = NULL,
+            PostedAmount = NULL,
+            PostedAt = NULL,
+            PostedBy = NULL,
+            ReviewerNotes = CONCAT(COALESCE(ReviewerNotes, ''), CASE WHEN COALESCE(ReviewerNotes, '') = '' THEN '' ELSE CHAR(10) END, 'Posting reversed by ', ?, ' at ', CONVERT(NVARCHAR(30), SYSUTCDATETIME(), 126)),
+            UpdatedAt = SYSUTCDATETIME()
+        WHERE ExpenseReviewItemId = ?;
+        """,
+        reviewer_email,
         item_id,
     )
     conn.commit()
     conn.close()
-    return redirect("/expense-upload?saved=1#review-table")
+    return redirect(request.headers.get("Referer") or "/expenses")
 
 
 @app.route("/expense-upload", methods=["GET", "POST"])
