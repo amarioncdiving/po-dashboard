@@ -85,6 +85,7 @@ PAGE_ACCESS = {
     "PO List": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "PO Detail": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "Upload Issued POs": ["Admin", "Accounting"],
+    "Expense Upload / PO Matching": ["Admin", "Accounting"],
     "Import History": ["Admin", "Accounting"],
     "Exceptions": ["Admin", "Executive", "Accounting"],
     "Exports": ["Admin", "Executive", "Accounting"],
@@ -703,6 +704,306 @@ def import_po_rows(rows, filename):
 
     finally:
         conn.close()
+
+
+# ------------------------------------------------------------
+# Expense upload / PO matching helpers
+# ------------------------------------------------------------
+
+REQUIRED_EXPENSE_COLUMNS = [
+    "ExpenseId",
+    "ProjectName",
+    "TxDate",
+    "TxType",
+    "VendorName",
+    "Amount",
+    "Description",
+    "PMComments",
+]
+
+
+def row_value(row, aliases):
+    """Return the first populated value from a row using several possible column names."""
+    normalized = {str(k or "").strip().lower(): v for k, v in row.items()}
+    for alias in aliases:
+        key = alias.strip().lower()
+        if key in normalized and normalized[key] not in [None, ""]:
+            return normalized[key]
+    return None
+
+
+def compact_match_text(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def ensure_expense_review_tables():
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        IF OBJECT_ID('dbo.ExpenseUploadBatches', 'U') IS NULL
+        BEGIN
+            CREATE TABLE dbo.ExpenseUploadBatches (
+                ExpenseBatchId INT IDENTITY(1,1) PRIMARY KEY,
+                FileName NVARCHAR(255) NOT NULL,
+                UploadedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+                UploadedBy NVARCHAR(255) NULL,
+                TotalRows INT NOT NULL DEFAULT 0,
+                AutoMatchedCount INT NOT NULL DEFAULT 0,
+                NeedsReviewCount INT NOT NULL DEFAULT 0,
+                NoMatchCount INT NOT NULL DEFAULT 0,
+                ImportStatus NVARCHAR(100) NOT NULL DEFAULT 'Completed'
+            );
+        END;
+
+        IF OBJECT_ID('dbo.ExpenseReviewItems', 'U') IS NULL
+        BEGIN
+            CREATE TABLE dbo.ExpenseReviewItems (
+                ExpenseReviewItemId INT IDENTITY(1,1) PRIMARY KEY,
+                ExpenseBatchId INT NOT NULL,
+                SourceRowNumber INT NULL,
+                ExpenseId NVARCHAR(100) NULL,
+                ProjectName NVARCHAR(255) NULL,
+                TxDate DATE NULL,
+                TxType NVARCHAR(100) NULL,
+                VendorName NVARCHAR(255) NULL,
+                Description NVARCHAR(MAX) NULL,
+                Amount DECIMAL(18,2) NULL,
+                PMComments NVARCHAR(MAX) NULL,
+                ExtractedPONumber NVARCHAR(100) NULL,
+                MatchedPONumber NVARCHAR(100) NULL,
+                MatchStatus NVARCHAR(100) NOT NULL DEFAULT 'Needs Review',
+                MatchConfidence NVARCHAR(50) NULL,
+                MatchReason NVARCHAR(MAX) NULL,
+                ReviewDecision NVARCHAR(100) NULL,
+                CorrectPONumber NVARCHAR(100) NULL,
+                ReviewerNotes NVARCHAR(MAX) NULL,
+                CreatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+                UpdatedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+            );
+            CREATE INDEX IX_ExpenseReviewItems_Status ON dbo.ExpenseReviewItems(MatchStatus);
+            CREATE INDEX IX_ExpenseReviewItems_Project ON dbo.ExpenseReviewItems(ProjectName);
+            CREATE INDEX IX_ExpenseReviewItems_PO ON dbo.ExpenseReviewItems(MatchedPONumber);
+        END;
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_po_match_candidates(cursor):
+    cursor.execute(
+        """
+        SELECT
+            po.PONumber,
+            COALESCE(v.VendorName, '') AS VendorName,
+            COALESCE(p.ProjectName, '') AS ProjectName,
+            COALESCE(po.RemainingAmount, po.RevisedAmount, po.OriginalAmount, 0) AS RemainingAmount
+        FROM dbo.PurchaseOrders po
+        LEFT JOIN dbo.Vendors v ON po.VendorId = v.VendorId
+        LEFT JOIN dbo.Projects p ON po.ProjectId = p.ProjectId
+        ORDER BY po.PONumber;
+        """
+    )
+    return cursor.fetchall()
+
+
+def choose_expense_match(project_name, vendor_name, amount, pm_comments, po_candidates):
+    comments_key = compact_match_text(pm_comments)
+    project_key = compact_match_text(project_name)
+    vendor_key = compact_match_text(vendor_name)
+    amount_float = float(amount or 0)
+
+    # First: exact PO reference in PM comments.
+    for po in po_candidates:
+        po_number = po.PONumber or ""
+        if po_number and compact_match_text(po_number) and compact_match_text(po_number) in comments_key:
+            return {
+                "status": "Auto Matched",
+                "confidence": "High",
+                "extracted_po": po_number,
+                "matched_po": po_number,
+                "reason": "PO number was found directly in PM Comments.",
+            }
+
+    # Second: a project + vendor candidate. This should be reviewed before it affects balances.
+    candidate_matches = []
+    for po in po_candidates:
+        po_project = compact_match_text(po.ProjectName)
+        po_vendor = compact_match_text(po.VendorName)
+        project_match = bool(project_key and (project_key in po_project or po_project in project_key))
+        vendor_match = bool(vendor_key and (vendor_key in po_vendor or po_vendor in vendor_key))
+        if project_match and vendor_match:
+            candidate_matches.append(po)
+
+    if len(candidate_matches) == 1:
+        po = candidate_matches[0]
+        remaining = float(po.RemainingAmount or 0)
+        amount_note = " Remaining balance appears sufficient." if remaining >= amount_float else " Remaining balance may be insufficient."
+        return {
+            "status": "Needs Review",
+            "confidence": "Medium",
+            "extracted_po": "",
+            "matched_po": po.PONumber,
+            "reason": "One PO matched by project and vendor." + amount_note,
+        }
+
+    if len(candidate_matches) > 1:
+        return {
+            "status": "Needs Review",
+            "confidence": "Low",
+            "extracted_po": "",
+            "matched_po": "",
+            "reason": f"{len(candidate_matches)} possible POs matched by project/vendor. Select the correct PO manually.",
+        }
+
+    # Fallback: try to extract a PO-looking token from comments so the reviewer can see it.
+    extracted = ""
+    token_match = re.search(r"\b(?:PO[-\s#:]*)?([A-Z]{0,3}-?\d{2,3}-\d{3}(?:-\d{3})?)\b", str(pm_comments or ""), re.IGNORECASE)
+    if token_match:
+        extracted = token_match.group(1).upper()
+
+    return {
+        "status": "No Match",
+        "confidence": "None",
+        "extracted_po": extracted,
+        "matched_po": "",
+        "reason": "No exact PO comment match or unique project/vendor PO match was found.",
+    }
+
+
+def import_expense_rows(rows, filename):
+    ensure_expense_review_tables()
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+    try:
+        po_candidates = load_po_match_candidates(cursor)
+        cursor.execute(
+            """
+            INSERT INTO dbo.ExpenseUploadBatches (FileName, UploadedBy, TotalRows, ImportStatus)
+            OUTPUT INSERTED.ExpenseBatchId
+            VALUES (?, ?, ?, 'Completed')
+            """,
+            filename,
+            get_current_user()["email"] or "Manual Upload",
+            len(rows),
+        )
+        batch_id = cursor.fetchone().ExpenseBatchId
+        counts = {"Auto Matched": 0, "Needs Review": 0, "No Match": 0}
+
+        for index, row in enumerate(rows, start=2):
+            expense_id = clean_text(row_value(row, ["ExpenseId", "Expense ID", "Transaction ID", "Tx ID", "Track No."]))
+            project_name = clean_text(row_value(row, ["ProjectName", "Project Name", "Project", "Project Short Name", "Project Code"]))
+            tx_date = clean_date(row_value(row, ["TxDate", "Tx Date", "Transaction Date", "Date"]));
+            tx_type = clean_text(row_value(row, ["TxType", "Tx Type", "Transaction Type", "Type"]));
+            vendor_name = clean_text(row_value(row, ["VendorName", "Vendor Name", "Vendor", "Vendor/Purchaser", "Charger Name", "Purchaser"]));
+            description = clean_text(row_value(row, ["Description", "Charge Code", "Memo", "Notes"]));
+            amount = clean_decimal(row_value(row, ["Amount", "Transaction Amount", "Cost", "Total"]));
+            pm_comments = clean_text(row_value(row, ["PMComments", "PM Comments", "Project Manager Comments", "Comments"]));
+
+            match = choose_expense_match(project_name, vendor_name, amount, pm_comments, po_candidates)
+            counts[match["status"]] = counts.get(match["status"], 0) + 1
+            review_decision = "Matched to PO" if match["status"] == "Auto Matched" else "Pending Review"
+
+            cursor.execute(
+                """
+                INSERT INTO dbo.ExpenseReviewItems
+                    (ExpenseBatchId, SourceRowNumber, ExpenseId, ProjectName, TxDate, TxType, VendorName,
+                     Description, Amount, PMComments, ExtractedPONumber, MatchedPONumber, MatchStatus,
+                     MatchConfidence, MatchReason, ReviewDecision, CorrectPONumber)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                batch_id,
+                index,
+                expense_id,
+                project_name,
+                tx_date,
+                tx_type,
+                vendor_name,
+                description,
+                amount,
+                pm_comments,
+                match["extracted_po"],
+                match["matched_po"],
+                match["status"],
+                match["confidence"],
+                match["reason"],
+                review_decision,
+                match["matched_po"] if match["status"] == "Auto Matched" else None,
+            )
+
+        cursor.execute(
+            """
+            UPDATE dbo.ExpenseUploadBatches
+            SET AutoMatchedCount = ?, NeedsReviewCount = ?, NoMatchCount = ?
+            WHERE ExpenseBatchId = ?
+            """,
+            counts.get("Auto Matched", 0),
+            counts.get("Needs Review", 0),
+            counts.get("No Match", 0),
+            batch_id,
+        )
+        conn.commit()
+        return {"batch_id": batch_id, "total_rows": len(rows), "auto": counts.get("Auto Matched", 0), "review": counts.get("Needs Review", 0), "no_match": counts.get("No Match", 0)}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def load_expense_upload_page_data(status_filter="All"):
+    ensure_expense_review_tables()
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT
+            COUNT(*) AS TotalRows,
+            SUM(CASE WHEN MatchStatus = 'Auto Matched' THEN 1 ELSE 0 END) AS AutoMatched,
+            SUM(CASE WHEN MatchStatus = 'Manually Matched' THEN 1 ELSE 0 END) AS ManuallyMatched,
+            SUM(CASE WHEN MatchStatus = 'Needs Review' THEN 1 ELSE 0 END) AS NeedsReview,
+            SUM(CASE WHEN MatchStatus = 'No Match' THEN 1 ELSE 0 END) AS NoMatch,
+            SUM(CASE WHEN ReviewDecision IS NOT NULL AND ReviewDecision <> 'Pending Review' THEN 1 ELSE 0 END) AS ReviewedRows
+        FROM dbo.ExpenseReviewItems;
+        """
+    )
+    stats = cursor.fetchone()
+
+    where = ""
+    params = []
+    if status_filter and status_filter != "All":
+        where = "WHERE MatchStatus = ?"
+        params.append(status_filter)
+
+    cursor.execute(
+        f"""
+        SELECT TOP 250
+            ExpenseReviewItemId, ExpenseBatchId, ExpenseId, ProjectName, TxDate, TxType, VendorName,
+            Description, Amount, PMComments, ExtractedPONumber, MatchedPONumber, MatchStatus,
+            MatchConfidence, MatchReason, ReviewDecision, CorrectPONumber, ReviewerNotes, CreatedAt, UpdatedAt
+        FROM dbo.ExpenseReviewItems
+        {where}
+        ORDER BY CreatedAt DESC, ExpenseReviewItemId DESC;
+        """,
+        *params,
+    )
+    rows = cursor.fetchall()
+
+    cursor.execute(
+        """
+        SELECT TOP 6 ExpenseBatchId, FileName, UploadedAt, UploadedBy, TotalRows,
+               AutoMatchedCount, NeedsReviewCount, NoMatchCount, ImportStatus
+        FROM dbo.ExpenseUploadBatches
+        ORDER BY UploadedAt DESC;
+        """
+    )
+    batches = cursor.fetchall()
+
+    cursor.execute("SELECT PONumber FROM dbo.PurchaseOrders ORDER BY PONumber;")
+    po_numbers = [r.PONumber for r in cursor.fetchall() if r.PONumber]
+    conn.close()
+    return stats, rows, batches, po_numbers
 
 
 # ------------------------------------------------------------
@@ -1905,6 +2206,29 @@ a, a:visited { color:#1d4ed8; }
 }
 .project-filter-select.show { display:block; }
 
+
+/* Expense upload / PO matching */
+.expense-upload-layout { display:grid; grid-template-columns:1fr 1fr; gap:16px; align-items:start; margin-bottom:16px; }
+.expense-review-table table { min-width:1500px; }
+.expense-review-table .comments-cell { max-width:320px; white-space:normal; color:#334155; font-size:12px; line-height:1.35; }
+.expense-review-table .match-reason-cell { max-width:280px; white-space:normal; color:#64748b; font-size:12px; line-height:1.35; }
+.expense-review-table select, .expense-review-table input, .expense-review-table textarea { width:100%; border:1px solid var(--line); border-radius:10px; padding:8px 9px; background:#fff; font-size:12px; }
+.expense-review-table textarea { min-height:58px; resize:vertical; }
+.expense-action-cell { min-width:240px; }
+.expense-match-form { display:grid; gap:7px; }
+.expense-match-form button { width:100%; }
+.expense-batch-list { display:grid; gap:8px; }
+.expense-batch-item { border:1px solid var(--line); border-radius:13px; padding:10px; background:#f8fafc; display:grid; gap:3px; }
+.expense-batch-item strong { font-size:13px; }
+.expense-batch-item span { color:var(--muted); font-size:12px; }
+.status-chip.auto-matched { background:#dcfce7; color:#166534; }
+.status-chip.manually-matched { background:#dbeafe; color:#1e40af; }
+.status-chip.needs-review { background:#fef3c7; color:#92400e; }
+.status-chip.no-match { background:#fee2e2; color:#991b1b; }
+.status-chip.no-po-needed { background:#e2e8f0; color:#334155; }
+.status-chip.needs-pm-review { background:#ede9fe; color:#5b21b6; }
+@media (max-width:1000px) { .expense-upload-layout { grid-template-columns:1fr; } }
+
 </style>
 """
 
@@ -1925,6 +2249,7 @@ def shell(title, subtitle, active, content):
 
     accounting_nav_items = [
         ("Upload Issued POs", "/upload-po", "⬆️"),
+        ("Expense Upload / PO Matching", "/expense-upload", "🧾"),
         ("Import History", "/import-history", "🕘"),
         ("Exceptions", "/exceptions", "🚩"),
         ("Exports", "/exports", "⬇️"),
@@ -2025,7 +2350,7 @@ def shell(title, subtitle, active, content):
 def status_chip(value):
     text = value or "Unknown"
     cls = str(text).lower().replace(" ", "-").replace("/", "-")
-    allowed = {"all", "submitted", "under-review", "needs-more-info", "pending-approval", "approved", "converted-to-po", "rejected", "open", "closed", "needs-pm-info", "needs-forecast-date", "needs-payment-schedule", "assigned-to-pm", "in-progress", "needs-info", "complete", "not-required"}
+    allowed = {"all", "submitted", "under-review", "needs-more-info", "pending-approval", "approved", "converted-to-po", "rejected", "open", "closed", "needs-pm-info", "needs-forecast-date", "needs-payment-schedule", "assigned-to-pm", "in-progress", "needs-info", "complete", "not-required", "auto-matched", "manually-matched", "needs-review", "no-match", "no-po-needed", "needs-pm-review"}
     if cls not in allowed:
         cls = "default"
     return f'<span class="status-chip {cls}">{h(text)}</span>'
@@ -4373,6 +4698,210 @@ def missing_po_review():
     if not allowed:
         return access_denied_response("Missing PO Review", reason)
     return redirect("/project-po-setup")
+
+
+@app.route("/download-expense-upload-template.csv")
+def download_expense_upload_template():
+    allowed, reason = require_page_access("Expense Upload / PO Matching")
+    if not allowed:
+        return access_denied_response("Expense Upload / PO Matching", reason)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(REQUIRED_EXPENSE_COLUMNS)
+    writer.writerow(["EXP-1001", "Example Project", "2026-06-22", "Purchase", "Example Vendor", "1250.00", "Materials or service description", "PM comment with PO-XX-XXX-001 if available"])
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=unanet_expense_upload_template.csv"},
+    )
+
+
+@app.route("/expense-review/update", methods=["POST"])
+def expense_review_update():
+    allowed, reason = require_page_access("Expense Upload / PO Matching")
+    if not allowed:
+        return access_denied_response("Expense Upload / PO Matching", reason)
+    ensure_expense_review_tables()
+    item_id = request.form.get("item_id")
+    decision = clean_text(request.form.get("review_decision")) or "Pending Review"
+    correct_po = clean_text(request.form.get("correct_po_number"))
+    notes = clean_text(request.form.get("reviewer_notes"))
+    new_status = None
+    if decision == "Matched to PO" and correct_po:
+        new_status = "Manually Matched"
+    elif decision == "No PO Needed":
+        new_status = "No PO Needed"
+    elif decision == "Needs PM Review":
+        new_status = "Needs PM Review"
+    elif decision == "Hold for More Info":
+        new_status = "Needs Review"
+    else:
+        new_status = "Needs Review"
+
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE dbo.ExpenseReviewItems
+        SET ReviewDecision = ?, CorrectPONumber = ?, ReviewerNotes = ?, MatchStatus = ?, UpdatedAt = SYSUTCDATETIME()
+        WHERE ExpenseReviewItemId = ?;
+        """,
+        decision,
+        correct_po,
+        notes,
+        new_status,
+        item_id,
+    )
+    conn.commit()
+    conn.close()
+    return redirect("/expense-upload?saved=1#review-table")
+
+
+@app.route("/expense-upload", methods=["GET", "POST"])
+def expense_upload():
+    allowed, reason = require_page_access("Expense Upload / PO Matching")
+    if not allowed:
+        return access_denied_response("Expense Upload / PO Matching", reason)
+
+    message_html = ""
+    try:
+        ensure_expense_review_tables()
+        if request.method == "POST":
+            uploaded_file = request.files.get("expense_file")
+            if not uploaded_file or uploaded_file.filename == "":
+                message_html = '<div class="notice error">Please choose a Unanet expense file to upload.</div>'
+            else:
+                rows = read_uploaded_po_file(uploaded_file)
+                result = import_expense_rows(rows, uploaded_file.filename)
+                message_html = f"""
+                <div class="notice success">
+                    Expense upload processed. Batch {h(result['batch_id'])}: {h(result['total_rows'])} rows, {h(result['auto'])} auto matched, {h(result['review'])} need review, {h(result['no_match'])} no match.
+                </div>
+                """
+        elif request.args.get("saved"):
+            message_html = '<div class="notice success">Expense review action saved.</div>'
+
+        status_filter = request.args.get("status", "All")
+        stats, rows, batches, po_numbers = load_expense_upload_page_data(status_filter)
+        total_rows = stats.TotalRows or 0
+        auto_matched = stats.AutoMatched or 0
+        manually_matched = stats.ManuallyMatched or 0
+        needs_review = stats.NeedsReview or 0
+        no_match = stats.NoMatch or 0
+        reviewed_rows = stats.ReviewedRows or 0
+
+        def status_card(label, value, status, tone, sub):
+            active_cls = " active" if status_filter == status else ""
+            href = "/expense-upload" if status == "All" else "/expense-upload?status=" + quote_plus(status)
+            return f'<a class="status-card {tone}{active_cls}" href="{href}"><div class="label">{h(label)}</div><div class="value">{h(value)}</div><div class="trend">{h(sub)}</div></a>'
+
+        kpi_html = f"""
+        <div class="status-card-grid">
+            {status_card('All Rows', total_rows, 'All', 'blue', 'Uploaded expense rows')}
+            {status_card('Auto Matched', auto_matched, 'Auto Matched', 'green', 'PO found in comments')}
+            {status_card('Manual Matches', manually_matched, 'Manually Matched', 'blue', 'Reviewed and linked')}
+            {status_card('Needs Review', needs_review, 'Needs Review', 'amber', 'Possible match or unclear')}
+            {status_card('No Match', no_match, 'No Match', 'red', 'Needs PO decision')}
+            {status_card('Reviewed', reviewed_rows, 'All', 'slate', 'Rows with decisions')}
+        </div>
+        """
+
+        batch_html = ""
+        if batches:
+            batch_html = "".join(
+                f"""
+                <div class="expense-batch-item">
+                    <strong>Batch {h(b.ExpenseBatchId)} · {h(b.FileName)}</strong>
+                    <span>{h(b.UploadedAt)} · {h(b.TotalRows)} rows · {h(b.AutoMatchedCount)} auto · {h(b.NeedsReviewCount)} review · {h(b.NoMatchCount)} no match</span>
+                </div>
+                """ for b in batches
+            )
+        else:
+            batch_html = '<div class="empty-state"><strong>No expense uploads yet.</strong><span>Upload a Unanet expense file to begin matching expenses to POs.</span></div>'
+
+        po_options = "".join(f'<option value="{h(po)}"></option>' for po in po_numbers)
+        decision_options = ["Pending Review", "Matched to PO", "No PO Needed", "Needs PM Review", "Hold for More Info"]
+        table_rows = ""
+        if rows:
+            for r in rows:
+                current_po = r.CorrectPONumber or r.MatchedPONumber or r.ExtractedPONumber or ""
+                decision_select = "".join(f'<option value="{h(opt)}" {"selected" if (r.ReviewDecision or "Pending Review") == opt else ""}>{h(opt)}</option>' for opt in decision_options)
+                table_rows += f"""
+                <tr>
+                    <td>{status_chip(r.MatchStatus)}<div class="muted">{h(r.MatchConfidence or '')}</div></td>
+                    <td><strong>{h(r.ExpenseId or 'Expense')}</strong><div class="muted">{h(r.TxDate or '')} · {h(r.TxType or '')}</div></td>
+                    <td>{h(r.ProjectName)}</td>
+                    <td>{h(r.VendorName)}</td>
+                    <td class="right">{currency(r.Amount)}</td>
+                    <td class="comments-cell">{h(r.PMComments or r.Description or '')}</td>
+                    <td>{h(r.ExtractedPONumber or '')}</td>
+                    <td><strong>{h(r.MatchedPONumber or '')}</strong><div class="match-reason-cell">{h(r.MatchReason or '')}</div></td>
+                    <td class="expense-action-cell">
+                        <form class="expense-match-form" method="post" action="/expense-review/update">
+                            <input type="hidden" name="item_id" value="{h(r.ExpenseReviewItemId)}">
+                            <select name="review_decision">{decision_select}</select>
+                            <input name="correct_po_number" list="poNumberList" placeholder="Correct PO number" value="{h(current_po)}">
+                            <textarea name="reviewer_notes" placeholder="Reviewer notes">{h(r.ReviewerNotes or '')}</textarea>
+                            <button type="submit" class="primary mini">Save Review</button>
+                        </form>
+                    </td>
+                </tr>
+                """
+        else:
+            table_rows = '<tr><td colspan="9"><div class="empty-state"><strong>No expense rows found.</strong><span>Upload a file or clear the status filter.</span></div></td></tr>'
+
+        content = f"""
+        {message_html}
+        {kpi_html}
+        <div class="expense-upload-layout">
+            <div class="card">
+                <h3>Upload Unanet Expense File</h3>
+                <p class="card-subtitle">Upload a CSV or Excel file exported from Unanet. The app will look for PO numbers in PM Comments and suggest PO matches by project/vendor when possible.</p>
+                <form method="post" enctype="multipart/form-data">
+                    <div class="form-field full">
+                        <label>Unanet expense file</label>
+                        <input type="file" name="expense_file" accept=".csv,.xlsx" required>
+                    </div>
+                    <div class="request-actions" style="justify-content:flex-start;">
+                        <button class="primary" type="submit">Upload and Match Expenses</button>
+                        <a class="button" href="/download-expense-upload-template.csv">Download CSV Template</a>
+                    </div>
+                </form>
+            </div>
+            <div class="card">
+                <h3>Recent Expense Uploads</h3>
+                <p class="card-subtitle">Latest expense batches and match results.</p>
+                <div class="expense-batch-list">{batch_html}</div>
+            </div>
+        </div>
+        <div class="card" id="review-table">
+            <h3>Expense Review Queue</h3>
+            <p class="card-subtitle">Review auto matches, choose the correct PO when needed, or mark rows as no PO needed / needs PM review. This page records the match decision; balance-posting can be added as a controlled next step.</p>
+            <datalist id="poNumberList">{po_options}</datalist>
+            <div class="table-wrap expense-review-table">
+                <table>
+                    <tr>
+                        <th>Status</th><th>Expense</th><th>Project</th><th>Vendor / Purchaser</th><th class="right">Amount</th><th>PM Comments / Description</th><th>Extracted PO</th><th>Suggested / Matched PO</th><th>Review Action</th>
+                    </tr>
+                    {table_rows}
+                </table>
+            </div>
+        </div>
+        <div class="card">
+            <h3>Workflow</h3>
+            <div class="timeline">
+                <div class="timeline-item"><strong>1. Upload Unanet expenses</strong><span>Accounting uploads a CSV/XLSX expense export.</span></div>
+                <div class="timeline-item"><strong>2. Auto-match where safe</strong><span>Rows with an issued PO number in PM Comments are marked Auto Matched.</span></div>
+                <div class="timeline-item"><strong>3. Review uncertain rows</strong><span>Project/vendor matches and no-match rows are reviewed manually.</span></div>
+                <div class="timeline-item"><strong>4. Confirm PO decision</strong><span>The reviewed PO number or no-PO-needed decision becomes the audit trail for future balance updates.</span></div>
+            </div>
+        </div>
+        """
+        return shell("Expense Upload / PO Matching", "Upload Unanet expenses, review matches, and link transactions to issued POs.", "Expense Upload / PO Matching", content)
+    except Exception as e:
+        content = f'<div class="notice error">Error loading Expense Upload / PO Matching: {h(e)}</div>'
+        return shell("Expense Upload / PO Matching", "Unable to load expense matching page.", "Expense Upload / PO Matching", content), 500
+
 
 @app.route("/download-issued-po-template.csv")
 def download_issued_po_template():
