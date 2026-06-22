@@ -86,6 +86,10 @@ PAGE_ACCESS = {
     "PO Detail": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "Upload Issued POs": ["Admin", "Accounting"],
     "Expense Upload / PO Matching": ["Admin", "Accounting"],
+    "Expenses": ["Admin", "Executive", "Accounting", "Project Manager"],
+    "Missing PO Review": ["Admin", "Executive", "Accounting", "Project Manager"],
+    "Vendors": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
+    "POs in PM Comments": ["Admin", "Executive", "Accounting", "Project Manager"],
     "Import History": ["Admin", "Accounting"],
     "Exceptions": ["Admin", "Executive", "Accounting"],
     "Exports": ["Admin", "Executive", "Accounting"],
@@ -109,6 +113,11 @@ def currency(value):
         return "${:,.2f}".format(float(value or 0))
     except Exception:
         return "$0.00"
+
+
+def select_option(value, selected_value):
+    selected = " selected" if str(value or "") == str(selected_value or "") else ""
+    return f'<option value="{h(value)}"{selected}>{h(value)}</option>'
 
 
 def get_sql_connection():
@@ -2250,6 +2259,10 @@ def shell(title, subtitle, active, content):
     accounting_nav_items = [
         ("Upload Issued POs", "/upload-po", "⬆️"),
         ("Expense Upload / PO Matching", "/expense-upload", "🧾"),
+        ("Expenses", "/expenses", "📄"),
+        ("Missing PO Review", "/missing-po-review", "⚠️"),
+        ("Vendors", "/vendors", "🏢"),
+        ("POs in PM Comments", "/pos-in-pm-comments", "🔎"),
         ("Import History", "/import-history", "🕘"),
         ("Exceptions", "/exceptions", "🚩"),
         ("Exports", "/exports", "⬇️"),
@@ -4692,12 +4705,309 @@ def project_po_setup():
         return shell("PO Info Review", "Unable to load setup queue.", "PO Info Review", content), 500
 
 
+@app.route("/expenses")
+def expenses_page():
+    allowed, reason = require_page_access("Expenses")
+    if not allowed:
+        return access_denied_response("Expenses", reason)
+    try:
+        ensure_expense_review_tables()
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) AS TotalRows,
+                SUM(CASE WHEN MatchStatus IN ('Auto Matched','Manually Matched') THEN 1 ELSE 0 END) AS MatchedRows,
+                SUM(CASE WHEN MatchStatus IN ('Needs Review','No Match') THEN 1 ELSE 0 END) AS ReviewRows,
+                SUM(COALESCE(Amount, 0)) AS TotalAmount
+            FROM dbo.ExpenseReviewItems;
+            """
+        )
+        stats = cursor.fetchone()
+        cursor.execute(
+            """
+            SELECT TOP 750 ExpenseReviewItemId, ExpenseId, ProjectName, TxDate, TxType, VendorName,
+                   Description, Amount, PMComments, ExtractedPONumber, MatchedPONumber, MatchStatus,
+                   MatchConfidence, ReviewDecision, CorrectPONumber
+            FROM dbo.ExpenseReviewItems
+            ORDER BY TxDate DESC, ExpenseReviewItemId DESC;
+            """
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        table_rows = ""
+        for r in rows:
+            status_class = str(r.MatchStatus or "").lower().replace(" ", "-")
+            po_number = r.CorrectPONumber or r.MatchedPONumber or r.ExtractedPONumber or ""
+            po_link = f'<a href="/po-detail?po_number={quote_plus(str(po_number))}">{h(po_number)}</a>' if po_number else ""
+            table_rows += f"""
+            <tr>
+                <td><span class="status-chip {h(status_class)}">{h(r.MatchStatus)}</span><br><small>{h(r.MatchConfidence)}</small></td>
+                <td><strong>{h(r.ExpenseId or r.ExpenseReviewItemId)}</strong><br><small>{h(r.TxDate)}</small></td>
+                <td>{h(r.ProjectName)}</td>
+                <td>{h(r.TxType)}</td>
+                <td>{h(r.VendorName)}</td>
+                <td class="right">{currency(r.Amount)}</td>
+                <td>{h(r.Description)}<br><small>{h(r.PMComments)}</small></td>
+                <td>{po_link}</td>
+                <td>{h(r.ReviewDecision)}</td>
+            </tr>
+            """
+        if not table_rows:
+            table_rows = '<tr><td colspan="9"><div class="empty-state"><strong>No expenses loaded yet.</strong><span>Upload a Unanet expense file from Expense Upload / PO Matching.</span></div></td></tr>'
+
+        content = f"""
+        <div class="grid kpis">
+            <a class="card kpi status-card" href="/expense-upload"><div class="label">Expense Rows</div><div class="value">{int(stats.TotalRows or 0)}</div><div class="trend">Imported from Unanet uploads</div></a>
+            <a class="card kpi status-card" href="/expenses"><div class="label">Expense Amount</div><div class="value">{currency(stats.TotalAmount)}</div><div class="trend">Total uploaded expense value</div></a>
+            <a class="card kpi status-card" href="/pos-in-pm-comments"><div class="label">Matched / Linked</div><div class="value">{int(stats.MatchedRows or 0)}</div><div class="trend">Auto or manually matched rows</div></a>
+            <a class="card kpi status-card" href="/missing-po-review"><div class="label">Needs Review</div><div class="value">{int(stats.ReviewRows or 0)}</div><div class="trend">Rows needing PO decision</div></a>
+        </div>
+        <div class="card">
+            <h3>Expenses</h3>
+            <p class="card-subtitle">Imported Unanet expense rows. Use this page as the full expense ledger view; use Expense Upload / PO Matching for upload and row-level matching decisions.</p>
+            <div class="table-wrap"><table id="expensesTable">
+                <tr><th>Status</th><th>Expense</th><th>Project</th><th>Type</th><th>Vendor / Purchaser</th><th class="right">Amount</th><th>Description / PM Comments</th><th>PO</th><th>Decision</th></tr>
+                {table_rows}
+            </table></div>
+        </div>
+        """
+        return shell("Expenses", "Imported Unanet expense rows and PO match status.", "Expenses", content)
+    except Exception as e:
+        return shell("Expenses", "Unable to load expenses.", "Expenses", f'<div class="notice error">Error loading Expenses: {h(e)}</div>'), 500
+
+
 @app.route("/missing-po-review")
 def missing_po_review():
     allowed, reason = require_page_access("Missing PO Review")
     if not allowed:
         return access_denied_response("Missing PO Review", reason)
-    return redirect("/project-po-setup")
+    try:
+        ensure_expense_review_tables()
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT PONumber FROM dbo.PurchaseOrders WHERE PONumber IS NOT NULL ORDER BY PONumber")
+        po_numbers = [row.PONumber for row in cursor.fetchall()]
+        cursor.execute(
+            """
+            SELECT TOP 500 ExpenseReviewItemId, ExpenseId, ProjectName, TxDate, TxType, VendorName,
+                   Description, Amount, PMComments, ExtractedPONumber, MatchedPONumber, MatchStatus,
+                   MatchConfidence, MatchReason, ReviewDecision, CorrectPONumber, ReviewerNotes
+            FROM dbo.ExpenseReviewItems
+            WHERE COALESCE(ReviewDecision, 'Pending Review') IN ('Pending Review','Needs PM Review','Hold for More Info')
+               OR MatchStatus IN ('Needs Review','No Match')
+            ORDER BY
+                CASE WHEN MatchStatus = 'No Match' THEN 0 WHEN MatchStatus = 'Needs Review' THEN 1 ELSE 2 END,
+                ABS(COALESCE(Amount,0)) DESC,
+                ExpenseReviewItemId DESC;
+            """
+        )
+        rows = cursor.fetchall()
+        cursor.execute(
+            """
+            SELECT
+                COUNT(*) AS TotalOpen,
+                SUM(CASE WHEN MatchStatus = 'No Match' THEN 1 ELSE 0 END) AS NoMatch,
+                SUM(CASE WHEN MatchStatus = 'Needs Review' THEN 1 ELSE 0 END) AS NeedsReview,
+                SUM(CASE WHEN ABS(COALESCE(Amount,0)) >= 1000 THEN 1 ELSE 0 END) AS HighDollar,
+                SUM(COALESCE(Amount, 0)) AS OpenAmount
+            FROM dbo.ExpenseReviewItems
+            WHERE COALESCE(ReviewDecision, 'Pending Review') IN ('Pending Review','Needs PM Review','Hold for More Info')
+               OR MatchStatus IN ('Needs Review','No Match');
+            """
+        )
+        stats = cursor.fetchone()
+        conn.close()
+
+        po_options = "".join(f'<option value="{h(po)}">' for po in po_numbers)
+        row_html = ""
+        for r in rows:
+            suggested = r.MatchedPONumber or r.ExtractedPONumber or ""
+            status_class = str(r.MatchStatus or "").lower().replace(" ", "-")
+            row_html += f"""
+            <tr>
+                <td><span class="status-chip {h(status_class)}">{h(r.MatchStatus)}</span><br><small>{h(r.MatchConfidence)}</small></td>
+                <td><strong>{h(r.ExpenseId or r.ExpenseReviewItemId)}</strong><br><small>{h(r.TxDate)}</small></td>
+                <td>{h(r.ProjectName)}</td>
+                <td>{h(r.VendorName)}<br><small>{h(r.TxType)}</small></td>
+                <td class="right">{currency(r.Amount)}</td>
+                <td>{h(r.Description)}<br><small>{h(r.PMComments)}</small></td>
+                <td>{h(suggested)}<br><small>{h(r.MatchReason)}</small></td>
+                <td class="expense-action-cell">
+                    <form class="expense-match-form" method="post" action="/expense-review/update">
+                        <input type="hidden" name="item_id" value="{h(r.ExpenseReviewItemId)}">
+                        <input list="poNumberList" name="correct_po_number" value="{h(r.CorrectPONumber or suggested)}" placeholder="Correct PO number">
+                        <select name="review_decision">
+                            {select_option('Pending Review', r.ReviewDecision or 'Pending Review')}
+                            {select_option('Matched to PO', r.ReviewDecision or 'Pending Review')}
+                            {select_option('No PO Needed', r.ReviewDecision or 'Pending Review')}
+                            {select_option('Needs PM Review', r.ReviewDecision or 'Pending Review')}
+                            {select_option('Hold for More Info', r.ReviewDecision or 'Pending Review')}
+                        </select>
+                        <textarea name="reviewer_notes" placeholder="Reviewer notes">{h(r.ReviewerNotes)}</textarea>
+                        <button class="primary" type="submit">Save Decision</button>
+                    </form>
+                </td>
+            </tr>
+            """
+        if not row_html:
+            row_html = '<tr><td colspan="8"><div class="empty-state"><strong>No missing PO review items.</strong><span>Rows needing PO decisions will appear here after expense uploads.</span></div></td></tr>'
+
+        content = f"""
+        <div class="grid kpis">
+            <a class="card kpi status-card" href="/missing-po-review"><div class="label">Open Review Items</div><div class="value">{int(stats.TotalOpen or 0)}</div><div class="trend">Rows needing PO decision</div></a>
+            <a class="card kpi status-card" href="/missing-po-review"><div class="label">No Match</div><div class="value">{int(stats.NoMatch or 0)}</div><div class="trend">No clear PO found</div></a>
+            <a class="card kpi status-card" href="/missing-po-review"><div class="label">Needs Review</div><div class="value">{int(stats.NeedsReview or 0)}</div><div class="trend">Suggested match needs validation</div></a>
+            <a class="card kpi status-card" href="/missing-po-review"><div class="label">Review Amount</div><div class="value">{currency(stats.OpenAmount)}</div><div class="trend">Open review dollar value</div></a>
+        </div>
+        <div class="card" id="review-table">
+            <h3>Missing PO Review</h3>
+            <p class="card-subtitle">Review expense rows where a PO is missing, uncertain, or needs PM confirmation. This is separate from Data Quality Exceptions.</p>
+            <datalist id="poNumberList">{po_options}</datalist>
+            <div class="table-wrap expense-review-table"><table>
+                <tr><th>Status</th><th>Expense</th><th>Project</th><th>Vendor / Purchaser</th><th class="right">Amount</th><th>Description / PM Comments</th><th>Suggested PO</th><th>Review Action</th></tr>
+                {row_html}
+            </table></div>
+        </div>
+        """
+        return shell("Missing PO Review", "Expense rows that need a PO decision.", "Missing PO Review", content)
+    except Exception as e:
+        return shell("Missing PO Review", "Unable to load missing PO review.", "Missing PO Review", f'<div class="notice error">Error loading Missing PO Review: {h(e)}</div>'), 500
+
+
+@app.route("/vendors")
+def vendors_page():
+    allowed, reason = require_page_access("Vendors")
+    if not allowed:
+        return access_denied_response("Vendors", reason)
+    try:
+        ensure_expense_review_tables()
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            WITH POVendors AS (
+                SELECT COALESCE(v.VendorName, 'Missing Vendor') AS VendorName,
+                       COUNT(DISTINCT po.PONumber) AS POCount,
+                       SUM(COALESCE(po.RevisedAmount, po.OriginalAmount, 0)) AS POAmount,
+                       SUM(COALESCE(po.RemainingAmount, COALESCE(po.RevisedAmount, po.OriginalAmount, 0))) AS RemainingAmount
+                FROM dbo.PurchaseOrders po
+                LEFT JOIN dbo.Vendors v ON po.VendorId = v.VendorId
+                GROUP BY COALESCE(v.VendorName, 'Missing Vendor')
+            ), ExpenseVendors AS (
+                SELECT COALESCE(NULLIF(LTRIM(RTRIM(VendorName)), ''), 'Missing Vendor') AS VendorName,
+                       COUNT(*) AS ExpenseRows,
+                       SUM(COALESCE(Amount,0)) AS ExpenseAmount
+                FROM dbo.ExpenseReviewItems
+                GROUP BY COALESCE(NULLIF(LTRIM(RTRIM(VendorName)), ''), 'Missing Vendor')
+            )
+            SELECT COALESCE(p.VendorName, e.VendorName) AS VendorName,
+                   COALESCE(p.POCount, 0) AS POCount,
+                   COALESCE(p.POAmount, 0) AS POAmount,
+                   COALESCE(p.RemainingAmount, 0) AS RemainingAmount,
+                   COALESCE(e.ExpenseRows, 0) AS ExpenseRows,
+                   COALESCE(e.ExpenseAmount, 0) AS ExpenseAmount
+            FROM POVendors p
+            FULL OUTER JOIN ExpenseVendors e ON p.VendorName = e.VendorName
+            ORDER BY COALESCE(p.POAmount, 0) DESC, COALESCE(e.ExpenseAmount, 0) DESC;
+            """
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        total_vendors = len(rows)
+        total_po_amount = sum(float(r.POAmount or 0) for r in rows)
+        total_expense_amount = sum(float(r.ExpenseAmount or 0) for r in rows)
+        table_rows = ""
+        top_rows = ""
+        max_po = max([float(r.POAmount or 0) for r in rows] or [1])
+        for idx, r in enumerate(rows):
+            table_rows += f"""
+            <tr><td><strong>{h(r.VendorName)}</strong></td><td class="right">{int(r.POCount or 0)}</td><td class="right">{currency(r.POAmount)}</td><td class="right">{currency(r.RemainingAmount)}</td><td class="right">{int(r.ExpenseRows or 0)}</td><td class="right">{currency(r.ExpenseAmount)}</td></tr>
+            """
+            if idx < 8:
+                width = 0 if max_po == 0 else max(5, float(r.POAmount or 0) / max_po * 100)
+                top_rows += f"<div class='bar-row'><strong>{h(r.VendorName)}</strong><div class='bar-track'><div class='bar-fill' style='width:{width:.1f}%'></div></div><div class='right'>{currency(r.POAmount)}</div></div>"
+        if not table_rows:
+            table_rows = '<tr><td colspan="6"><div class="empty-state"><strong>No vendor data found.</strong><span>Vendors will appear after PO or expense uploads.</span></div></td></tr>'
+            top_rows = '<p class="card-subtitle">No vendor data found.</p>'
+
+        content = f"""
+        <div class="grid kpis">
+            <div class="card kpi"><div class="label">Vendors</div><div class="value">{total_vendors}</div><div class="trend">Across POs and expenses</div></div>
+            <div class="card kpi"><div class="label">Issued PO Amount</div><div class="value">{currency(total_po_amount)}</div><div class="trend">Vendor commitment value</div></div>
+            <div class="card kpi"><div class="label">Expense Amount</div><div class="value">{currency(total_expense_amount)}</div><div class="trend">Uploaded expense value</div></div>
+            <a class="card kpi status-card" href="/pos-balances"><div class="label">POs & Balances</div><div class="value">View</div><div class="trend">Open PO detail</div></a>
+        </div>
+        <div class="grid two">
+            <div class="card"><h3>Top Vendors by PO Amount</h3><div class="bar-chart">{top_rows}</div></div>
+            <div class="card"><h3>Vendor Summary</h3><p class="card-subtitle">Vendor and purchaser totals across issued POs and uploaded expenses.</p><div class="table-wrap"><table><tr><th>Vendor / Purchaser</th><th class="right">POs</th><th class="right">PO Amount</th><th class="right">Remaining</th><th class="right">Expense Rows</th><th class="right">Expense Amount</th></tr>{table_rows}</table></div></div>
+        </div>
+        """
+        return shell("Vendors", "Vendor and purchaser totals across POs and expenses.", "Vendors", content)
+    except Exception as e:
+        return shell("Vendors", "Unable to load vendors.", "Vendors", f'<div class="notice error">Error loading Vendors: {h(e)}</div>'), 500
+
+
+@app.route("/pos-in-pm-comments")
+def pos_in_pm_comments_page():
+    allowed, reason = require_page_access("POs in PM Comments")
+    if not allowed:
+        return access_denied_response("POs in PM Comments", reason)
+    try:
+        ensure_expense_review_tables()
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT TOP 500 ExpenseReviewItemId, ExpenseId, ProjectName, TxDate, TxType, VendorName,
+                   Amount, PMComments, ExtractedPONumber, MatchedPONumber, CorrectPONumber, MatchStatus,
+                   MatchConfidence, ReviewDecision
+            FROM dbo.ExpenseReviewItems
+            WHERE (COALESCE(ExtractedPONumber, '') <> '' OR COALESCE(MatchedPONumber, '') <> '' OR PMComments LIKE '%PO%')
+              AND COALESCE(PMComments, '') <> ''
+            ORDER BY TxDate DESC, ExpenseReviewItemId DESC;
+            """
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        total_amount = sum(float(r.Amount or 0) for r in rows)
+        unique_pos = len(set(str(r.CorrectPONumber or r.MatchedPONumber or r.ExtractedPONumber or '').strip() for r in rows if str(r.CorrectPONumber or r.MatchedPONumber or r.ExtractedPONumber or '').strip()))
+        table_rows = ""
+        for r in rows:
+            po_number = r.CorrectPONumber or r.MatchedPONumber or r.ExtractedPONumber or ""
+            po_link = f'<a href="/po-detail?po_number={quote_plus(str(po_number))}">{h(po_number)}</a>' if po_number else ""
+            status_class = str(r.MatchStatus or "").lower().replace(" ", "-")
+            table_rows += f"""
+            <tr>
+                <td><span class="status-chip {h(status_class)}">{h(r.MatchStatus)}</span><br><small>{h(r.MatchConfidence)}</small></td>
+                <td><strong>{h(r.ExpenseId or r.ExpenseReviewItemId)}</strong><br><small>{h(r.TxDate)}</small></td>
+                <td>{h(r.ProjectName)}</td>
+                <td>{h(r.VendorName)}<br><small>{h(r.TxType)}</small></td>
+                <td class="right">{currency(r.Amount)}</td>
+                <td>{h(r.PMComments)}</td>
+                <td>{po_link}</td>
+                <td>{h(r.ReviewDecision)}</td>
+            </tr>
+            """
+        if not table_rows:
+            table_rows = '<tr><td colspan="8"><div class="empty-state"><strong>No PO references found in PM comments yet.</strong><span>Rows will appear after expense uploads identify PO numbers in PM Comments.</span></div></td></tr>'
+
+        content = f"""
+        <div class="grid kpis">
+            <div class="card kpi"><div class="label">Rows Found</div><div class="value">{len(rows)}</div><div class="trend">PM comments with PO-like references</div></div>
+            <div class="card kpi"><div class="label">Unique POs</div><div class="value">{unique_pos}</div><div class="trend">Referenced or matched POs</div></div>
+            <div class="card kpi"><div class="label">Referenced Amount</div><div class="value">{currency(total_amount)}</div><div class="trend">Expense rows shown below</div></div>
+            <a class="card kpi status-card" href="/missing-po-review"><div class="label">Review Queue</div><div class="value">Open</div><div class="trend">Validate uncertain matches</div></a>
+        </div>
+        <div class="card"><h3>POs in PM Comments</h3><p class="card-subtitle">Expense rows where PO numbers or PO-like references were found in PM Comments.</p><div class="table-wrap"><table><tr><th>Status</th><th>Expense</th><th>Project</th><th>Vendor / Purchaser</th><th class="right">Amount</th><th>PM Comments</th><th>PO Reference</th><th>Decision</th></tr>{table_rows}</table></div></div>
+        """
+        return shell("POs in PM Comments", "Rows where PO references were found in PM Comments.", "POs in PM Comments", content)
+    except Exception as e:
+        return shell("POs in PM Comments", "Unable to load POs in PM Comments.", "POs in PM Comments", f'<div class="notice error">Error loading POs in PM Comments: {h(e)}</div>'), 500
 
 
 @app.route("/download-expense-upload-template.csv")
