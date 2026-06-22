@@ -9,7 +9,7 @@ from datetime import datetime, date
 from decimal import Decimal, InvalidOperation
 from urllib.parse import quote_plus
 
-from flask import Flask, jsonify, request, Response, redirect
+from flask import Flask, jsonify, request, Response, redirect, make_response
 
 
 # ------------------------------------------------------------
@@ -93,7 +93,7 @@ PAGE_ACCESS = {
     "Import History": ["Admin", "Accounting"],
     "Exceptions": ["Admin", "Executive", "Accounting"],
     "Exports": ["Admin", "Executive", "Accounting"],
-    "User Access": ["Admin"],
+    "User Access": ["Admin", "Executive"],
     "Who Am I": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
 }
 
@@ -1061,6 +1061,10 @@ def import_expense_rows(rows, filename):
             project_name = clean_text(row_value(row, ["ProjectName", "Project Name", "Project", "Project Short Name", "Project Code"]))
             tx_date = clean_date(row_value(row, ["TxDate", "Tx Date", "Transaction Date", "Date"]));
             tx_type = clean_text(row_value(row, ["TxType", "Tx Type", "Transaction Type", "Type"]));
+            # Rollout rule: timesheet/labor expense rows are ignored during upload and do not enter PO matching or reduce balances.
+            tx_type_lc = str(tx_type or "").strip().lower()
+            if "time sheet" in tx_type_lc or "timesheet" in tx_type_lc:
+                continue
             vendor_name = clean_text(row_value(row, ["VendorName", "Vendor Name", "Vendor", "Vendor/Purchaser", "Charger Name", "Purchaser"]));
             description = clean_text(row_value(row, ["Description", "Charge Code", "Memo", "Notes"]));
             amount = clean_decimal(row_value(row, ["Amount", "Transaction Amount", "Cost", "Total"]));
@@ -1647,6 +1651,151 @@ def create_purchase_request(form):
         conn.close()
 
 
+def generate_app_po_number(cursor):
+    today_prefix = datetime.utcnow().strftime("APP-PO-%Y%m%d")
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS POCount
+        FROM dbo.PurchaseOrders
+        WHERE PONumber LIKE ?;
+        """,
+        today_prefix + "-%",
+    )
+    row = cursor.fetchone()
+    next_number = (row.POCount or 0) + 1
+    while True:
+        po_number = f"{today_prefix}-{next_number:04d}"
+        cursor.execute("SELECT COUNT(*) AS ExistingCount FROM dbo.PurchaseOrders WHERE PONumber = ?", po_number)
+        existing = cursor.fetchone()
+        if not (existing.ExistingCount or 0):
+            return po_number
+        next_number += 1
+
+
+def create_or_update_po_from_purchase_request(cursor, purchase_request_id, requested_po_number=None):
+    cursor.execute(
+        """
+        SELECT
+            PurchaseRequestId,
+            RequestNumber,
+            RequestedByEmail,
+            RequestedByName,
+            NeededByDate,
+            VendorName,
+            ProjectName,
+            Department,
+            RequestTitle,
+            RequestDescription,
+            EstimatedAmount,
+            ConvertedPONumber
+        FROM dbo.PurchaseRequests
+        WHERE PurchaseRequestId = ?;
+        """,
+        purchase_request_id,
+    )
+    req = cursor.fetchone()
+    if not req:
+        raise ValueError("Purchase request was not found.")
+
+    po_number = clean_text(requested_po_number) or clean_text(req.ConvertedPONumber) or generate_app_po_number(cursor)
+    vendor_name = clean_text(req.VendorName) or "Vendor TBD"
+    project_name = clean_text(req.ProjectName) or "Project TBD"
+    department = clean_text(req.Department)
+    requestor = clean_text(req.RequestedByName) or clean_text(req.RequestedByEmail)
+    amount = clean_decimal(req.EstimatedAmount)
+    today = datetime.utcnow().date()
+
+    vendor_id = get_or_create_vendor(cursor, vendor_name)
+    project_id = get_or_create_project(cursor, project_name, department)
+
+    cursor.execute(
+        """
+        INSERT INTO dbo.ImportBatches
+            (
+                FileName,
+                SourceSystem,
+                UploadedBy,
+                TotalRows,
+                SuccessCount,
+                ErrorCount,
+                ImportStatus
+            )
+        OUTPUT INSERTED.ImportBatchId
+        VALUES (?, 'Purchase Request Auto PO', ?, 1, 1, 0, 'Complete');
+        """,
+        f"Auto-created from {clean_text(req.RequestNumber) or 'purchase request'}",
+        get_current_user()["email"] or "Purchase Request Approval",
+    )
+    import_batch_id = cursor.fetchone().ImportBatchId
+
+    purchase_order_id = upsert_purchase_order(
+        cursor=cursor,
+        po_number=po_number,
+        vendor_id=vendor_id,
+        project_id=project_id,
+        department=department,
+        requestor=requestor,
+        po_date=today,
+        po_status="Open",
+        original_amount=amount,
+        revised_amount=amount,
+        remaining_amount=amount,
+        import_batch_id=import_batch_id,
+    )
+
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS LineCount
+        FROM dbo.IssuedPOLines
+        WHERE PONumber = ?;
+        """,
+        po_number,
+    )
+    line_count = cursor.fetchone().LineCount or 0
+    if line_count == 0:
+        cursor.execute(
+            """
+            INSERT INTO dbo.IssuedPOLines
+                (
+                    PurchaseOrderId,
+                    ImportBatchId,
+                    PONumber,
+                    VendorName,
+                    ProjectName,
+                    Department,
+                    PODate,
+                    POStatus,
+                    LineDescription,
+                    Unit,
+                    UnitCost,
+                    Qty,
+                    LineAmount,
+                    OriginalAmount,
+                    RevisedAmount,
+                    RemainingAmount,
+                    Requestor
+                )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'Open', ?, 'LS', ?, 1, ?, ?, ?, ?, ?);
+            """,
+            purchase_order_id,
+            import_batch_id,
+            po_number,
+            vendor_name,
+            project_name,
+            department,
+            today,
+            clean_text(req.RequestTitle) or clean_text(req.RequestDescription) or "Purchase request approved item",
+            amount,
+            amount,
+            amount,
+            amount,
+            amount,
+            requestor,
+        )
+
+    return po_number
+
+
 def update_purchase_request_status(form):
     user = get_current_user()
 
@@ -1668,9 +1817,6 @@ def update_purchase_request_status(form):
     if request_status not in valid_statuses:
         raise ValueError("Invalid request status.")
 
-    if request_status != "Converted to PO":
-        converted_po_number = ""
-
     if not purchase_request_id:
         raise ValueError("Purchase Request ID is required.")
 
@@ -1678,6 +1824,18 @@ def update_purchase_request_status(form):
     cursor = conn.cursor()
 
     try:
+        if request_status in ["Approved", "Converted to PO"]:
+            converted_po_number = create_or_update_po_from_purchase_request(cursor, purchase_request_id, converted_po_number)
+            request_status = "Converted to PO"
+            auto_note = f"Approved and auto-created PO {converted_po_number}."
+            if review_notes:
+                if auto_note not in review_notes:
+                    review_notes = review_notes + "\n" + auto_note
+            else:
+                review_notes = auto_note
+        else:
+            converted_po_number = ""
+
         cursor.execute(
             """
             UPDATE dbo.PurchaseRequests
@@ -2481,8 +2639,41 @@ a, a:visited { color:#1d4ed8; }
 @media (max-width:1100px) { .rollout-filter-fields { grid-template-columns:repeat(2, minmax(0, 1fr)); } }
 @media (max-width:760px) { .rollout-filter-fields { grid-template-columns:1fr; } }
 
+/* Rollout-standard KPI cards: consistent top-page card design across pages */
+.grid.kpis .card.kpi, .status-card-grid .status-card {
+  border-top: 5px solid #2563eb;
+  min-height: 122px;
+}
+.grid.kpis .card.kpi:nth-child(2), .status-card-grid .status-card.green { border-top-color:#16a34a; }
+.grid.kpis .card.kpi:nth-child(3), .status-card-grid .status-card.amber { border-top-color:#f59e0b; }
+.grid.kpis .card.kpi:nth-child(4), .status-card-grid .status-card.red { border-top-color:#dc2626; }
+.grid.kpis .card.kpi:nth-child(5) { border-top-color:#7c3aed; }
+.grid.kpis .card.kpi:nth-child(6) { border-top-color:#0ea5e9; }
+.po-link { font-weight:900; color:#1d4ed8; text-decoration:underline; text-underline-offset:2px; }
+.po-link:visited { color:#1d4ed8; }
+.view-as-banner { margin-bottom:16px; background:#eef6ff; border:1px solid #bfdbfe; border-radius:14px; padding:12px 14px; color:#1e3a8a; }
+.vendor-detail-link { font-weight:900; color:#1d4ed8; text-decoration:underline; }
+.vendor-detail-link:visited { color:#1d4ed8; }
+
 </style>
 """
+
+
+def get_view_as_email():
+    """Admin/Executive helper for viewing user-specific context while keeping the real admin/executive sidebar."""
+    access = get_user_access()
+    if access.get("role") not in ["Admin", "Executive"]:
+        return ""
+    return clean_text(request.cookies.get("PO_DASHBOARD_VIEW_AS")) or ""
+
+def current_working_email():
+    return get_view_as_email() or get_current_user().get("email") or ""
+
+def view_as_notice():
+    view_email = get_view_as_email()
+    if not view_email:
+        return ""
+    return f'<div class="view-as-banner"><strong>Viewing as:</strong> {h(view_email)} <a class="button secondary" href="/clear-view-as">Clear view-as</a></div>'
 
 
 def shell(title, subtitle, active, content):
@@ -2503,7 +2694,7 @@ def shell(title, subtitle, active, content):
         ("Expenses", "/expenses", "📄"),
         ("Missing PO Review", "/missing-po-review", "⚠️"),
         ("Vendors", "/vendors", "🏢"),
-        ("POs in PM Comments", "/pos-in-pm-comments", "🔎"),
+        # PM Comment PO Audit remains available by direct URL from reporting, but is hidden from main rollout navigation to reduce overlap.
         ("Import History", "/import-history", "🕘"),
         # Dormant for July 1 rollout: Exceptions and Exports hidden from main navigation.
 
@@ -2578,6 +2769,7 @@ def shell(title, subtitle, active, content):
             </div>
         </header>
 
+        {view_as_notice()}
         {content}
     </main>
     <div id="appToast" class="app-toast"></div>
@@ -3354,13 +3546,24 @@ def load_project_po_setup_items(status_filter=None, assigned_filter=None):
 
 def count_po_setup_actions_for_current_user():
     user = get_current_user()
+    view_email = current_working_email()
     access = get_user_access()
     conn = get_sql_connection()
     cursor = conn.cursor()
     ensure_po_setup_columns(cursor)
     conn.commit()
 
-    if access["role"] == "Project Manager" and user["email"]:
+    if get_view_as_email():
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS ActionCount
+            FROM dbo.PurchaseOrders
+            WHERE LOWER(COALESCE(SetupAssignedTo, '')) = LOWER(?)
+              AND COALESCE(NULLIF(SetupStatus, ''), 'Needs Payment Schedule') <> 'Complete';
+            """,
+            view_email,
+        )
+    elif access["role"] == "Project Manager" and user["email"]:
         cursor.execute(
             """
             SELECT COUNT(*) AS ActionCount
@@ -3729,8 +3932,8 @@ def purchase_requests():
 
         manual_review_notice = """
         <div class="notice info">
-            <strong>Manual purchase request review for July 1 rollout.</strong><br>
-            Purchase requests are reviewed manually by Accounting/Admin for the July 1 rollout. Approval in this app records the decision, but does not automatically create a PO.
+            <strong>Purchase request review for July 1 rollout.</strong><br>
+            Purchase requests are reviewed by Accounting/Admin. When a request is approved, the app automatically creates an internal PO, links it to the request, and adds it to PO tracking/balances. The app does not write the PO back to the ERP.
         </div>
         """
 
@@ -3781,11 +3984,12 @@ def purchase_requests():
                     <input type="hidden" name="purchase_request_id" value="{h(row.PurchaseRequestId)}">
                     <label>Status</label>
                     <select name="request_status" onchange="toggleConvertedPOField(this)">{status_options}</select>
+                    <small class="field-help">Selecting Approved will automatically create and link an internal app PO.</small>
                     <label>Reviewer</label>
                     <select name="reviewer_email">{reviewer_options}</select>
                     <div class="converted-po-field" style="display:{converted_display};">
                         <label>Converted PO Number</label>
-                        <input type="text" name="converted_po_number" value="{h(row.ConvertedPONumber)}" placeholder="Enter issued PO number">
+                        <input type="text" name="converted_po_number" value="{h(row.ConvertedPONumber)}" placeholder="Leave blank to auto-generate">
                     </div>
                     <label>Review Notes</label>
                     <textarea name="review_notes" placeholder="Add review notes, approval comments, rejection reason, or follow-up needed">{h(row.ReviewNotes)}</textarea>
@@ -4463,7 +4667,7 @@ def pos_balances():
         for row in data["lines"]:
             line_rows += f"""
             <tr>
-                <td>{h(row.PONumber)}</td>
+                <td><a class="po-link" href="/po-detail?po_number={quote_plus(str(row.PONumber or ''))}">{h(row.PONumber)}</a></td>
                 <td>{h(row.VendorName)}</td>
                 <td>{h(row.ProjectName)}</td>
                 <td>{h(row.Department)}</td>
@@ -4478,7 +4682,6 @@ def pos_balances():
             line_rows = '<tr><td colspan="9">No line items found.</td></tr>'
 
         content = f"""
-        {latest_data_freshness_banner()}
         <div class="grid kpis">
             <a class="card kpi action-card blue" href="#posBalancesPOListTable"><div class="label">Issued PO Count</div><div class="value">{overall['total_pos']}</div><div class="trend">Unique issued POs</div></a>
             <a class="card kpi action-card green" href="#posBalancesPOListTable"><div class="label">Open POs</div><div class="value">{overall['open_pos']}</div><div class="trend">Currently open</div></a>
@@ -4488,7 +4691,6 @@ def pos_balances():
             <div class="card kpi"><div class="label">Review Flags</div><div class="value">{overall['amount_mismatch_count']}</div><div class="trend">PO value vs. line total</div></div>
         </div>
 
-        <div class="notice info"><strong>Balance method:</strong> PO balances are app-calculated as issued PO amount minus expenses posted through the PO matching workflow. The app does not write balances back to Unanet or the ERP.</div>
 
         <div class="card project-bucket-card">
             <h3>Project Open Balance Buckets</h3>
@@ -5057,11 +5259,6 @@ def project_po_setup():
             mine_link = f'<a class="button secondary" href="/project-po-setup?mine=1">My Assigned PO Info Tasks</a>'
 
         content = f"""
-        {latest_data_freshness_banner()}
-        <div class="info-callout">
-            <strong>PO Setup Review replaces duplicate missing-info workflows.</strong>
-            Use this page for POs that are missing payment schedules, payment timing, payment type, or PM-provided details. The separate Exceptions page remains for data-quality problems like amount mismatches or closed POs with remaining balances.
-        </div>
         <div class="grid kpis">
             <div class="card kpi"><div class="label">Rows In View</div><div class="value">{len(rows)}</div><div class="trend">PO setup records</div></div>
             <div class="card kpi"><div class="label">Missing Schedule</div><div class="value">{needs_schedule}</div><div class="trend">Need payment schedule</div></div>
@@ -5095,15 +5292,6 @@ def project_po_setup():
                     {table_rows}
                     </tbody>
                 </table>
-            </div>
-        </div>
-        <div class="card">
-            <h3>Recommended workflow</h3>
-            <div class="timeline">
-                <div class="timeline-item"><strong>Accounting imports issued POs</strong><span>PO rows land in the dashboard from the Upload Issued POs page.</span></div>
-                <div class="timeline-item"><strong>PO Setup Review identifies missing planning data</strong><span>Missing payment schedule, payment type, and expected payment date appear here.</span></div>
-                <div class="timeline-item"><strong>Assign missing info to the PM</strong><span>Choose the project manager or responsible user from the Assigned To dropdown and click Assign. They will see assigned PO info tasks on My Dashboard.</span></div>
-                <div class="timeline-item"><strong>PM/accounting updates the PO</strong><span>Once payment schedule and timing are entered, mark the item Complete.</span></div>
             </div>
         </div>
         """
@@ -5254,7 +5442,6 @@ def expenses_page():
             ("search", "Search", "Description or comments"),
         ])
         content = f"""
-        {latest_data_freshness_banner()}
         <div class="grid kpis">
             <a class="card kpi status-card" href="/expense-upload"><div class="label">Expense Rows</div><div class="value">{int(stats.TotalRows or 0)}</div><div class="trend">Imported from Unanet uploads</div></a>
             <a class="card kpi status-card" href="/expenses"><div class="label">Expense Amount</div><div class="value">{currency(stats.TotalAmount)}</div><div class="trend">Total uploaded expense value</div></a>
@@ -5371,7 +5558,6 @@ def missing_po_review():
             row_html = '<tr><td colspan="9"><div class="empty-state"><strong>No missing PO review items.</strong><span>Rows needing PO decisions will appear here after expense uploads.</span></div></td></tr>'
         filter_bar = build_simple_filter_bar(filters, "/missing-po-review", [("project", "Project", "Project name/code"), ("vendor", "Vendor", "Vendor or purchaser"), ("type", "Type", "Purchase, Disbursement..."), ("status", "Match Status", "No Match, Needs Review..."), ("decision", "Decision", "Pending Review..."), ("search", "Search", "Description or comments")])
         content = f"""
-        {latest_data_freshness_banner()}
         <div class="notice info"><strong>Missing PO Review:</strong> Use this page to review expenses that may need a PO or corrected PO reference. Rows only reduce PO balances after they are posted as valid matches.</div>
         <div class="grid kpis">
             <a class="card kpi status-card" href="/missing-po-review"><div class="label">Open Review Items</div><div class="value">{int(stats.TotalOpen or 0)}</div><div class="trend">Rows needing PO decision</div></a>
@@ -5433,6 +5619,47 @@ def vendors_page():
             """
         )
         rows = cursor.fetchall()
+
+        selected_vendor = clean_text(request.args.get("vendor")) or ""
+        vendor_line_rows = ""
+        if selected_vendor:
+            cursor.execute(
+                """
+                SELECT TOP 500
+                    po.PONumber,
+                    COALESCE(pr.ProjectName, '') AS ProjectName,
+                    po.Department,
+                    l.LineDescription,
+                    l.Unit,
+                    l.UnitCost,
+                    l.Qty,
+                    l.LineAmount
+                FROM dbo.IssuedPOLines l
+                INNER JOIN dbo.PurchaseOrders po ON l.PurchaseOrderId = po.PurchaseOrderId
+                LEFT JOIN dbo.Vendors v ON po.VendorId = v.VendorId
+                LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
+                WHERE LOWER(COALESCE(v.VendorName, 'Missing Vendor')) = LOWER(?)
+                ORDER BY po.PONumber, l.IssuedPOLineId;
+                """,
+                selected_vendor,
+            )
+            vendor_lines = cursor.fetchall()
+            for line in vendor_lines:
+                vendor_line_rows += f"""
+                <tr>
+                    <td><a class="po-link" href="/po-detail?po_number={quote_plus(str(line.PONumber or ''))}">{h(line.PONumber)}</a></td>
+                    <td>{h(line.ProjectName)}</td>
+                    <td>{h(line.Department)}</td>
+                    <td>{h(line.LineDescription)}</td>
+                    <td>{h(line.Unit)}</td>
+                    <td class="right">{currency(line.UnitCost)}</td>
+                    <td class="right">{h(line.Qty)}</td>
+                    <td class="right">{currency(line.LineAmount)}</td>
+                </tr>
+                """
+            if not vendor_line_rows:
+                vendor_line_rows = '<tr><td colspan="8"><div class="empty-state"><strong>No PO line items found for this vendor.</strong></div></td></tr>'
+
         conn.close()
 
         total_vendors = len(rows)
@@ -5443,7 +5670,7 @@ def vendors_page():
         max_po = max([float(r.POAmount or 0) for r in rows] or [1])
         for idx, r in enumerate(rows):
             table_rows += f"""
-            <tr><td><strong>{h(r.VendorName)}</strong></td><td class="right">{int(r.POCount or 0)}</td><td class="right">{currency(r.POAmount)}</td><td class="right">{currency(r.RemainingAmount)}</td><td class="right">{int(r.ExpenseRows or 0)}</td><td class="right">{currency(r.ExpenseAmount)}</td></tr>
+            <tr><td><a class="vendor-detail-link" href="/vendors?vendor={quote_plus(str(r.VendorName or ''))}">{h(r.VendorName)}</a></td><td class="right">{int(r.POCount or 0)}</td><td class="right">{currency(r.POAmount)}</td><td class="right">{currency(r.RemainingAmount)}</td><td class="right">{int(r.ExpenseRows or 0)}</td><td class="right">{currency(r.ExpenseAmount)}</td></tr>
             """
             if idx < 8:
                 width = 0 if max_po == 0 else max(5, float(r.POAmount or 0) / max_po * 100)
@@ -5461,8 +5688,9 @@ def vendors_page():
         </div>
         <div class="grid two">
             <div class="card"><h3>Top Vendors by PO Amount</h3><div class="bar-chart">{top_rows}</div></div>
-            <div class="card"><h3>Vendor Summary</h3><p class="card-subtitle">Vendor and purchaser totals across issued POs and uploaded expenses.</p><div class="table-wrap"><table><tr><th>Vendor / Purchaser</th><th class="right">POs</th><th class="right">PO Amount</th><th class="right">Remaining</th><th class="right">Expense Rows</th><th class="right">Expense Amount</th></tr>{table_rows}</table></div></div>
+            <div class="card"><h3>Vendor Summary</h3><p class="card-subtitle">Click a vendor name to view all PO line items for that vendor.</p><div class="table-wrap"><table><tr><th>Vendor / Purchaser</th><th class="right">POs</th><th class="right">PO Amount</th><th class="right">Remaining</th><th class="right">Expense Rows</th><th class="right">Expense Amount</th></tr>{table_rows}</table></div></div>
         </div>
+        {f'<div class="card"><h3>PO Line Items for {h(selected_vendor)}</h3><p class="card-subtitle">Click a PO number to open the full PO.</p><div class="table-wrap"><table><tr><th>PO</th><th>Project</th><th>Department</th><th>Description</th><th>Unit</th><th class="right">Unit Cost</th><th class="right">Qty</th><th class="right">Line Amount</th></tr>{vendor_line_rows}</table></div></div>' if selected_vendor else ''}
         """
         return shell("Vendors", "Vendor and purchaser totals across POs and expenses.", "Vendors", content)
     except Exception as e:
@@ -5505,11 +5733,10 @@ def pos_in_pm_comments_page():
             table_rows = '<tr><td colspan="9"><div class="empty-state"><strong>No PO references found in PM comments.</strong><span>Adjust filters or upload expenses with PM comments.</span></div></td></tr>'
         filter_bar = build_simple_filter_bar(filters, "/pos-in-pm-comments", [("project", "Project", "Project name/code"), ("vendor", "Vendor", "Vendor or purchaser"), ("po", "PO", "PO number"), ("status", "Match Status", "Auto Matched..."), ("decision", "Decision", "Matched to PO..."), ("search", "Search", "PM comments")])
         content = f"""
-        {latest_data_freshness_banner()}
-        <div class="notice info"><strong>PM Comment PO references:</strong> This page shows possible PO references found in PM Comments. Validate uncertain rows before relying on them for balance reporting.</div>
+        <div class="notice info"><strong>PM Comment PO Audit:</strong> This read-only page explains where PO references were found in PM Comments. Use Expense Upload / PO Matching or Missing PO Review to change decisions.</div>
         <div class="grid kpis"><div class="card kpi"><div class="label">Rows Found</div><div class="value">{len(rows)}</div><div class="trend">PM comments with PO-like references</div></div><div class="card kpi"><div class="label">Unique POs</div><div class="value">{unique_pos}</div><div class="trend">Referenced or matched POs</div></div><div class="card kpi"><div class="label">Referenced Amount</div><div class="value">{currency(total_amount)}</div><div class="trend">Filtered expense rows</div></div><a class="card kpi status-card" href="/missing-po-review"><div class="label">Review Queue</div><div class="value">Open</div><div class="trend">Validate uncertain matches</div></a></div>
         {filter_bar}
-        <div class="card"><h3>POs in PM Comments</h3><p class="card-subtitle">Expense rows where PO numbers or PO-like references were found in PM Comments.</p><div class="table-wrap"><table><tr><th>Status</th><th>Expense</th><th>Project</th><th>Vendor / Purchaser</th><th class="right">Amount</th><th>PM Comments</th><th>PO Reference</th><th>Decision</th><th>Posting</th></tr>{table_rows}</table></div></div>
+        <div class="card"><h3>PM Comment PO Audit</h3><p class="card-subtitle">Read-only audit view of expense rows where PO numbers or PO-like references were found in PM Comments.</p><div class="table-wrap"><table><tr><th>Status</th><th>Expense</th><th>Project</th><th>Vendor / Purchaser</th><th class="right">Amount</th><th>PM Comments</th><th>PO Reference</th><th>Decision</th><th>Posting</th></tr>{table_rows}</table></div></div>
         """
         return shell("POs in PM Comments", "Rows where PO references were found in PM Comments.", "POs in PM Comments", content)
     except Exception as e:
@@ -5627,7 +5854,7 @@ def expense_upload():
                 result = import_expense_rows(rows, uploaded_file.filename)
                 message_html = f"""
                 <div class="notice success">
-                    Expense upload processed. Batch {h(result['batch_id'])}: {h(result['total_rows'])} rows, {h(result['auto'])} auto matched, {h(result['review'])} need review, {h(result['no_match'])} no match.
+                    Expense upload processed. Batch {h(result['batch_id'])}: timesheet rows ignored, {h(result['auto'])} auto matched, {h(result['review'])} need review, {h(result['no_match'])} no match.
                 </div>
                 """
         elif request.args.get("saved"):
@@ -5708,7 +5935,7 @@ def expense_upload():
         <div class="expense-upload-layout">
             <div class="card">
                 <h3>Upload Unanet Expense File</h3>
-                <p class="card-subtitle">Upload a CSV or Excel file exported from Unanet. The app will look for PO numbers in PM Comments and suggest PO matches by project/vendor when possible.</p>
+                <p class="card-subtitle">Upload a CSV or Excel file exported from Unanet. Timesheet rows are ignored. Purchase/disbursement rows are checked for PO numbers in PM Comments and suggested matches by project/vendor.</p>
                 <form method="post" enctype="multipart/form-data">
                     <div class="form-field full">
                         <label>Unanet expense file</label>
@@ -5728,7 +5955,7 @@ def expense_upload():
         </div>
         <div class="card" id="review-table">
             <h3>Expense Review Queue</h3>
-            <p class="card-subtitle">Review auto matches, choose the correct PO when needed, or mark rows as no PO needed / needs PM review. This page records the match decision; balance-posting can be added as a controlled next step.</p>
+            <p class="card-subtitle">Use this as the active work queue for uploaded non-timesheet expenses. Confirm PO matches, correct uncertain rows, or mark a row as no PO required / PM review needed. Posted matched rows reduce Current App Balance.</p>
             <datalist id="poNumberList">{po_options}</datalist>
             <div class="table-wrap expense-review-table">
                 <table>
@@ -5737,15 +5964,6 @@ def expense_upload():
                     </tr>
                     {table_rows}
                 </table>
-            </div>
-        </div>
-        <div class="card">
-            <h3>Workflow</h3>
-            <div class="timeline">
-                <div class="timeline-item"><strong>1. Upload Unanet expenses</strong><span>Accounting uploads a CSV/XLSX expense export.</span></div>
-                <div class="timeline-item"><strong>2. Auto-match where safe</strong><span>Rows with an issued PO number in PM Comments are marked Auto Matched.</span></div>
-                <div class="timeline-item"><strong>3. Review uncertain rows</strong><span>Project/vendor matches and no-match rows are reviewed manually.</span></div>
-                <div class="timeline-item"><strong>4. Confirm PO decision</strong><span>The reviewed PO number or no-PO-needed decision becomes the audit trail for future balance updates.</span></div>
             </div>
         </div>
         """
@@ -6102,6 +6320,26 @@ def export_issued_lines_csv():
 
     return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=issued_po_lines_export.csv"})
 
+
+@app.route("/set-view-as", methods=["POST"])
+def set_view_as():
+    access = get_user_access()
+    if access.get("role") not in ["Admin", "Executive"]:
+        return access_denied_response("User Access", "Only Admin or Executive users can use View As.")
+    email = clean_text(request.form.get("view_as_email")) or ""
+    resp = make_response(redirect("/user-access"))
+    if email:
+        resp.set_cookie("PO_DASHBOARD_VIEW_AS", email.lower(), max_age=8*60*60, httponly=True, samesite="Lax")
+    else:
+        resp.delete_cookie("PO_DASHBOARD_VIEW_AS")
+    return resp
+
+@app.route("/clear-view-as")
+def clear_view_as():
+    resp = make_response(redirect(request.headers.get("Referer") or "/user-access"))
+    resp.delete_cookie("PO_DASHBOARD_VIEW_AS")
+    return resp
+
 @app.route("/user-access", methods=["GET", "POST"])
 def user_access():
     allowed, reason = require_page_access("User Access")
@@ -6110,7 +6348,9 @@ def user_access():
 
     message_html = ""
 
-    if request.method == "POST":
+    if request.method == "POST" and get_user_access().get("role") != "Admin":
+        message_html = '<div class="notice error">Only Admin users can add or update user access. Executive users can use View As only.</div>'
+    elif request.method == "POST":
         email = clean_text(request.form.get("email"))
         display_name = clean_text(request.form.get("display_name"))
         role_name = clean_text(request.form.get("role_name"))
@@ -6192,8 +6432,18 @@ def user_access():
         content = f"""
         {message_html}
         <div class="card">
+            <h3>View As User</h3>
+            <p class="card-subtitle">Admin/Executive users can view user-specific task context while keeping the admin/executive sidebar and permissions.</p>
+            <form method="post" action="/set-view-as" class="rollout-filter-bar">
+                <div class="rollout-filter-fields">
+                    <label>View as<select name="view_as_email"><option value="">Actual signed-in user</option>{''.join(f'<option value="{h(u.Email)}" {"selected" if get_view_as_email().lower() == str(u.Email).lower() else ""}>{h(u.DisplayName or u.Email)} · {h(u.RoleName)}</option>' for u in users if u.IsActive)}</select></label>
+                </div>
+                <div class="rollout-filter-actions"><button class="primary" type="submit">Apply View As</button><a class="button secondary" href="/clear-view-as">Clear</a></div>
+            </form>
+        </div>
+        <div class="card">
             <h3>Add or Update User Access</h3>
-            <p class="card-subtitle">Admins can add users or update their dashboard role. Use the exact Microsoft 365 email address.</p>
+            <p class="card-subtitle">Admins can add users or update their dashboard role. Executive users can use View As but cannot change access.</p>
             <form method="post" action="/user-access">
                 <p><label>Email</label><br><input type="text" name="email" placeholder="person@c-diving.com" required></p>
                 <p><label>Display Name</label><br><input type="text" name="display_name" placeholder="Person Name"></p>
