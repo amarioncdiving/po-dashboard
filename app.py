@@ -42,21 +42,24 @@ SQL_CONNECTION = (
 
 
 REQUIRED_PO_COLUMNS = [
+    "ProjectCode",
+    "ProjectName",
     "PONumber",
     "VendorName",
-    "ProjectName",
-    "Department",
     "PODate",
-    "POStatus",
     "Description",
     "Unit",
     "UnitCost",
     "Qty",
     "LineAmount",
-    "OriginalAmount",
-    "RevisedAmount",
-    "RemainingAmount",
-    "Requestor",
+]
+
+DEPARTMENT_OPTIONS = [
+    "Engineering",
+    "Marine Construction",
+    "Commercial Diving",
+    "Dredging",
+    "Marine Services",
 ]
 
 
@@ -376,15 +379,27 @@ def read_uploaded_po_file(uploaded_file):
 
         return rows
 
-    raise ValueError("Unsupported file type. Please upload a .xlsx or .csv file.")
+    raise ValueError("Unsupported file type. Please upload a .csv file.")
 
 
-def validate_po_rows(rows):
+def validate_po_rows(rows, selected_department=None, selected_requestor=None, valid_requestors=None):
     errors = []
 
     if not rows:
         errors.append("The file has no data rows.")
         return errors
+
+    selected_department = clean_text(selected_department)
+    selected_requestor = clean_text(selected_requestor)
+    valid_requestors = set(valid_requestors or [])
+
+    if selected_department not in DEPARTMENT_OPTIONS:
+        errors.append("Select a department before uploading. Department must be one of: " + ", ".join(DEPARTMENT_OPTIONS) + ".")
+
+    if not selected_requestor:
+        errors.append("Select a requestor before uploading.")
+    elif valid_requestors and selected_requestor not in valid_requestors:
+        errors.append("Selected requestor is not an active user in User Access.")
 
     actual_columns = set(rows[0].keys())
     missing_columns = [col for col in REQUIRED_PO_COLUMNS if col not in actual_columns]
@@ -393,10 +408,14 @@ def validate_po_rows(rows):
         errors.append("Missing required columns: " + ", ".join(missing_columns))
 
     for index, row in enumerate(rows, start=2):
+        project_code = clean_text(row.get("ProjectCode"))
         po_number = clean_text(row.get("PONumber"))
         vendor_name = clean_text(row.get("VendorName"))
         project_name = clean_text(row.get("ProjectName"))
         line_amount = clean_decimal(row.get("LineAmount"))
+
+        if not project_code:
+            errors.append(f"Row {index}: ProjectCode is required.")
 
         if not po_number:
             errors.append(f"Row {index}: PONumber is required.")
@@ -432,19 +451,57 @@ def get_or_create_vendor(cursor, vendor_name):
     return cursor.fetchone().VendorId
 
 
-def get_or_create_project(cursor, project_name, department):
-    cursor.execute("SELECT ProjectId FROM dbo.Projects WHERE ProjectName = ?", project_name)
+def ensure_project_code_columns(cursor):
+    """Add ProjectCode to project/PO tables for the Phase 1 setup template."""
+    for table_name in ["Projects", "PurchaseOrders", "IssuedPOLines"]:
+        cursor.execute(
+            f"""
+            IF COL_LENGTH('dbo.{table_name}', 'ProjectCode') IS NULL
+            BEGIN
+                ALTER TABLE dbo.{table_name} ADD ProjectCode NVARCHAR(100) NULL;
+            END
+            """
+        )
+
+
+def get_or_create_project(cursor, project_name, department, project_code=None):
+    project_code = clean_text(project_code)
+    project_name = clean_text(project_name)
+
+    ensure_project_code_columns(cursor)
+
+    if project_code:
+        cursor.execute(
+            "SELECT ProjectId FROM dbo.Projects WHERE ProjectCode = ? OR ProjectName = ?",
+            project_code,
+            project_name,
+        )
+    else:
+        cursor.execute("SELECT ProjectId FROM dbo.Projects WHERE ProjectName = ?", project_name)
+
     row = cursor.fetchone()
 
     if row:
+        cursor.execute(
+            """
+            UPDATE dbo.Projects
+            SET ProjectCode = COALESCE(NULLIF(ProjectCode, ''), ?),
+                Department = COALESCE(NULLIF(Department, ''), ?)
+            WHERE ProjectId = ?
+            """,
+            project_code,
+            department,
+            row.ProjectId,
+        )
         return row.ProjectId
 
     cursor.execute(
         """
-        INSERT INTO dbo.Projects (ProjectName, Department, IsActive)
+        INSERT INTO dbo.Projects (ProjectCode, ProjectName, Department, IsActive)
         OUTPUT INSERTED.ProjectId
-        VALUES (?, ?, 1)
+        VALUES (?, ?, ?, 1)
         """,
+        project_code,
         project_name,
         department,
     )
@@ -465,6 +522,7 @@ def upsert_purchase_order(
     revised_amount,
     remaining_amount,
     import_batch_id,
+    project_code=None,
 ):
     cursor.execute(
         "SELECT PurchaseOrderId FROM dbo.PurchaseOrders WHERE PONumber = ?",
@@ -481,6 +539,7 @@ def upsert_purchase_order(
             SET
                 VendorId = ?,
                 ProjectId = ?,
+                ProjectCode = ?,
                 Department = ?,
                 Requestor = ?,
                 PODate = ?,
@@ -494,6 +553,7 @@ def upsert_purchase_order(
             """,
             vendor_id,
             project_id,
+            project_code,
             department,
             requestor,
             po_date,
@@ -514,6 +574,7 @@ def upsert_purchase_order(
                 PONumber,
                 VendorId,
                 ProjectId,
+                ProjectCode,
                 Department,
                 Requestor,
                 PODate,
@@ -525,11 +586,12 @@ def upsert_purchase_order(
                 LastImportBatchId
             )
         OUTPUT INSERTED.PurchaseOrderId
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
         """,
         po_number,
         vendor_id,
         project_id,
+        project_code,
         department,
         requestor,
         po_date,
@@ -543,7 +605,7 @@ def upsert_purchase_order(
     return cursor.fetchone().PurchaseOrderId
 
 
-def import_po_rows(rows, filename):
+def import_po_rows(rows, filename, selected_department=None, selected_requestor=None):
     conn = get_sql_connection()
     cursor = conn.cursor()
 
@@ -572,33 +634,43 @@ def import_po_rows(rows, filename):
         success_count = 0
         error_count = 0
 
+        ensure_project_code_columns(cursor)
+
         po_numbers = sorted(
             set(clean_text(row.get("PONumber")) for row in rows if clean_text(row.get("PONumber")))
         )
+
+        po_totals = {}
+        for source_row in rows:
+            source_po = clean_text(source_row.get("PONumber"))
+            source_amount = clean_decimal(source_row.get("LineAmount")) or Decimal("0")
+            if source_po:
+                po_totals[source_po] = po_totals.get(source_po, Decimal("0")) + source_amount
 
         for po_number in po_numbers:
             cursor.execute("DELETE FROM dbo.IssuedPOLines WHERE PONumber = ?", po_number)
 
         for index, row in enumerate(rows, start=2):
             try:
+                project_code = clean_text(row.get("ProjectCode"))
                 po_number = clean_text(row.get("PONumber"))
                 vendor_name = clean_text(row.get("VendorName"))
                 project_name = clean_text(row.get("ProjectName"))
-                department = clean_text(row.get("Department"))
+                department = clean_text(selected_department)
                 po_date = clean_date(row.get("PODate"))
-                po_status = clean_text(row.get("POStatus"))
+                po_status = "Open"
                 description = clean_text(row.get("Description"))
                 unit = clean_text(row.get("Unit"))
                 unit_cost = clean_decimal(row.get("UnitCost"))
                 qty = clean_decimal(row.get("Qty"))
                 line_amount = clean_decimal(row.get("LineAmount"))
-                original_amount = clean_decimal(row.get("OriginalAmount"))
-                revised_amount = clean_decimal(row.get("RevisedAmount"))
-                remaining_amount = clean_decimal(row.get("RemainingAmount"))
-                requestor = clean_text(row.get("Requestor"))
+                original_amount = po_totals.get(po_number, Decimal("0"))
+                revised_amount = original_amount
+                remaining_amount = original_amount
+                requestor = clean_text(selected_requestor)
 
                 vendor_id = get_or_create_vendor(cursor, vendor_name)
-                project_id = get_or_create_project(cursor, project_name, department)
+                project_id = get_or_create_project(cursor, project_name, department, project_code)
 
                 purchase_order_id = upsert_purchase_order(
                     cursor=cursor,
@@ -613,6 +685,7 @@ def import_po_rows(rows, filename):
                     revised_amount=revised_amount,
                     remaining_amount=remaining_amount,
                     import_batch_id=import_batch_id,
+                    project_code=project_code,
                 )
 
                 cursor.execute(
@@ -623,6 +696,7 @@ def import_po_rows(rows, filename):
                             ImportBatchId,
                             PONumber,
                             VendorName,
+                            ProjectCode,
                             ProjectName,
                             Department,
                             PODate,
@@ -637,12 +711,13 @@ def import_po_rows(rows, filename):
                             RemainingAmount,
                             Requestor
                         )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     purchase_order_id,
                     import_batch_id,
                     po_number,
                     vendor_name,
+                    project_code,
                     project_name,
                     department,
                     po_date,
@@ -5973,6 +6048,74 @@ def expense_upload():
         return shell("Expense Upload / PO Matching", "Unable to load expense matching page.", "Expense Upload / PO Matching", content), 500
 
 
+
+@app.route("/download-issued-po-template.xlsx")
+def download_issued_po_template_xlsx():
+    allowed, reason = require_page_access("Upload Issued POs")
+    if not allowed:
+        return access_denied_response("Upload Issued POs", reason)
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.worksheet.datavalidation import DataValidation
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Issued PO Setup"
+    lists = wb.create_sheet("Lists")
+
+    headers = REQUIRED_PO_COLUMNS
+    ws.append(headers)
+    ws.append(["25-209", "Round Valley", "25-209-PO-001", "Example Vendor", "Marine Construction", "2026-07-01", "Ashley Marion", "Example line item", "EA", 1000, 2, 2000])
+    ws.append(["25-209", "Round Valley", "25-209-PO-001", "Example Vendor", "Marine Construction", "2026-07-01", "Ashley Marion", "Second line item", "LS", 500, 1, 500])
+
+    lists["A1"] = "Department Options"
+    for idx, dept in enumerate(DEPARTMENT_OPTIONS, start=2):
+        lists[f"A{idx}"] = dept
+
+    header_fill = PatternFill("solid", fgColor="0B1F3A")
+    header_font = Font(color="FFFFFF", bold=True)
+    thin = Side(style="thin", color="D9E2EC")
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = Border(bottom=thin)
+
+    widths = [14, 24, 18, 26, 24, 14, 22, 36, 12, 14, 10, 14]
+    for idx, width in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(idx)].width = width
+    ws.freeze_panes = "A2"
+
+    dv = DataValidation(type="list", formula1="=Lists!$A$2:$A$6", allow_blank=False)
+    ws.add_data_validation(dv)
+    dv.add("E2:E1000")
+
+    ws["A6"] = "Template notes"
+    ws["A6"].fill = PatternFill("solid", fgColor="EAF2FF")
+    ws["A6"].font = Font(color="0B1F3A", bold=True)
+    ws.merge_cells("A6:L6")
+    notes = [
+        "ProjectCode is required and should match the project code used internally, such as 25-209.",
+        "Department must be selected from the dropdown.",
+        "Original/Revised/Remaining Amount and PO Status are intentionally removed. The app calculates PO amount from line amounts and marks uploaded POs Open.",
+        "Use one row per PO line item. Repeating the same PO number creates multiple line items under the same PO.",
+    ]
+    for row_idx, note in enumerate(notes, start=7):
+        ws[f"A{row_idx}"] = note
+        ws.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=12)
+        ws[f"A{row_idx}"].alignment = Alignment(wrap_text=True)
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return Response(
+        output.getvalue(),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=issued_po_project_setup_template.xlsx"},
+    )
+
 @app.route("/download-issued-po-template.csv")
 def download_issued_po_template():
     allowed, reason = require_page_access("Upload Issued POs")
@@ -5987,7 +6130,7 @@ def download_issued_po_template():
         output.getvalue(),
         mimetype="text/csv",
         headers={
-            "Content-Disposition": "attachment; filename=issued_po_upload_template.csv"
+            "Content-Disposition": "attachment; filename=issued_po_project_setup_template.csv"
         },
     )
 
@@ -6002,53 +6145,97 @@ def upload_po():
     result_html = ""
     errors_html = ""
 
+    assignable_users = load_assignable_users()
+    requestor_options = []
+    for u in assignable_users:
+        display = clean_text(getattr(u, "DisplayName", "") or getattr(u, "Email", ""))
+        role = clean_text(getattr(u, "RoleName", ""))
+        email = clean_text(getattr(u, "Email", ""))
+        if display:
+            requestor_options.append((display, role, email))
+    valid_requestors = [x[0] for x in requestor_options]
+
+    selected_department = clean_text(request.form.get("default_department")) if request.method == "POST" else ""
+    selected_requestor = clean_text(request.form.get("default_requestor")) if request.method == "POST" else ""
+
     if request.method == "POST":
         uploaded_file = request.files.get("po_file")
 
         if not uploaded_file or uploaded_file.filename == "":
             message_html = '<div class="notice error">No file selected.</div>'
+        elif not uploaded_file.filename.lower().endswith(".csv"):
+            message_html = '<div class="notice error">Please upload a CSV file. The issued PO setup upload is CSV-only.</div>'
         else:
             try:
                 rows = read_uploaded_po_file(uploaded_file)
-                validation_errors = validate_po_rows(rows)
+                validation_errors = validate_po_rows(rows, selected_department, selected_requestor, valid_requestors)
 
                 if validation_errors:
                     message_html = '<div class="notice error">The file could not be imported because validation errors were found.</div>'
                     error_items = "".join(f"<li>{h(error)}</li>" for error in validation_errors)
                     errors_html = f'<div class="card"><h3>Validation Errors</h3><ul>{error_items}</ul></div>'
                 else:
-                    result = import_po_rows(rows, uploaded_file.filename)
+                    result = import_po_rows(rows, uploaded_file.filename, selected_department, selected_requestor)
                     message_html = '<div class="notice ok">Issued PO import completed.</div>'
                     result_html = f"""
-                    <div class="card"><h3>Import Result</h3><table><tr><th>Import Batch ID</th><td>{result["import_batch_id"]}</td></tr><tr><th>Total Rows</th><td>{result["total_rows"]}</td></tr><tr><th>Success Count</th><td>{result["success_count"]}</td></tr><tr><th>Error Count</th><td>{result["error_count"]}</td></tr><tr><th>Status</th><td>{h(result["status"])}</td></tr></table></div>
+                    <div class="card"><h3>Import Result</h3><table><tr><th>Import Batch ID</th><td>{result["import_batch_id"]}</td></tr><tr><th>Total Rows</th><td>{result["total_rows"]}</td></tr><tr><th>Success Count</th><td>{result["success_count"]}</td></tr><tr><th>Error Count</th><td>{result["error_count"]}</td></tr><tr><th>Status</th><td>{h(result["status"])}</td></tr><tr><th>Department Applied</th><td>{h(selected_department)}</td></tr><tr><th>Requestor Applied</th><td>{h(selected_requestor)}</td></tr></table></div>
                     """
 
             except Exception as e:
                 message_html = '<div class="notice error">Import failed.</div>'
                 errors_html = f'<div class="card"><h3>Error Details</h3><p>{h(e)}</p></div>'
 
+    department_options_html = "".join(
+        f'<option value="{h(dept)}" {"selected" if dept == selected_department else ""}>{h(dept)}</option>'
+        for dept in DEPARTMENT_OPTIONS
+    )
+    requestor_options_html = "".join(
+        f'<option value="{h(display)}" {"selected" if display == selected_requestor else ""}>{h(display)}{(" · " + h(role)) if role else ""}</option>'
+        for display, role, email in requestor_options
+    )
+
     content = f"""
     {message_html}{result_html}{errors_html}
     <div class="grid two">
         <div class="card">
             <h3>Select Issued PO File</h3>
-            <p class="card-subtitle">Upload the cleaned issued PO template as .xlsx or .csv.</p>
+            <p class="card-subtitle">Upload the first-time project setup PO file as CSV. Department and requestor are selected here and applied to every row in the upload.</p>
             <form method="post" enctype="multipart/form-data">
-                <p><input type="file" name="po_file" accept=".xlsx,.csv" required></p>
+                <div class="form-grid">
+                    <div class="form-field">
+                        <label>Department *</label>
+                        <select name="default_department" required>
+                            <option value="">Select department</option>
+                            {department_options_html}
+                        </select>
+                    </div>
+                    <div class="form-field">
+                        <label>Requestor *</label>
+                        <select name="default_requestor" required>
+                            <option value="">Select requestor</option>
+                            {requestor_options_html}
+                        </select>
+                    </div>
+                    <div class="form-field full">
+                        <label>Issued PO CSV *</label>
+                        <input type="file" name="po_file" accept=".csv" required>
+                    </div>
+                </div>
+                <p class="field-help">The selected department and requestor will be stamped onto all POs and PO line items in this upload.</p>
                 <p><button class="primary" type="submit">Upload Issued POs</button></p>
             </form>
         </div>
         <div class="card">
-            <h3>CSV Template</h3>
-            <p class="card-subtitle">Download a blank CSV with the required upload headers.</p>
+            <h3>Project Setup CSV Template</h3>
+            <p class="card-subtitle">Download the CSV template for the Phase 1 first-time project PO setup load.</p>
             <p><a class="button primary" href="/download-issued-po-template.csv">Download CSV Template</a></p>
-            <p class="field-help">Use this template when preparing issued PO uploads from Excel or ERP exports.</p>
+            <p class="field-help">The CSV no longer includes Department, Requestor, OriginalAmount, RevisedAmount, RemainingAmount, or POStatus. Uploaded POs are marked Open, and PO amount is calculated from line amounts.</p>
         </div>
     </div>
-    <div class="card"><h3>Expected Columns</h3><p class="card-subtitle">The upload must include these exact headers.</p><code>{h(", ".join(REQUIRED_PO_COLUMNS))}</code></div>
+    <div class="card"><h3>Expected CSV Columns</h3><p class="card-subtitle">The upload must include these exact headers. Department and requestor are selected above before upload.</p><code>{h(", ".join(REQUIRED_PO_COLUMNS))}</code></div>
     """
 
-    return shell("Upload Issued POs", "Import issued purchase orders and line items into Azure SQL.", "Upload Issued POs", content)
+    return shell("Upload Issued POs", "Import first-time project setup POs and line items into Azure SQL.", "Upload Issued POs", content)
 
 @app.route("/import-history")
 def import_history():
