@@ -2640,7 +2640,7 @@ a, a:visited { color:#1d4ed8; }
   font-size:13px;
 }
 .project-filter-button:hover { background:#eaf4ff; border-color:#93c5fd; }
-.filter-icon { font-size:16px; line-height:1; transform:rotate(45deg); display:inline-block; }
+.filter-icon { font-size:15px; line-height:1; display:inline-block; font-weight:900; }
 .project-filter-select {
   display:none;
   margin-top:8px;
@@ -2657,6 +2657,10 @@ a, a:visited { color:#1d4ed8; }
 }
 .project-filter-select.show { display:block; }
 
+
+.vendor-terms-card { page-break-inside:avoid; }
+.terms-list { margin:0; padding-left:20px; display:grid; gap:8px; font-size:13px; line-height:1.45; color:#334155; }
+.terms-list strong { color:#0f172a; }
 
 /* Expense upload / PO matching */
 .expense-upload-layout { display:grid; grid-template-columns:1fr 1fr; gap:16px; align-items:start; margin-bottom:16px; }
@@ -4098,11 +4102,6 @@ def purchase_request():
                             </select>
                         </div>
                         <div class="form-field">
-                            <label>Quote / Backup Reference</label>
-                            <input type="text" name="quote_backup" placeholder="Quote #12345, vendor email, or note">
-                            <p class="field-help">Optional note to help identify the backup.</p>
-                        </div>
-                        <div class="form-field">
                             <label>Upload Quote / Backup</label>
                             <input type="file" name="quote_files" multiple accept=".pdf,.png,.jpg,.jpeg,.doc,.docx,.xls,.xlsx,.csv,.txt,.eml,.msg">
                             <p class="field-help">Files are stored with the request and linked to the PO when approved.</p>
@@ -4209,12 +4208,7 @@ def purchase_requests():
             </a>
             """
 
-        manual_review_notice = """
-        <div class="notice info">
-            <strong>Purchase request review for July 1 rollout.</strong><br>
-            Purchase requests are reviewed by Accounting/Admin. When a request is approved, the app automatically creates an internal PO, links it to the request, and adds it to PO tracking/balances. The app does not write the PO back to the ERP.
-        </div>
-        """
+        manual_review_notice = ""
 
         dashboard_cards = f"""
         <div class="status-card-grid">
@@ -5539,6 +5533,22 @@ def po_packet(po_number):
         if packet_type == "internal":
             line_headers += "<th class=\"right\">Remaining</th>"
 
+        vendor_terms_card = "" if packet_type != "vendor" else """
+        <div class="card vendor-terms-card">
+            <h3>Coastal Engineering PO Terms and Conditions</h3>
+            <ul class="terms-list">
+                <li><strong>Delivery / Performance:</strong> Vendor must deliver goods or perform services by the required date. Delays without written approval may result in cancellation.</li>
+                <li><strong>Invoicing &amp; Payment:</strong> Include the PO number on all invoices. Send invoices to accounting@c-diving.com. Unless otherwise agreed, payment terms are Net 30 from receipt of a valid invoice and satisfactory delivery.</li>
+                <li><strong>Changes:</strong> No substitutions or changes to quantity or delivery date without written approval from Coastal Engineering.</li>
+                <li><strong>Inspection:</strong> All items are subject to inspection. Non-compliant goods or services may be rejected at the vendor's expense.</li>
+                <li><strong>Warranties:</strong> Vendor warrants that goods and services are free from defects, conform to specifications, and are fit for their intended use.</li>
+                <li><strong>Compliance:</strong> Vendor must comply with all applicable laws and regulations.</li>
+                <li><strong>Indemnification:</strong> Vendor agrees to hold Coastal Engineering harmless from any claims or liabilities arising from this Purchase Order.</li>
+                <li><strong>PO Cancellation:</strong> Coastal Engineering reserves the right to cancel this PO at any time for undelivered goods or services.</li>
+            </ul>
+        </div>
+        """
+
         content = f"""
         <div class="packet-actions">
             <a class="secondary" href="/pos-balances">Back to POs & Balances</a>
@@ -5577,6 +5587,7 @@ def po_packet(po_number):
             <h3>PO Line Items</h3>
             <div class="table-wrap"><table><tr>{line_headers}</tr>{line_rows}</table></div>
         </div>
+        {vendor_terms_card}
         {attachment_card(po.PONumber) if packet_type == 'internal' else ''}
         {posted_expense_card(posted_expenses) if packet_type == 'internal' else ''}
         {internal_timeline}
@@ -5734,7 +5745,7 @@ def project_po_setup():
                         <tr>
                             <th>PO</th>
                             <th class="project-filter-th">
-                                <div class="project-filter-head"><span>Project</span><button class="project-filter-button" type="button" onclick="togglePOProjectFilter()" title="Filter by project" aria-label="Filter by project"><span class="filter-icon">◇</span></button></div>
+                                <div class="project-filter-head"><span>Project</span><button class="project-filter-button" type="button" onclick="togglePOProjectFilter()" title="Filter by project" aria-label="Filter by project"><span class="filter-icon">▼</span></button></div>
                                 <select id="poProjectFilter" class="project-filter-select" onchange="filterPOInfoReviewByProject()">{project_filter_options}</select>
                             </th>
                             <th>Vendor / Amount</th><th>Requestor</th><th>Payment Type</th><th>Payment Schedule</th><th>Assigned To</th><th>Status</th><th>Actions</th>
