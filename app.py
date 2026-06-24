@@ -579,15 +579,22 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
     payment_schedule = _safe_text(_row_value(po, "PaymentSchedule"))
 
     def draw_logo(x, y, w, h):
+        # Keep PDF generation resilient. Some ReportLab/Pillow builds can fail on
+        # embedded JPEG decoding even when the same image works in the browser.
+        # If the image draw fails, fall back to a clean text logo instead of
+        # failing the whole PO packet route.
         if logo:
-            c.drawImage(logo, x, y, width=w, height=h, preserveAspectRatio=True, anchor="nw", mask="auto")
-        else:
-            c.setFillColor(navy)
-            c.setFont("Helvetica-Bold", 16)
-            c.drawString(x, y + h - 18, "COASTAL")
-            c.setFillColor(blue)
-            c.setFont("Helvetica-Bold", 10)
-            c.drawString(x, y + h - 32, "ENGINEERING GROUP")
+            try:
+                c.drawImage(logo, x, y, width=w, height=h, preserveAspectRatio=True, mask="auto")
+                return
+            except Exception:
+                pass
+        c.setFillColor(navy)
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(x, y + h - 18, "COASTAL")
+        c.setFillColor(blue)
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(x, y + h - 32, "ENGINEERING GROUP")
 
     def draw_label_value(x, y, label, value, w=160):
         c.setFillColor(muted)
@@ -5564,7 +5571,7 @@ def po_list():
             if row.AmountMismatch:
                 mismatch_badge = '<span class="badge amber">Check totals</span>'
 
-            po_url = "/po-detail?po_number=" + quote_plus(str(row.PONumber or ""))
+            po_url = "/po-packet/" + quote_plus(str(row.PONumber or "")) + "?type=internal"
 
             po_rows += f"""
             <tr>
@@ -5588,7 +5595,7 @@ def po_list():
         content = f"""
         <div class="card">
             <h3>Issued PO List</h3>
-            <p class="card-subtitle">Browse all issued POs imported into the dashboard. Click a PO number to view its line items.</p>
+            <p class="card-subtitle">Browse all issued POs imported into the dashboard. Click a PO number to open the full PO packet.</p>
             <div class="filter-hint">
                 <span>Use the filters below each column heading to narrow the issued PO list.</span>
                 <button type="button" onclick="clearPOListFilters()">Clear Filters</button>
@@ -5882,7 +5889,7 @@ def projects_page():
         for row in po_rows_raw:
             po_rows += f"""
             <tr>
-                <td><a class="po-link" href="/po-detail?po_number={quote_plus(str(row.PONumber or ''))}">{h(row.PONumber)}</a></td>
+                <td><a class="po-link" href="/po-packet/{quote_plus(str(row.PONumber or ''))}?type=internal">{h(row.PONumber)}</a></td>
                 <td>{h(row.VendorName)}</td>
                 <td>{status_chip(row.POStatus or 'Open')}</td>
                 <td>{h(row.PODate)}</td>
@@ -5900,7 +5907,7 @@ def projects_page():
         for row in line_rows_raw:
             line_rows += f"""
             <tr>
-                <td><a class="po-link" href="/po-detail?po_number={quote_plus(str(row.PONumber or ''))}">{h(row.PONumber)}</a></td>
+                <td><a class="po-link" href="/po-packet/{quote_plus(str(row.PONumber or ''))}?type=internal">{h(row.PONumber)}</a></td>
                 <td>{h(row.VendorName)}</td>
                 <td>{h(row.Department)}</td>
                 <td>{h(row.LineDescription)}</td>
@@ -5923,7 +5930,7 @@ def projects_page():
         </div>
         <div class="card">
             <h3>Project POs</h3>
-            <p class="card-subtitle">POs for the selected project. Click a PO number to open the full PO.</p>
+            <p class="card-subtitle">POs for the selected project. Click a PO number to open the full PO packet.</p>
             <div class="filter-hint"><span>Filter the PO table below.</span><button type="button" onclick="clearPOListFilters('projectPOTable')">Clear Filters</button></div>
             <div class="table-wrap"><table id="projectPOTable"><thead><tr><th>PO</th><th>Vendor</th><th>Status</th><th>PO Date</th><th>Requestor</th><th class="right">PO Value</th><th class="right">Posted Expenses</th><th class="right">Current Balance</th><th class="right">Lines</th></tr><tr class="column-filter-row"><th><input data-col="0" oninput="filterPOListTable('projectPOTable')" placeholder="PO"></th><th><input data-col="1" oninput="filterPOListTable('projectPOTable')" placeholder="Vendor"></th><th><input data-col="2" oninput="filterPOListTable('projectPOTable')" placeholder="Status"></th><th><input data-col="3" oninput="filterPOListTable('projectPOTable')" placeholder="Date"></th><th><input data-col="4" oninput="filterPOListTable('projectPOTable')" placeholder="Requestor"></th><th><input data-col="5" oninput="filterPOListTable('projectPOTable')" placeholder="Value"></th><th><input data-col="6" oninput="filterPOListTable('projectPOTable')" placeholder="Posted"></th><th><input data-col="7" oninput="filterPOListTable('projectPOTable')" placeholder="Balance"></th><th><input data-col="8" oninput="filterPOListTable('projectPOTable')" placeholder="Lines"></th></tr></thead><tbody>{po_rows}</tbody></table></div>
         </div>
@@ -5985,7 +5992,7 @@ def pos_balances():
         for row in data["pos"]:
             status_text = row.POStatus or "Unknown"
             flag = '<span class="badge amber">Mismatch</span>' if row.AmountMismatch else '<span class="badge green">OK</span>'
-            po_url = "/po-detail?po_number=" + quote_plus(str(row.PONumber or ""))
+            po_url = "/po-packet/" + quote_plus(str(row.PONumber or "")) + "?type=internal"
             internal_packet_url = "/po-packet/" + quote_plus(str(row.PONumber or "")) + "?type=internal"
             vendor_packet_url = "/po-packet/" + quote_plus(str(row.PONumber or "")) + "?type=vendor"
             po_rows += f"""
@@ -6012,7 +6019,7 @@ def pos_balances():
         for row in data["lines"]:
             line_rows += f"""
             <tr>
-                <td><a class="po-link" href="/po-detail?po_number={quote_plus(str(row.PONumber or ''))}">{h(row.PONumber)}</a></td>
+                <td><a class="po-link" href="/po-packet/{quote_plus(str(row.PONumber or ''))}?type=internal">{h(row.PONumber)}</a></td>
                 <td>{h(row.VendorName)}</td>
                 <td>{h(row.ProjectName)}</td>
                 <td>{h(row.Department)}</td>
@@ -6366,7 +6373,20 @@ def po_packet_pdf(po_number):
     if packet_type not in ["internal", "vendor"]:
         packet_type = "internal"
 
-    att = po_packet_pdf_attachment(po_number, packet_type)
+    try:
+        att = po_packet_pdf_attachment(po_number, packet_type)
+    except Exception as exc:
+        # If styled PDF rendering hits an environment-specific issue, return a
+        # valid fallback PDF instead of an Internal Server Error.
+        title = ("Vendor PO Packet" if packet_type == "vendor" else "Internal PO Packet") + " - " + clean_text(po_number)
+        att = {
+            "filename": f"{clean_text(po_number)}_{packet_type}_packet.pdf",
+            "content": simple_pdf_bytes(title, [
+                "Coastal Engineering Group",
+                "The styled PDF renderer encountered an issue. This fallback confirms the PO exists while the styled renderer is being corrected.",
+                f"PO Number: {clean_text(po_number)}",
+            ]),
+        }
     if not att:
         content = '<div class="notice error">PO PDF was not found.</div>'
         return shell("PO Packet PDF", "Unable to generate this PO packet PDF.", "POs & Balances", content), 404
@@ -6850,7 +6870,7 @@ def expenses_page():
             status_class = str(r.MatchStatus or "").lower().replace(" ", "-")
             po_number = r.CorrectPONumber or r.MatchedPONumber or r.ExtractedPONumber or ""
             posted_po = r.PostedPONumber or po_number
-            po_link = f'<a href="/po-detail?po_number={quote_plus(str(posted_po))}">{h(posted_po)}</a>' if posted_po else ""
+            po_link = f'<a href="/po-packet/{quote_plus(str(posted_po))}?type=internal">{h(posted_po)}</a>' if posted_po else ""
             unpost_button = ""
             if getattr(r, "PostedToPO", 0):
                 unpost_button = (
@@ -7094,7 +7114,7 @@ def vendors_page():
             for line in vendor_lines:
                 vendor_line_rows += f"""
                 <tr>
-                    <td><a class="po-link" href="/po-detail?po_number={quote_plus(str(line.PONumber or ''))}">{h(line.PONumber)}</a></td>
+                    <td><a class="po-link" href="/po-packet/{quote_plus(str(line.PONumber or ''))}?type=internal">{h(line.PONumber)}</a></td>
                     <td>{h(line.ProjectName)}</td>
                     <td>{h(line.Department)}</td>
                     <td>{h(line.LineDescription)}</td>
@@ -7137,7 +7157,7 @@ def vendors_page():
             <div class="card"><h3>Top Vendors by PO Amount</h3><div class="bar-chart">{top_rows}</div></div>
             <div class="card"><h3>Vendor Summary</h3><p class="card-subtitle">Click a vendor name to view all PO line items for that vendor.</p><div class="table-wrap"><table><tr><th>Vendor / Purchaser</th><th class="right">POs</th><th class="right">PO Amount</th><th class="right">Remaining</th><th class="right">Expense Rows</th><th class="right">Expense Amount</th></tr>{table_rows}</table></div></div>
         </div>
-        {f'<div class="card"><h3>PO Line Items for {h(selected_vendor)}</h3><p class="card-subtitle">Click a PO number to open the full PO.</p><div class="table-wrap"><table><tr><th>PO</th><th>Project</th><th>Department</th><th>Description</th><th>Unit</th><th class="right">Unit Cost</th><th class="right">Qty</th><th class="right">Line Amount</th></tr>{vendor_line_rows}</table></div></div>' if selected_vendor else ''}
+        {f'<div class="card"><h3>PO Line Items for {h(selected_vendor)}</h3><p class="card-subtitle">Click a PO number to open the full PO packet.</p><div class="table-wrap"><table><tr><th>PO</th><th>Project</th><th>Department</th><th>Description</th><th>Unit</th><th class="right">Unit Cost</th><th class="right">Qty</th><th class="right">Line Amount</th></tr>{vendor_line_rows}</table></div></div>' if selected_vendor else ''}
         """
         return shell("Vendors", "Vendor and purchaser totals across POs and expenses.", "Vendors", content)
     except Exception as e:
@@ -7173,7 +7193,7 @@ def pos_in_pm_comments_page():
         table_rows = ""
         for r in rows:
             po_number = r.CorrectPONumber or r.MatchedPONumber or r.ExtractedPONumber or ""
-            po_link = f'<a href="/po-detail?po_number={quote_plus(str(po_number))}">{h(po_number)}</a>' if po_number else ""
+            po_link = f'<a href="/po-packet/{quote_plus(str(po_number))}?type=internal">{h(po_number)}</a>' if po_number else ""
             status_class = str(r.MatchStatus or "").lower().replace(" ", "-")
             table_rows += f"""<tr><td><span class="status-chip {h(status_class)}">{h(r.MatchStatus)}</span><br>{posting_status_chip(r)}<br><small>{h(r.MatchConfidence)}</small></td><td><strong>{h(r.ExpenseId or r.ExpenseReviewItemId)}</strong><br><small>{h(r.TxDate)}</small></td><td>{h(r.ProjectName)}</td><td>{h(r.VendorName)}<br><small>{h(r.TxType)}</small></td><td class="right">{currency(r.Amount)}</td><td>{h(r.PMComments)}</td><td>{po_link}</td><td>{h(r.ReviewDecision)}</td><td class="posting-audit-cell">{h(posting_reason(r))}<br><small>{h(r.PostedBy or '')} {h(r.PostedAt or '')}</small></td></tr>"""
         if not table_rows:
@@ -7793,7 +7813,7 @@ def exceptions():
 
         for row in rows:
             count_by_type[row.ExceptionType] = count_by_type.get(row.ExceptionType, 0) + 1
-            po_url = "/po-detail?po_number=" + quote_plus(str(row.PONumber or ""))
+            po_url = "/po-packet/" + quote_plus(str(row.PONumber or "")) + "?type=internal"
             badge_class = "red" if row.ExceptionType == "Amount Mismatch" else "amber"
 
             exception_rows += f"""
