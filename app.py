@@ -961,44 +961,81 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
 
     def terms_block(y):
         terms = [
-            "Vendor must deliver goods or perform services by the required date. Delays without written approval may result in cancellation.",
-            "Include the PO number on all invoices. Send invoices to accounting@c-diving.com. Unless otherwise agreed, payment terms are Net 30 from receipt of a valid invoice and satisfactory delivery.",
-            "No substitutions or changes to quantity or delivery date without written approval from Coastal Engineering.",
-            "All items are subject to inspection. Non-compliant goods or services may be rejected at the vendor's expense.",
-            "Vendor warrants goods and services are free from defects, conform to specifications, and are fit for their intended use.",
-            "Vendor must comply with all applicable laws and regulations.",
-            "Vendor agrees to hold Coastal Engineering harmless from claims or liabilities arising from this Purchase Order.",
-            "Coastal Engineering reserves the right to cancel this PO at any time for undelivered goods or services.",
+            ("Delivery", "Vendor must deliver goods or perform services by the required date. Delays without written approval may result in cancellation."),
+            ("Invoicing & Payment", "Include the PO number on all invoices. Send invoices to accounting@c-diving.com. Unless otherwise agreed, payment terms are Net 30 from receipt of a valid invoice and satisfactory delivery."),
+            ("Changes", "No substitutions or changes to quantity or delivery date without written approval from Coastal Engineering."),
+            ("Inspection", "All items are subject to inspection. Non-compliant goods or services may be rejected at the vendor's expense."),
+            ("Warranties", "Vendor warrants that goods and services are free from defects, conform to specifications, and are fit for their intended use."),
+            ("Compliance", "Vendor must comply with all applicable laws and regulations."),
+            ("Indemnification", "Vendor agrees to hold Coastal Engineering harmless from any claims or liabilities arising from this Purchase Order."),
+            ("PO Cancellation", "Coastal Engineering reserves the right to cancel this PO at any time for undelivered goods or services."),
         ]
-        est_height = 220
-        if y < est_height + 55:
+        # Keep terms readable and aligned to the same page/table edges.
+        # The old version used too many characters per line, which made the terms
+        # look cramped and caused long lines to run across the section.
+        if y < 230:
             footer(f"PO {po_number}")
             y = new_page()
         y = section_title(y, "Coastal Engineering PO Terms and Conditions")
-        c.setFillColor(panel)
-        c.setStrokeColor(light_line)
-        c.roundRect(margin, y - est_height, W - 2 * margin, est_height, 4, fill=1, stroke=1)
-        c.setFillColor(text)
-        c.setFont("Helvetica", 8.0)
+
+        box_x = margin
+        box_w = W - 2 * margin
+        inner_x = box_x + 12
+        inner_w = box_w - 24
+        max_chars = 104
+        row_gap = 8
+        line_h = 10.2
+
+        # Pre-wrap so the box height matches the actual terms content.
+        prepared = []
+        total_h = 18
+        for label, body in terms:
+            first = f"{label}: {body}"
+            wrapped = wrap_pdf_text(first, max_chars)
+            prepared.append((label, wrapped))
+            total_h += max(16, len(wrapped) * line_h) + row_gap
+        total_h = min(total_h + 8, y - 58)
+
+        c.setFillColor(colors.HexColor("#f8fbff"))
+        c.setStrokeColor(colors.HexColor("#bfdbfe"))
+        c.roundRect(box_x, y - total_h, box_w, total_h, 4, fill=1, stroke=1)
+
         yy = y - 17
-        max_chars = 145
-        for term in terms:
-            wrapped = wrap_pdf_text("• " + term, max_chars)
-            for txt in wrapped:
-                c.drawString(margin + 12, yy, txt)
-                yy -= 9.2
-            yy -= 3.8
-            if yy < 62:
+        for idx, (label, wrapped) in enumerate(prepared, start=1):
+            # If the terms section gets too long for the page, continue cleanly on a new page.
+            needed = max(16, len(wrapped) * line_h) + row_gap
+            if yy - needed < 58:
                 footer(f"PO {po_number}")
                 y = new_page()
                 y = section_title(y, "Coastal Engineering PO Terms and Conditions Continued")
-                c.setFillColor(panel)
-                c.setStrokeColor(light_line)
-                c.roundRect(margin, y - est_height, W - 2 * margin, est_height, 4, fill=1, stroke=1)
-                c.setFillColor(text)
-                c.setFont("Helvetica", 8.0)
-                yy = y - 17
-        return y - est_height - 16
+                yy = y - 14
+                remaining_h = max(120, min(y - 58, 260))
+                c.setFillColor(colors.HexColor("#f8fbff"))
+                c.setStrokeColor(colors.HexColor("#bfdbfe"))
+                c.roundRect(box_x, y - remaining_h, box_w, remaining_h, 4, fill=1, stroke=1)
+
+            bullet_x = inner_x
+            text_x = inner_x + 12
+            c.setFillColor(accent)
+            c.circle(bullet_x + 3, yy - 2, 2.2, fill=1, stroke=0)
+
+            for line_idx, txt in enumerate(wrapped):
+                if line_idx == 0 and ":" in txt:
+                    label_part, rest = txt.split(":", 1)
+                    c.setFillColor(navy)
+                    c.setFont("Helvetica-Bold", 8.6)
+                    c.drawString(text_x, yy, label_part + ":")
+                    label_width = c.stringWidth(label_part + ": ", "Helvetica-Bold", 8.6)
+                    c.setFillColor(text)
+                    c.setFont("Helvetica", 8.6)
+                    c.drawString(text_x + label_width, yy, rest.strip())
+                else:
+                    c.setFillColor(text)
+                    c.setFont("Helvetica", 8.6)
+                    c.drawString(text_x, yy, txt)
+                yy -= line_h
+            yy -= row_gap
+        return yy - 6
 
     y = header()
     y = two_column_details(y)
