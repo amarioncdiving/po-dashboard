@@ -540,12 +540,12 @@ def _row_value(row, name, default=""):
 
 
 def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="internal"):
-    """Create branded PO packet PDFs.
+    """Create formal document style PO packet PDFs.
 
-    Internal packets follow the selected Option 1 style: navy wave header,
-    grouped info cards, totals block, and internal balance/audit detail.
-    Vendor packets follow the selected Option 2 style in blue: clean white
-    header, blue total badge, line items, invoice instructions, and terms.
+    Selected design: Mockup C for both internal and vendor packets.
+    This layout is intentionally PDF-native and reliable: clean letterhead,
+    formal purchase-order title block, two-column details, line items, totals,
+    and internal/vendor-specific sections.
     """
     try:
         from io import BytesIO
@@ -571,23 +571,24 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=letter)
     W, H = letter
-    margin = 34
+    margin = 36
 
     navy = colors.HexColor("#061b36")
-    navy2 = colors.HexColor("#09284d")
     blue = colors.HexColor("#0b5dad")
-    blue2 = colors.HexColor("#0d3f76")
-    pale_blue = colors.HexColor("#eef6ff")
-    pale_panel = colors.HexColor("#f8fbff")
-    border = colors.HexColor("#d9e2ef")
+    blue_dark = colors.HexColor("#07447f")
+    green = colors.HexColor("#0f766e")
     text = colors.HexColor("#0f172a")
     muted = colors.HexColor("#64748b")
-    dark_green = colors.HexColor("#0f766e")
+    line_color = colors.HexColor("#cbd5e1")
+    light_line = colors.HexColor("#e2e8f0")
+    panel = colors.HexColor("#f8fafc")
+    soft_blue = colors.HexColor("#eff6ff")
 
     logo = _coastal_logo_image_reader()
-    po_number = _safe_text(_row_value(po, "PONumber"))
+    po_number = _safe_text(_row_value(po, "PONumber")) or "PO"
     vendor = _safe_text(_row_value(po, "VendorName")) or "Vendor TBD"
     project = _safe_text(_row_value(po, "ProjectName")) or "Project TBD"
+    project_code = _safe_text(_row_value(po, "ProjectCode")) or ""
     department = _safe_text(_row_value(po, "Department")) or "Department TBD"
     requestor = _safe_text(_row_value(po, "Requestor")) or "Requestor TBD"
     po_date = _safe_text(_row_value(po, "PODate")) or "TBD"
@@ -595,9 +596,13 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
     po_value = _row_value(po, "POValue", 0)
     posted_amount = _row_value(po, "PostedExpenseAmount", 0)
     current_balance = _row_value(po, "RemainingAmount", 0)
-    payment_type = _safe_text(_row_value(po, "PaymentType")) or "TBD"
+    payment_type = _safe_text(_row_value(po, "PaymentType")) or "Net 30"
     payment_schedule = _safe_multiline(_row_value(po, "PaymentSchedule"))
     status = _safe_text(_row_value(po, "POStatus")) or "Open"
+    is_vendor = packet_type == "vendor"
+    accent = blue if is_vendor else navy
+    title = "PURCHASE ORDER"
+    subtitle = po_number
 
     def draw_logo(x, y, w, h):
         if logo:
@@ -607,116 +612,166 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
             except Exception:
                 pass
         c.setFillColor(navy)
-        c.setFont("Helvetica-Bold", 18)
-        c.drawString(x, y + h - 20, "COASTAL")
+        c.setFont("Helvetica-Bold", 19)
+        c.drawString(x, y + h - 22, "COASTAL")
         c.setFillColor(blue)
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(x, y + h - 34, "ENGINEERING GROUP")
+        c.setFont("Helvetica-Bold", 8.5)
+        c.drawString(x, y + h - 36, "ENGINEERING GROUP")
 
-    def draw_top_wave_header(title, subtitle):
-        c.setFillColor(navy)
-        c.rect(0, H - 116, W, 116, fill=1, stroke=0)
-        c.setFillColor(navy2)
-        p = c.beginPath()
-        p.moveTo(0, H - 66)
-        p.curveTo(W * 0.25, H - 88, W * 0.46, H - 50, W, H - 72)
-        p.lineTo(W, H - 116)
-        p.lineTo(0, H - 116)
-        p.close()
-        c.drawPath(p, fill=1, stroke=0)
-        c.setFillColor(blue)
-        p2 = c.beginPath()
-        p2.moveTo(0, H - 100)
-        p2.curveTo(W * 0.26, H - 124, W * 0.48, H - 83, W, H - 104)
-        p2.lineTo(W, H - 116)
-        p2.lineTo(0, H - 116)
-        p2.close()
-        c.drawPath(p2, fill=1, stroke=0)
-        draw_logo(margin, H - 86, 175, 58)
-        c.setFillColor(colors.white)
-        c.setFont("Helvetica-Bold", 20)
-        c.drawRightString(W - margin, H - 48, title)
-        c.setFillColor(colors.HexColor("#60a5fa"))
-        c.setFont("Helvetica-Bold", 12)
-        c.drawRightString(W - margin, H - 66, subtitle)
-        return H - 142
-
-    def draw_vendor_header():
+    def header():
         c.setFillColor(colors.white)
         c.rect(0, 0, W, H, fill=1, stroke=0)
-        draw_logo(margin, H - 70, 190, 52)
+        draw_logo(margin, H - 76, 175, 50)
         c.setFillColor(navy)
         c.setFont("Helvetica-Bold", 21)
-        c.drawRightString(W - margin, H - 42, "PURCHASE ORDER")
-        c.setFillColor(blue)
-        c.setFont("Helvetica-Bold", 12)
-        c.drawRightString(W - margin, H - 60, po_number)
-        c.setFillColor(blue)
-        c.rect(0, H - 88, W, 5, fill=1, stroke=0)
-        return H - 112
+        c.drawRightString(W - margin, H - 47, title)
+        c.setFillColor(blue if is_vendor else navy)
+        c.setFont("Helvetica-Bold", 11)
+        c.drawRightString(W - margin, H - 65, subtitle)
+        c.setStrokeColor(line_color)
+        c.setLineWidth(1)
+        c.line(margin, H - 88, W - margin, H - 88)
+        c.setStrokeColor(accent)
+        c.setLineWidth(2.2)
+        c.line(margin, H - 92, W - margin, H - 92)
+        if not is_vendor:
+            c.setFillColor(colors.HexColor("#334155"))
+            c.setFont("Helvetica-Bold", 7.5)
+            c.drawRightString(W - margin, H - 77, "FOR INTERNAL USE ONLY")
+        return H - 118
 
-    def footer(vendor_mode=False):
-        c.setFillColor(blue if vendor_mode else navy)
-        c.rect(0, 0, W, 30, fill=1, stroke=0)
-        c.setFillColor(colors.white)
-        c.setFont("Helvetica-Bold", 7.3)
-        c.drawCentredString(W / 2, 17, "COASTAL ENGINEERING GROUP PO TERMS & CONDITIONS" if vendor_mode else "COASTAL ENGINEERING GROUP INTERNAL PO PACKET")
-        c.setFont("Helvetica", 6)
-        c.setFillColor(colors.HexColor("#dbeafe"))
-        c.drawRightString(W - margin, 17, f"Generated {datetime.now().strftime('%Y-%m-%d %I:%M %p')}")
+    def footer(page_label=""):
+        c.setStrokeColor(line_color)
+        c.setLineWidth(0.7)
+        c.line(margin, 42, W - margin, 42)
+        c.setFillColor(muted)
+        c.setFont("Helvetica", 6.8)
+        c.drawString(margin, 28, "Coastal Engineering Group")
+        c.drawCentredString(W / 2, 28, "Generated " + datetime.now().strftime("%Y-%m-%d %I:%M %p"))
+        c.drawRightString(W - margin, 28, page_label)
 
-    def box(x, y_top, w, h, fill=colors.white, stroke=border, r=8):
-        c.setFillColor(fill)
-        c.setStrokeColor(stroke)
-        c.roundRect(x, y_top - h, w, h, r, fill=1, stroke=1)
+    def section_title(y, title_text):
+        c.setFillColor(accent)
+        c.setFont("Helvetica-Bold", 8.8)
+        c.drawString(margin, y, _safe_text(title_text).upper())
+        c.setStrokeColor(accent)
+        c.setLineWidth(0.8)
+        c.line(margin, y - 4, W - margin, y - 4)
+        return y - 16
 
-    def label_value(x, y, label, value, width=150, max_lines=3, label_color=muted, value_color=text):
-        c.setFillColor(label_color)
+    def label_value(x, y, label, value, width=150, label_w=72, max_lines=3):
+        c.setFillColor(navy)
         c.setFont("Helvetica-Bold", 6.7)
-        c.drawString(x, y, _safe_text(label).upper())
-        c.setFillColor(value_color)
-        c.setFont("Helvetica", 8.2)
-        yy = y - 10
-        for line in wrap_pdf_text(_safe_text(value), max(16, int(width / 4.2)))[:max_lines]:
-            c.drawString(x, yy, line)
+        c.drawString(x, y, _safe_text(label).upper() + ":")
+        c.setFillColor(text)
+        c.setFont("Helvetica", 7.6)
+        lines_wrapped = []
+        for part in _safe_text(value).split("\n"):
+            lines_wrapped.extend(wrap_pdf_text(part, max(12, int((width - label_w) / 4.1))))
+        yy = y
+        for line in (lines_wrapped or [""])[:max_lines]:
+            c.drawString(x + label_w, yy, line)
             yy -= 9
         return yy
 
-    def table_header(y, cols, widths, bg):
-        c.setFillColor(bg)
+    def two_column_details(y):
+        left_x = margin
+        right_x = W / 2 + 8
+        col_w = (W - 2 * margin - 16) / 2
+        box_h = 116 if is_vendor else 138
+        c.setFillColor(colors.white)
+        c.setStrokeColor(light_line)
+        c.roundRect(left_x, y - box_h, col_w, box_h, 4, fill=1, stroke=1)
+        c.roundRect(right_x, y - box_h, col_w, box_h, 4, fill=1, stroke=1)
+        c.setFillColor(panel)
+        c.roundRect(left_x, y - 22, col_w, 22, 4, fill=1, stroke=0)
+        c.roundRect(right_x, y - 22, col_w, 22, 4, fill=1, stroke=0)
+        c.setFillColor(navy)
+        c.setFont("Helvetica-Bold", 7.5)
+        c.drawString(left_x + 10, y - 14, "PO DETAILS")
+        c.drawString(right_x + 10, y - 14, "VENDOR / DELIVERY")
+        yy = y - 38
+        label_value(left_x + 10, yy, "PO Date", po_date, col_w - 20, 92, 1)
+        yy -= 15
+        label_value(left_x + 10, yy, "Required Date", required_date, col_w - 20, 92, 1)
+        yy -= 15
+        label_value(left_x + 10, yy, "Payment Terms", payment_type, col_w - 20, 92, 1)
+        yy -= 15
+        label_value(left_x + 10, yy, "Requestor", requestor, col_w - 20, 92, 1)
+        yy -= 15
+        label_value(left_x + 10, yy, "Department", department, col_w - 20, 92, 1)
+        if not is_vendor:
+            yy -= 15
+            label_value(left_x + 10, yy, "Status", status, col_w - 20, 92, 1)
+        yy2 = y - 38
+        label_value(right_x + 10, yy2, "Vendor", vendor, col_w - 20, 72, 3)
+        yy2 -= 37
+        deliver_to = "Coastal Engineering Group\n"
+        if project_code:
+            deliver_to += f"Project: {project_code} - {project}\n"
+        else:
+            deliver_to += f"Project: {project}\n"
+        deliver_to += f"Attn: {requestor}"
+        label_value(right_x + 10, yy2, "Ship To", deliver_to, col_w - 20, 72, 4)
+        return y - box_h - 20
+
+    def table_header(y, cols, widths):
+        c.setFillColor(accent)
         c.rect(margin, y - 18, sum(widths), 18, fill=1, stroke=0)
         c.setFillColor(colors.white)
-        c.setFont("Helvetica-Bold", 6.2)
+        c.setFont("Helvetica-Bold", 6.4)
         xx = margin
         for col, w in zip(cols, widths):
             c.drawString(xx + 4, y - 12, _safe_text(col).upper())
             xx += w
         return y - 18
 
-    def line_items_table(y, vendor_mode=False):
-        cols = ["Line", "Description", "Unit", "Qty", "Unit Cost", "Line Amount"]
-        widths = [28, 224 if vendor_mode else 190, 42, 42, 70, 82]
-        if not vendor_mode:
-            cols.append("Open")
-            widths.append(60)
-        y = table_header(y, cols, widths, blue if vendor_mode else navy)
-        c.setFont("Helvetica", 6.8)
-        for idx, line in enumerate((lines or []), start=1):
-            desc_lines = wrap_pdf_text(_safe_text(_row_value(line, "LineDescription")), 38 if vendor_mode else 31)[:3]
-            row_h = max(20, 10 + len(desc_lines) * 8)
-            if y - row_h < 58:
-                footer(vendor_mode)
-                c.showPage()
-                y = draw_vendor_header() if vendor_mode else draw_top_wave_header("PURCHASE ORDER", po_number)
-                y = table_header(y, cols, widths, blue if vendor_mode else navy)
-                c.setFont("Helvetica", 6.8)
+    def new_page():
+        c.showPage()
+        yy = header()
+        return yy
+
+    def line_items_table(y):
+        y = section_title(y, "Line Items")
+        if is_vendor:
+            cols = ["Line", "Description", "Unit", "Qty", "Unit Cost", "Line Amount"]
+            widths = [28, 242, 44, 48, 78, 94]
+        else:
+            cols = ["Line", "Description", "Unit", "Qty", "Unit Cost", "Line Amount", "Open"]
+            widths = [28, 190, 40, 44, 68, 82, 82]
+        y = table_header(y, cols, widths)
+        c.setFont("Helvetica", 6.9)
+        total_width = sum(widths)
+        if not lines:
             c.setFillColor(colors.white)
-            c.setStrokeColor(border)
-            c.rect(margin, y - row_h, sum(widths), row_h, fill=1, stroke=1)
-            xx = margin
-            vals = [str(idx), "\n".join(desc_lines), _safe_text(_row_value(line, "Unit")), _safe_text(_row_value(line, "Qty")), _money(_row_value(line, "UnitCost", 0)), _money(_row_value(line, "LineAmount", 0))]
-            if not vendor_mode:
+            c.setStrokeColor(light_line)
+            c.rect(margin, y - 22, total_width, 22, fill=1, stroke=1)
+            c.setFillColor(muted)
+            c.drawString(margin + 6, y - 14, "No PO line items available.")
+            return y - 22
+        for idx, line in enumerate(lines, start=1):
+            desc_lines = wrap_pdf_text(_safe_text(_row_value(line, "LineDescription")), 42 if is_vendor else 32)[:3]
+            row_h = max(20, 9 + len(desc_lines) * 8)
+            if y - row_h < 70:
+                footer(f"PO {po_number}")
+                y = new_page()
+                y = section_title(y, "Line Items Continued")
+                y = table_header(y, cols, widths)
+                c.setFont("Helvetica", 6.9)
+            c.setFillColor(colors.white if idx % 2 else panel)
+            c.setStrokeColor(light_line)
+            c.rect(margin, y - row_h, total_width, row_h, fill=1, stroke=1)
+            vals = [
+                str(idx),
+                "\n".join(desc_lines),
+                _safe_text(_row_value(line, "Unit")),
+                _safe_text(_row_value(line, "Qty")),
+                _money(_row_value(line, "UnitCost", 0)),
+                _money(_row_value(line, "LineAmount", 0)),
+            ]
+            if not is_vendor:
                 vals.append(_money(_row_value(line, "RemainingAmount", 0)))
+            xx = margin
             for i, (val, w) in enumerate(zip(vals, widths)):
                 c.setFillColor(text)
                 if "\n" in val:
@@ -727,51 +782,122 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
                 elif i >= 3:
                     c.drawRightString(xx + w - 4, y - 12, val)
                 else:
-                    c.drawString(xx + 4, y - 12, val)
+                    c.drawString(xx + 4, y - 12, val[:48])
                 xx += w
             y -= row_h
+        return y - 10
+
+    def totals_block(y):
+        x = W - margin - 190
+        row_h = 18
+        labels = [("Subtotal", po_value)]
+        if not is_vendor:
+            labels.extend([("Posted Expenses", posted_amount), ("Current App Balance", current_balance)])
+        else:
+            labels.append(("Total PO Value", po_value))
+        h = 18 + row_h * len(labels)
+        if y - h < 70:
+            footer(f"PO {po_number}")
+            y = new_page()
+        c.setStrokeColor(line_color)
+        c.setFillColor(colors.white)
+        c.roundRect(x, y - h, 190, h, 4, fill=1, stroke=1)
+        c.setFillColor(panel)
+        c.roundRect(x, y - 18, 190, 18, 4, fill=1, stroke=0)
+        c.setFillColor(navy)
+        c.setFont("Helvetica-Bold", 7)
+        c.drawString(x + 10, y - 12, "TOTALS")
+        yy = y - 32
+        for label, val in labels:
+            is_total = label.lower().startswith("total") or label.lower().startswith("current")
+            c.setFillColor(navy if is_total else muted)
+            c.setFont("Helvetica-Bold" if is_total else "Helvetica", 7.3)
+            c.drawString(x + 10, yy, label)
+            c.drawRightString(x + 180, yy, _money(val))
+            yy -= row_h
+        return y - h - 18
+
+    def notes_block(y):
+        if y < 135:
+            footer(f"PO {po_number}")
+            y = new_page()
+        note_w = (W - 2 * margin - 18) / 3
+        blocks = [
+            ("Please Note", "Reference PO number on all invoices."),
+            ("Send Invoices To", "accounting@c-diving.com"),
+            ("Payment Terms", "Net 30 from receipt of valid invoice and satisfactory delivery."),
+        ]
+        for i, (lbl, val) in enumerate(blocks):
+            x = margin + i * (note_w + 9)
+            c.setFillColor(panel)
+            c.setStrokeColor(light_line)
+            c.roundRect(x, y - 58, note_w, 58, 4, fill=1, stroke=1)
+            c.setFillColor(navy)
+            c.setFont("Helvetica-Bold", 6.6)
+            c.drawString(x + 9, y - 15, lbl.upper())
+            c.setFillColor(text)
+            c.setFont("Helvetica", 6.8)
+            yy = y - 27
+            for ln in wrap_pdf_text(val, int(note_w / 4.2))[:3]:
+                c.drawString(x + 9, yy, ln)
+                yy -= 8
+        return y - 74
+
+    def internal_sections(y):
+        if payment_schedule:
+            if y < 116:
+                footer(f"PO {po_number}")
+                y = new_page()
+            y = section_title(y, "Payment Schedule")
+            c.setFillColor(panel)
+            c.setStrokeColor(light_line)
+            c.roundRect(margin, y - 48, W - 2 * margin, 48, 4, fill=1, stroke=1)
+            c.setFillColor(text)
+            c.setFont("Helvetica", 7.1)
+            yy = y - 13
+            for ln in wrap_pdf_text(payment_schedule, 112)[:4]:
+                c.drawString(margin + 10, yy, ln)
+                yy -= 9
+            y -= 64
+        if posted_expenses:
+            if y < 144:
+                footer(f"PO {po_number}")
+                y = new_page()
+            y = section_title(y, "Posted Expenses")
+            cols = ["Date", "Vendor", "Type", "Amount", "Posted By"]
+            widths = [70, 150, 95, 82, 137]
+            y = table_header(y, cols, widths)
+            c.setFont("Helvetica", 6.6)
+            for idx, exp in enumerate(posted_expenses[:34], start=1):
+                if y < 62:
+                    footer(f"PO {po_number}")
+                    y = new_page()
+                    y = section_title(y, "Posted Expenses Continued")
+                    y = table_header(y, cols, widths)
+                    c.setFont("Helvetica", 6.6)
+                c.setFillColor(colors.white if idx % 2 else panel)
+                c.setStrokeColor(light_line)
+                c.rect(margin, y - 18, sum(widths), 18, fill=1, stroke=1)
+                vals = [
+                    _safe_text(_row_value(exp, "TxDate")),
+                    _safe_text(_row_value(exp, "VendorName")),
+                    _safe_text(_row_value(exp, "TxType")),
+                    _money(_row_value(exp, "PostedAmount", _row_value(exp, "Amount", 0))),
+                    _safe_text(_row_value(exp, "PostedBy")),
+                ]
+                xx = margin
+                for i, (val, w) in enumerate(zip(vals, widths)):
+                    c.setFillColor(text)
+                    if i == 3:
+                        c.drawRightString(xx + w - 4, y - 12, val)
+                    else:
+                        c.drawString(xx + 4, y - 12, val[:34])
+                    xx += w
+                y -= 18
+            y -= 10
         return y
 
-    if packet_type == "vendor":
-        y = draw_vendor_header()
-        # Option 2 style: date tiles and blue total badge.
-        tile_w = (W - 2 * margin - 24) / 3
-        for i, (lbl, val, fill) in enumerate([("PO Date", po_date, pale_blue), ("Required Date", required_date, pale_blue), ("Total Amount", _money(po_value), blue2)]):
-            x = margin + i * (tile_w + 12)
-            box(x, y, tile_w, 54, fill=fill, stroke=border if i < 2 else blue2)
-            if i < 2:
-                label_value(x + 12, y - 17, lbl, val, tile_w - 24, 1)
-            else:
-                c.setFillColor(colors.HexColor("#bfdbfe"))
-                c.setFont("Helvetica-Bold", 7)
-                c.drawString(x + 12, y - 18, "TOTAL AMOUNT")
-                c.setFillColor(colors.white)
-                c.setFont("Helvetica-Bold", 15)
-                c.drawString(x + 12, y - 38, _money(po_value))
-        y -= 72
-        half = (W - 2 * margin - 12) / 2
-        box(margin, y, half, 76)
-        label_value(margin + 12, y - 16, "Vendor", vendor, half - 24, 3)
-        box(margin + half + 12, y, half, 76)
-        label_value(margin + half + 24, y - 16, "Deliver To", f"Coastal Engineering Group\nProject: {project}\nAttn: {requestor}", half - 24, 4)
-        y -= 96
-        y = line_items_table(y, vendor_mode=True)
-        y -= 14
-        if y < 240:
-            footer(True)
-            c.showPage()
-            y = draw_vendor_header()
-        third = (W - 2 * margin - 24) / 3
-        info = [("Please Note", "Reference PO number on all invoices."), ("Send Invoices To", "accounting@c-diving.com"), ("Payment Terms", "Net 30 from receipt of valid invoice and satisfactory delivery.")]
-        for i, (lbl, val) in enumerate(info):
-            x = margin + i * (third + 12)
-            box(x, y, third, 64, fill=pale_panel)
-            label_value(x + 12, y - 15, lbl, val, third - 24, 3)
-        y -= 82
-        box(margin, y, W - 2 * margin, 156, fill=pale_blue, stroke=border)
-        c.setFillColor(navy)
-        c.setFont("Helvetica-Bold", 9)
-        c.drawString(margin + 12, y - 17, "COASTAL ENGINEERING PO TERMS AND CONDITIONS")
+    def terms_block(y):
         terms = [
             "Vendor must deliver goods or perform services by the required date. Delays without written approval may result in cancellation.",
             "Include the PO number on all invoices. Send invoices to accounting@c-diving.com. Unless otherwise agreed, payment terms are Net 30 from receipt of a valid invoice and satisfactory delivery.",
@@ -782,102 +908,35 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
             "Vendor agrees to hold Coastal Engineering harmless from claims or liabilities arising from this Purchase Order.",
             "Coastal Engineering reserves the right to cancel this PO at any time for undelivered goods or services.",
         ]
-        c.setFont("Helvetica", 6.1)
+        if y < 250:
+            footer(f"PO {po_number}")
+            y = new_page()
+        y = section_title(y, "Coastal Engineering PO Terms and Conditions")
+        c.setFillColor(panel)
+        c.setStrokeColor(light_line)
+        c.roundRect(margin, y - 172, W - 2 * margin, 172, 4, fill=1, stroke=1)
         c.setFillColor(text)
-        col_x = [margin + 12, margin + (W - 2 * margin) / 2 + 8]
-        col_y = [y - 32, y - 32]
+        c.setFont("Helvetica", 5.9)
+        col_x = [margin + 10, margin + (W - 2 * margin) / 2 + 8]
+        col_y = [y - 14, y - 14]
         for i, term in enumerate(terms):
             col = 0 if i < 4 else 1
-            for txt in wrap_pdf_text("- " + term, 61):
+            for txt in wrap_pdf_text("• " + term, 65):
                 c.drawString(col_x[col], col_y[col], txt)
-                col_y[col] -= 7.6
-            col_y[col] -= 1.5
-        footer(True)
+                col_y[col] -= 7.2
+            col_y[col] -= 2
+        return y - 188
+
+    y = header()
+    y = two_column_details(y)
+    y = line_items_table(y)
+    y = totals_block(y)
+    y = notes_block(y)
+    if is_vendor:
+        y = terms_block(y)
     else:
-        y = draw_top_wave_header("PURCHASE ORDER", po_number)
-        # Option 1 style: three top cards plus strong internal totals panel.
-        card_w = (W - 2 * margin - 24) / 3
-        box(margin, y, card_w, 84)
-        label_value(margin + 12, y - 16, "Vendor", vendor, card_w - 24, 3)
-        label_value(margin + 12, y - 51, "Project", project, card_w - 24, 2)
-        box(margin + card_w + 12, y, card_w, 84)
-        label_value(margin + card_w + 24, y - 16, "Requestor", requestor, card_w - 24, 2)
-        label_value(margin + card_w + 24, y - 51, "Department", department, card_w - 24, 2)
-        box(margin + 2 * (card_w + 12), y, card_w, 84, fill=colors.HexColor("#06264a"), stroke=colors.HexColor("#06264a"))
-        c.setFillColor(colors.HexColor("#bfdbfe"))
-        c.setFont("Helvetica-Bold", 6.8)
-        c.drawString(margin + 2 * (card_w + 12) + 12, y - 16, "PO TOTAL")
-        c.drawString(margin + 2 * (card_w + 12) + 12, y - 43, "AMOUNT POSTED")
-        c.drawString(margin + 2 * (card_w + 12) + 12, y - 64, "CURRENT APP BALANCE")
-        c.setFillColor(colors.white)
-        c.setFont("Helvetica-Bold", 12)
-        c.drawRightString(W - margin - 12, y - 16, _money(po_value))
-        c.drawRightString(W - margin - 12, y - 43, _money(posted_amount))
-        c.drawRightString(W - margin - 12, y - 64, _money(current_balance))
-        y -= 102
-        small_w = (W - 2 * margin - 36) / 4
-        items = [("PO Date", po_date), ("Payment Type", payment_type), ("Expected Payment", required_date), ("Status", status)]
-        for i, (lbl, val) in enumerate(items):
-            x = margin + i * (small_w + 12)
-            box(x, y, small_w, 44, fill=pale_blue)
-            label_value(x + 10, y - 14, lbl, val, small_w - 20, 1)
-        y -= 62
-        c.setFillColor(navy)
-        c.setFont("Helvetica-Bold", 10)
-        c.drawString(margin, y, "PO Line Items")
-        y -= 9
-        y = line_items_table(y, vendor_mode=False)
-        y -= 14
-        if payment_schedule:
-            if y < 124:
-                footer(False)
-                c.showPage()
-                y = draw_top_wave_header("PURCHASE ORDER", po_number)
-            box(margin, y, W - 2 * margin, 56, fill=pale_panel)
-            c.setFillColor(muted)
-            c.setFont("Helvetica-Bold", 6.8)
-            c.drawString(margin + 12, y - 15, "PAYMENT SCHEDULE")
-            c.setFillColor(text)
-            c.setFont("Helvetica", 7.2)
-            yy = y - 27
-            for line in wrap_pdf_text(payment_schedule, 105)[:3]:
-                c.drawString(margin + 12, yy, line)
-                yy -= 9
-            y -= 72
-        if posted_expenses:
-            if y < 150:
-                footer(False)
-                c.showPage()
-                y = draw_top_wave_header("PURCHASE ORDER", po_number)
-            c.setFillColor(navy)
-            c.setFont("Helvetica-Bold", 10)
-            c.drawString(margin, y, "Posted Expenses")
-            y -= 9
-            cols = ["Date", "Vendor", "Type", "Amount", "Posted By"]
-            widths = [68, 145, 95, 78, 145]
-            y = table_header(y, cols, widths, navy)
-            c.setFont("Helvetica", 6.5)
-            for exp in posted_expenses[:28]:
-                if y < 62:
-                    footer(False)
-                    c.showPage()
-                    y = draw_top_wave_header("PURCHASE ORDER", po_number)
-                    y = table_header(y, cols, widths, navy)
-                    c.setFont("Helvetica", 6.5)
-                vals = [_safe_text(_row_value(exp, "TxDate")), _safe_text(_row_value(exp, "VendorName")), _safe_text(_row_value(exp, "TxType")), _money(_row_value(exp, "PostedAmount", _row_value(exp, "Amount", 0))), _safe_text(_row_value(exp, "PostedBy"))]
-                c.setFillColor(colors.white)
-                c.setStrokeColor(border)
-                c.rect(margin, y - 18, sum(widths), 18, fill=1, stroke=1)
-                xx = margin
-                for i, (val, w) in enumerate(zip(vals, widths)):
-                    c.setFillColor(text)
-                    if i == 3:
-                        c.drawRightString(xx + w - 4, y - 12, val)
-                    else:
-                        c.drawString(xx + 4, y - 12, val[:30])
-                    xx += w
-                y -= 18
-        footer(False)
+        y = internal_sections(y)
+    footer(f"PO {po_number}")
     c.save()
     return buf.getvalue()
 
