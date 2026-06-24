@@ -3838,26 +3838,50 @@ def ensure_purchase_request_project_code_column(cursor):
 
 
 def load_existing_project_options():
-    """Return active project options that already exist in the app. Purchase requests must select one of these."""
+    """Return project options from the actual project/PO setup data.
+
+    Purchase requests must select an existing project. This list intentionally
+    does not create projects from the request form and does not depend on the
+    current user's PO requestor filter, because Admin/Accounting need to be able
+    to submit requests against any setup project.
+    """
     try:
         conn = get_sql_connection()
         cursor = conn.cursor()
         ensure_project_code_columns(cursor)
         conn.commit()
-        req_where, req_params = requestor_filter_sql("po")
         cursor.execute(
-            f"""
-            SELECT DISTINCT
-                COALESCE(NULLIF(pr.ProjectCode, ''), NULLIF(po.ProjectCode, ''), '') AS ProjectCode,
-                COALESCE(NULLIF(pr.ProjectName, ''), NULLIF(l.ProjectName, ''), '') AS ProjectName
-            FROM dbo.PurchaseOrders po
-            LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
-            LEFT JOIN dbo.IssuedPOLines l ON po.PurchaseOrderId = l.PurchaseOrderId
-            WHERE {req_where}
-            ORDER BY COALESCE(NULLIF(pr.ProjectCode, ''), NULLIF(po.ProjectCode, ''), ''),
-                     COALESCE(NULLIF(pr.ProjectName, ''), NULLIF(l.ProjectName, ''), '');
-            """,
-            *req_params,
+            """
+            ;WITH ProjectChoices AS (
+                SELECT
+                    COALESCE(NULLIF(ProjectCode, ''), '') AS ProjectCode,
+                    COALESCE(NULLIF(ProjectName, ''), '') AS ProjectName
+                FROM dbo.Projects
+                WHERE COALESCE(NULLIF(ProjectCode, ''), NULLIF(ProjectName, '')) IS NOT NULL
+
+                UNION
+
+                SELECT
+                    COALESCE(NULLIF(po.ProjectCode, ''), NULLIF(p.ProjectCode, ''), '') AS ProjectCode,
+                    COALESCE(NULLIF(p.ProjectName, ''), NULLIF(l.ProjectName, ''), '') AS ProjectName
+                FROM dbo.PurchaseOrders po
+                LEFT JOIN dbo.Projects p ON po.ProjectId = p.ProjectId
+                LEFT JOIN dbo.IssuedPOLines l ON po.PurchaseOrderId = l.PurchaseOrderId
+                WHERE COALESCE(NULLIF(po.ProjectCode, ''), NULLIF(p.ProjectCode, ''), NULLIF(p.ProjectName, ''), NULLIF(l.ProjectName, '')) IS NOT NULL
+
+                UNION
+
+                SELECT
+                    COALESCE(NULLIF(ProjectCode, ''), '') AS ProjectCode,
+                    COALESCE(NULLIF(ProjectName, ''), '') AS ProjectName
+                FROM dbo.IssuedPOLines
+                WHERE COALESCE(NULLIF(ProjectCode, ''), NULLIF(ProjectName, '')) IS NOT NULL
+            )
+            SELECT DISTINCT ProjectCode, ProjectName
+            FROM ProjectChoices
+            WHERE COALESCE(NULLIF(ProjectCode, ''), NULLIF(ProjectName, '')) IS NOT NULL
+            ORDER BY ProjectCode, ProjectName;
+            """
         )
         rows = cursor.fetchall()
         conn.close()
@@ -5114,7 +5138,7 @@ def purchase_request():
     )
     no_project_notice = ""
     if not project_options:
-        no_project_notice = '<div class="notice warning"><strong>No projects are available for purchase requests yet.</strong><br>Upload issued POs for the project setup first, then return to this form.</div>'
+        no_project_notice = '<div class="notice warning"><strong>No projects are available for purchase requests yet.</strong><br>Upload issued POs for project setup first. Purchase requests can only be submitted against projects already loaded into the app.</div>'
 
     message_html = ""
 
@@ -5165,7 +5189,7 @@ def purchase_request():
                             <select name="project_value" required>
                                 {project_select_options}
                             </select>
-                            <p class="field-help">Projects must already exist from issued PO project setup. This form cannot create new projects.</p>
+                            <p class="field-help">Select a project already loaded through issued PO project setup. This form cannot create new projects.</p>
                         </div>
                         <div class="form-field">
                             <label>Department *</label>
