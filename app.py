@@ -8,8 +8,9 @@ import re
 from datetime import datetime, date
 from decimal import Decimal, InvalidOperation
 from urllib.parse import quote_plus
+from werkzeug.utils import secure_filename
 
-from flask import Flask, jsonify, request, Response, redirect, make_response
+from flask import Flask, jsonify, request, Response, redirect, make_response, send_from_directory
 
 
 # ------------------------------------------------------------
@@ -63,6 +64,10 @@ DEPARTMENT_OPTIONS = [
 ]
 
 
+REQUEST_ATTACHMENT_ROOT = os.getenv("REQUEST_ATTACHMENT_ROOT", "/home/site/wwwroot/request_attachments")
+ALLOWED_ATTACHMENT_EXTENSIONS = {"pdf", "png", "jpg", "jpeg", "doc", "docx", "xls", "xlsx", "csv", "txt", "eml", "msg"}
+
+
 VALID_ROLES = [
     "Admin",
     "Executive",
@@ -80,6 +85,7 @@ PAGE_ACCESS = {
     "Purchase Requests": ["Admin", "Executive", "Accounting"],
     "Approver Queue": ["Admin", "Executive", "Accounting"],
     "POs & Balances": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
+    "Projects": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "Forecasting": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "Project PO Setup": ["Admin", "Executive", "Accounting", "Project Manager"],
     "PO Setup Review": ["Admin", "Executive", "Accounting", "Project Manager"],
@@ -239,7 +245,6 @@ def get_user_access():
     try:
         conn = get_sql_connection()
         cursor = conn.cursor()
-
         cursor.execute(
             """
             SELECT TOP 1
@@ -1627,7 +1632,7 @@ def load_purchase_requests(limit=100):
     return rows
 
 
-def create_purchase_request(form):
+def create_purchase_request(form, files=None):
     user = get_current_user()
     access = get_user_access()
 
@@ -1711,11 +1716,13 @@ def create_purchase_request(form):
         )
 
         purchase_request_id = cursor.fetchone().PurchaseRequestId
+        saved_attachments = save_purchase_request_attachments(cursor, purchase_request_id, request_number, files or [])
         conn.commit()
 
         return {
             "purchase_request_id": purchase_request_id,
             "request_number": request_number,
+            "saved_attachments": saved_attachments,
         }
 
     except Exception:
@@ -1867,6 +1874,21 @@ def create_or_update_po_from_purchase_request(cursor, purchase_request_id, reque
             amount,
             requestor,
         )
+
+
+    try:
+        ensure_request_attachment_table(cursor)
+        cursor.execute(
+            """
+            UPDATE dbo.PurchaseRequestAttachments
+            SET PONumber = ?
+            WHERE PurchaseRequestId = ?;
+            """,
+            po_number,
+            purchase_request_id,
+        )
+    except Exception:
+        pass
 
     return po_number
 
@@ -2618,6 +2640,7 @@ a, a:visited { color:#1d4ed8; }
   font-size:13px;
 }
 .project-filter-button:hover { background:#eaf4ff; border-color:#93c5fd; }
+.filter-icon { font-size:16px; line-height:1; transform:rotate(45deg); display:inline-block; }
 .project-filter-select {
   display:none;
   margin-top:8px;
@@ -2744,6 +2767,173 @@ def get_view_as_email():
 def current_working_email():
     return get_view_as_email() or get_current_user().get("email") or ""
 
+
+
+def lookup_dashboard_user_by_email(email):
+    email = clean_text(email)
+    if not email:
+        return None
+    try:
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT TOP 1 Email, DisplayName, RoleName, IsActive
+            FROM dbo.DashboardUsers
+            WHERE LOWER(Email) = LOWER(?);
+            """,
+            email,
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return row
+    except Exception:
+        return None
+
+
+def current_data_role():
+    view_email = get_view_as_email()
+    if view_email:
+        row = lookup_dashboard_user_by_email(view_email)
+        if row and getattr(row, "IsActive", 0):
+            return clean_text(row.RoleName) or "No Access"
+    return get_user_access().get("role") or "No Access"
+
+
+def current_data_email():
+    return current_working_email()
+
+
+def should_filter_pos_to_requestor():
+    return current_data_role() == "Project Manager" and bool(current_data_email())
+
+
+def requestor_filter_sql(alias):
+    if should_filter_pos_to_requestor():
+        return f"LOWER(COALESCE({alias}.Requestor, '')) = LOWER(?)", [current_data_email()]
+    return "1=1", []
+
+
+def allowed_attachment(filename):
+    if not filename or "." not in filename:
+        return False
+    ext = filename.rsplit(".", 1)[1].lower()
+    return ext in ALLOWED_ATTACHMENT_EXTENSIONS
+
+
+def ensure_request_attachment_table(cursor):
+    cursor.execute(
+        """
+        IF OBJECT_ID('dbo.PurchaseRequestAttachments', 'U') IS NULL
+        BEGIN
+            CREATE TABLE dbo.PurchaseRequestAttachments (
+                AttachmentId INT IDENTITY(1,1) PRIMARY KEY,
+                PurchaseRequestId INT NOT NULL,
+                RequestNumber NVARCHAR(100) NULL,
+                PONumber NVARCHAR(100) NULL,
+                OriginalFileName NVARCHAR(260) NOT NULL,
+                StoredFileName NVARCHAR(260) NOT NULL,
+                StoragePath NVARCHAR(1000) NOT NULL,
+                ContentType NVARCHAR(200) NULL,
+                FileSize BIGINT NULL,
+                UploadedBy NVARCHAR(255) NULL,
+                UploadedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+            );
+        END
+        """
+    )
+
+
+def save_purchase_request_attachments(cursor, purchase_request_id, request_number, files):
+    files = files or []
+    saved = []
+    if not files:
+        return saved
+    ensure_request_attachment_table(cursor)
+    request_folder = secure_filename(str(request_number or purchase_request_id)) or str(purchase_request_id)
+    target_dir = os.path.join(REQUEST_ATTACHMENT_ROOT, request_folder)
+    os.makedirs(target_dir, exist_ok=True)
+    user_email = get_current_user().get("email") or "Unknown"
+    for uploaded in files:
+        if not uploaded or not uploaded.filename:
+            continue
+        if not allowed_attachment(uploaded.filename):
+            raise ValueError(f"Attachment type not allowed: {uploaded.filename}")
+        original_name = uploaded.filename
+        safe_name = secure_filename(original_name)
+        stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+        stored_name = f"{stamp}_{safe_name}"
+        storage_path = os.path.join(target_dir, stored_name)
+        uploaded.save(storage_path)
+        file_size = os.path.getsize(storage_path) if os.path.exists(storage_path) else None
+        cursor.execute(
+            """
+            INSERT INTO dbo.PurchaseRequestAttachments
+                (PurchaseRequestId, RequestNumber, OriginalFileName, StoredFileName, StoragePath, ContentType, FileSize, UploadedBy)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            purchase_request_id,
+            request_number,
+            original_name,
+            stored_name,
+            storage_path,
+            uploaded.content_type,
+            file_size,
+            user_email,
+        )
+        saved.append(original_name)
+    return saved
+
+
+def load_po_attachments(po_number):
+    po_number = clean_text(po_number)
+    if not po_number:
+        return []
+    try:
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        ensure_request_attachment_table(cursor)
+        cursor.execute(
+            """
+            SELECT AttachmentId, RequestNumber, PONumber, OriginalFileName, ContentType, FileSize, UploadedBy, UploadedAt
+            FROM dbo.PurchaseRequestAttachments
+            WHERE PONumber = ?
+            ORDER BY UploadedAt DESC, AttachmentId DESC;
+            """,
+            po_number,
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+    except Exception:
+        return []
+
+
+def attachment_card(po_number):
+    rows = load_po_attachments(po_number)
+    table_rows = ""
+    for r in rows:
+        size = getattr(r, "FileSize", 0) or 0
+        size_label = f"{size / 1024:.1f} KB" if size else ""
+        table_rows += f"""
+        <tr>
+            <td><a class="po-link" href="/purchase-request-attachment/{r.AttachmentId}" target="_blank">{h(r.OriginalFileName)}</a></td>
+            <td>{h(r.RequestNumber)}</td>
+            <td>{h(r.ContentType or '')}</td>
+            <td>{h(size_label)}</td>
+            <td>{h(r.UploadedBy)}</td>
+            <td>{h(r.UploadedAt)}</td>
+        </tr>
+        """
+    if not table_rows:
+        table_rows = '<tr><td colspan="6"><div class="empty-state"><strong>No quote or backup files linked.</strong><span>Files uploaded with the purchase request will appear here after the request is converted to a PO.</span></div></td></tr>'
+    return f"""
+    <div class="card">
+        <h3>Quote / Backup Files</h3>
+        <div class="table-wrap"><table><tr><th>File</th><th>Request</th><th>Type</th><th>Size</th><th>Uploaded By</th><th>Uploaded At</th></tr>{table_rows}</table></div>
+    </div>
+    """
+
 def view_as_notice():
     view_email = get_view_as_email()
     if not view_email:
@@ -2760,6 +2950,7 @@ def shell(title, subtitle, active, content):
         ("New Purchase Request", "/purchase-request", "📝"),
         ("Purchase Requests", "/purchase-requests", "📋"),
         ("POs & Balances", "/pos-balances", "💳"),
+        ("Projects", "/projects", "📁"),
         ("PO Setup Review", "/project-po-setup", "🧭"),
     ]
 
@@ -2973,6 +3164,7 @@ def load_pos_balances_data():
     ensure_expense_review_tables()
     conn = get_sql_connection()
     cursor = conn.cursor()
+    req_where, req_params = requestor_filter_sql("l")
 
     posted_cte = """
         PostedExpenses AS (
@@ -3029,7 +3221,8 @@ def load_pos_balances_data():
             SUM(CurrentAppBalance) AS TotalRemainingAmount,
             SUM(CASE WHEN ABS(COALESCE(POValue, 0) - COALESCE(TotalLineAmount, 0)) > 0.01 THEN 1 ELSE 0 END) AS AmountMismatchCount
         FROM UniquePOs;
-        """
+        """,
+        *req_params,
     )
     row = cursor.fetchone()
     overall = {
@@ -3057,7 +3250,8 @@ def load_pos_balances_data():
         FROM UniquePOs
         GROUP BY ProjectName
         ORDER BY POValue DESC;
-        """
+        """,
+        *req_params,
     )
     projects = cursor.fetchall()
 
@@ -3074,7 +3268,8 @@ def load_pos_balances_data():
         FROM UniquePOs
         GROUP BY VendorName
         ORDER BY POValue DESC;
-        """
+        """,
+        *req_params,
     )
     vendors = cursor.fetchall()
 
@@ -3097,7 +3292,8 @@ def load_pos_balances_data():
             CASE WHEN ABS(COALESCE(POValue, 0) - COALESCE(TotalLineAmount, 0)) > 0.01 THEN 1 ELSE 0 END AS AmountMismatch
         FROM UniquePOs
         ORDER BY PODate DESC, PONumber DESC;
-        """
+        """,
+        *req_params,
     )
     pos = cursor.fetchall()
 
@@ -3114,9 +3310,11 @@ def load_pos_balances_data():
             Qty,
             LineAmount,
             RemainingAmount
-        FROM dbo.IssuedPOLines
+        FROM dbo.IssuedPOLines l
+        WHERE {req_where}
         ORDER BY CreatedAt DESC, IssuedPOLineId DESC;
-        """
+        """.format(req_where=req_where),
+        *req_params,
     )
     lines = cursor.fetchall()
     conn.close()
@@ -3449,6 +3647,8 @@ def render_payment_schedule_for_packet(payment_schedule):
 def load_po_packet_data(po_number):
     conn = get_sql_connection()
     cursor = conn.cursor()
+    req_where, req_params = requestor_filter_sql("po")
+    line_req_where, line_req_params = requestor_filter_sql("IssuedPOLines")
     ensure_po_setup_columns(cursor)
     conn.commit()
     cursor.execute(
@@ -3480,7 +3680,7 @@ def load_po_packet_data(po_number):
         LEFT JOIN (
             SELECT PONumber, SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount, COUNT(*) AS LineCount
             FROM dbo.IssuedPOLines
-            WHERE PONumber = ?
+            WHERE PONumber = ? AND {line_req_where}
             GROUP BY PONumber
         ) lines ON lines.PONumber = po.PONumber
         LEFT JOIN (
@@ -3489,11 +3689,13 @@ def load_po_packet_data(po_number):
             WHERE COALESCE(PostedToPO, 0) = 1 AND PostedPONumber = ?
             GROUP BY PostedPONumber
         ) posted ON posted.PostedPONumber = po.PONumber
-        WHERE po.PONumber = ?;
-        """,
+        WHERE po.PONumber = ? AND {req_where};
+        """.format(line_req_where=line_req_where, req_where=req_where),
+        po_number,
+        *line_req_params,
         po_number,
         po_number,
-        po_number,
+        *req_params,
     )
     po = cursor.fetchone()
     cursor.execute(
@@ -3507,10 +3709,11 @@ def load_po_packet_data(po_number):
             RemainingAmount,
             CreatedAt
         FROM dbo.IssuedPOLines
-        WHERE PONumber = ?
+        WHERE PONumber = ? AND {line_req_where}
         ORDER BY IssuedPOLineId;
-        """,
+        """.format(line_req_where=line_req_where),
         po_number,
+        *line_req_params,
     )
     lines = cursor.fetchall()
     cursor.execute(
@@ -3558,6 +3761,10 @@ def load_project_po_setup_items(status_filter=None, assigned_filter=None):
 
     where_clauses = []
     params = []
+    req_where, req_params = requestor_filter_sql("po")
+    if req_where != "1=1":
+        where_clauses.append(req_where)
+        params.extend(req_params)
 
     if status_filter and status_filter != "All":
         where_clauses.append("COALESCE(NULLIF(po.SetupStatus, ''), CASE WHEN COALESCE(po.PaymentSchedule, '') = '' THEN 'Needs Payment Schedule' ELSE 'Complete' END) = ?")
@@ -3803,7 +4010,7 @@ def purchase_request():
 
     if request.method == "POST":
         try:
-            result = create_purchase_request(request.form)
+            result = create_purchase_request(request.form, request.files.getlist("quote_files"))
             message_html = f"""
             <div class="submit-status-box success">
                 <strong>Purchase request submitted successfully.</strong><br>
@@ -3820,7 +4027,7 @@ def purchase_request():
     content = f"""
     {message_html}
 
-    <form method="post" action="/purchase-request">
+    <form method="post" action="/purchase-request" enctype="multipart/form-data">
         <div class="grid two">
             <div>
                 <div class="card">
@@ -3892,8 +4099,13 @@ def purchase_request():
                         </div>
                         <div class="form-field">
                             <label>Quote / Backup Reference</label>
-                            <input type="text" name="quote_backup" placeholder="Quote #12345, vendor email, or file name">
-                            <p class="field-help">Actual file upload can be added later with Egnyte or Azure Blob Storage.</p>
+                            <input type="text" name="quote_backup" placeholder="Quote #12345, vendor email, or note">
+                            <p class="field-help">Optional note to help identify the backup.</p>
+                        </div>
+                        <div class="form-field">
+                            <label>Upload Quote / Backup</label>
+                            <input type="file" name="quote_files" multiple accept=".pdf,.png,.jpg,.jpeg,.doc,.docx,.xls,.xlsx,.csv,.txt,.eml,.msg">
+                            <p class="field-help">Files are stored with the request and linked to the PO when approved.</p>
                         </div>
                     </div>
                 </div>
@@ -3953,14 +4165,6 @@ def purchase_request():
                     </table>
                 </div>
 
-                <div class="card">
-                    <h3>Helpful Tips</h3>
-                    <div class="summary-list">
-                        <div class="summary-item"><span>Use a specific request name.</span></div>
-                        <div class="summary-item"><span>Add vendor info when known, but do not delay the request if unknown.</span></div>
-                        <div class="summary-item"><span>Use the quote field to reference backup, email approvals, or vendor quote numbers.</span></div>
-                    </div>
-                </div>
             </div>
         </div>
     </form>
@@ -4096,7 +4300,7 @@ def purchase_requests():
         {manual_review_notice}
         {dashboard_cards}
 
-        <div class="grid two visual-chart-row">
+        <div class="grid two visual-chart-row" style="margin-bottom:24px;">
             <div class="mini-chart-card">
                 <h4>Request Status Mix</h4>
                 <div class="mini-bar-row"><span>Submitted</span><div><b style="width:{max(5, stats["submitted_requests"] / total_requests * 100)}%"></b></div><em>{stats["submitted_requests"]}</em></div>
@@ -4591,6 +4795,7 @@ def po_detail():
     try:
         conn = get_sql_connection()
         cursor = conn.cursor()
+        req_where, req_params = requestor_filter_sql("IssuedPOLines")
 
         cursor.execute(
             """
@@ -4606,10 +4811,11 @@ def po_detail():
                 RemainingAmount,
                 Requestor
             FROM dbo.IssuedPOLines
-            WHERE PONumber = ?
+            WHERE PONumber = ? AND {req_where}
             ORDER BY CreatedAt DESC;
-            """,
+            """.format(req_where=req_where),
             po_number,
+            *req_params,
         )
 
         header = cursor.fetchone()
@@ -4623,10 +4829,11 @@ def po_detail():
             """
             SELECT LineDescription, Unit, UnitCost, Qty, LineAmount
             FROM dbo.IssuedPOLines
-            WHERE PONumber = ?
+            WHERE PONumber = ? AND {req_where}
             ORDER BY IssuedPOLineId;
-            """,
+            """.format(req_where=req_where),
             po_number,
+            *req_params,
         )
         lines = cursor.fetchall()
 
@@ -4639,9 +4846,10 @@ def po_detail():
                 MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS RevisedAmount,
                 MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
             FROM dbo.IssuedPOLines
-            WHERE PONumber = ?;
-            """,
+            WHERE PONumber = ? AND {req_where};
+            """.format(req_where=req_where),
             po_number,
+            *req_params,
         )
         totals = cursor.fetchone()
         conn.close()
@@ -4671,6 +4879,183 @@ def po_detail():
         return shell("PO Detail", "Unable to load PO detail.", "PO Detail", content), 500
 
 
+
+
+@app.route("/projects")
+def projects_page():
+    allowed, reason = require_page_access("Projects")
+    if not allowed:
+        return access_denied_response("Projects", reason)
+
+    selected_project = clean_text(request.args.get("project")) or ""
+    try:
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        ensure_project_code_columns(cursor)
+        conn.commit()
+        req_where_po, req_params_po = requestor_filter_sql("po")
+        req_where_line, req_params_line = requestor_filter_sql("l")
+
+        cursor.execute(
+            f"""
+            SELECT DISTINCT
+                COALESCE(pr.ProjectCode, '') AS ProjectCode,
+                COALESCE(pr.ProjectName, l.ProjectName, '') AS ProjectName
+            FROM dbo.IssuedPOLines l
+            LEFT JOIN dbo.PurchaseOrders po ON l.PurchaseOrderId = po.PurchaseOrderId
+            LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
+            WHERE {req_where_line}
+            ORDER BY COALESCE(pr.ProjectCode, ''), COALESCE(pr.ProjectName, l.ProjectName, '');
+            """,
+            *req_params_line,
+        )
+        projects = cursor.fetchall()
+
+        if not selected_project and projects:
+            first = projects[0]
+            selected_project = clean_text(first.ProjectCode) or clean_text(first.ProjectName) or ""
+
+        options = ""
+        for pr in projects:
+            value = clean_text(pr.ProjectCode) or clean_text(pr.ProjectName) or ""
+            label = (clean_text(pr.ProjectCode) + " - " if clean_text(pr.ProjectCode) else "") + (clean_text(pr.ProjectName) or "Unnamed Project")
+            sel = " selected" if value == selected_project else ""
+            options += f'<option value="{h(value)}"{sel}>{h(label)}</option>'
+
+        project_filter_sql = "1=0"
+        params_po = []
+        params_line = []
+        if selected_project:
+            project_filter_sql = "(LOWER(COALESCE(pr.ProjectCode, '')) = LOWER(?) OR LOWER(COALESCE(pr.ProjectName, l.ProjectName, '')) = LOWER(?))"
+            params_po = [selected_project, selected_project]
+            params_line = [selected_project, selected_project]
+
+        cursor.execute(
+            f"""
+            WITH PostedExpenses AS (
+                SELECT PostedPONumber AS PONumber, SUM(COALESCE(PostedAmount, Amount, 0)) AS PostedExpenseAmount
+                FROM dbo.ExpenseReviewItems
+                WHERE COALESCE(PostedToPO, 0) = 1 AND COALESCE(PostedPONumber, '') <> ''
+                GROUP BY PostedPONumber
+            ), LineRollup AS (
+                SELECT PONumber, SUM(COALESCE(LineAmount, 0)) AS LineAmount, COUNT(*) AS LineCount
+                FROM dbo.IssuedPOLines
+                GROUP BY PONumber
+            )
+            SELECT
+                po.PONumber,
+                COALESCE(v.VendorName, 'Missing Vendor') AS VendorName,
+                COALESCE(pr.ProjectCode, '') AS ProjectCode,
+                COALESCE(pr.ProjectName, '') AS ProjectName,
+                po.Department,
+                po.POStatus,
+                po.PODate,
+                po.Requestor,
+                COALESCE(po.RevisedAmount, po.OriginalAmount, lr.LineAmount, 0) AS POValue,
+                COALESCE(pe.PostedExpenseAmount, 0) AS PostedExpenseAmount,
+                CASE WHEN COALESCE(po.RevisedAmount, po.OriginalAmount, lr.LineAmount, 0) - COALESCE(pe.PostedExpenseAmount, 0) < 0 THEN 0 ELSE COALESCE(po.RevisedAmount, po.OriginalAmount, lr.LineAmount, 0) - COALESCE(pe.PostedExpenseAmount, 0) END AS CurrentAppBalance,
+                COALESCE(lr.LineCount, 0) AS LineCount
+            FROM dbo.PurchaseOrders po
+            LEFT JOIN dbo.Vendors v ON po.VendorId = v.VendorId
+            LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
+            LEFT JOIN LineRollup lr ON lr.PONumber = po.PONumber
+            LEFT JOIN PostedExpenses pe ON pe.PONumber = po.PONumber
+            LEFT JOIN dbo.IssuedPOLines l ON l.PONumber = po.PONumber
+            WHERE {project_filter_sql} AND {req_where_po}
+            GROUP BY po.PONumber, v.VendorName, pr.ProjectCode, pr.ProjectName, po.Department, po.POStatus, po.PODate, po.Requestor, po.RevisedAmount, po.OriginalAmount, lr.LineAmount, pe.PostedExpenseAmount, lr.LineCount
+            ORDER BY po.PONumber;
+            """,
+            *(params_po + req_params_po),
+        )
+        po_rows_raw = cursor.fetchall()
+
+        cursor.execute(
+            f"""
+            SELECT TOP 1000
+                l.PONumber,
+                l.VendorName,
+                COALESCE(pr.ProjectCode, '') AS ProjectCode,
+                COALESCE(pr.ProjectName, l.ProjectName, '') AS ProjectName,
+                l.Department,
+                l.LineDescription,
+                l.Unit,
+                l.UnitCost,
+                l.Qty,
+                l.LineAmount
+            FROM dbo.IssuedPOLines l
+            LEFT JOIN dbo.PurchaseOrders po ON l.PurchaseOrderId = po.PurchaseOrderId
+            LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
+            WHERE {project_filter_sql} AND {req_where_line}
+            ORDER BY l.PONumber, l.IssuedPOLineId;
+            """,
+            *(params_line + req_params_line),
+        )
+        line_rows_raw = cursor.fetchall()
+        conn.close()
+
+        po_rows = ""
+        for row in po_rows_raw:
+            po_rows += f"""
+            <tr>
+                <td><a class="po-link" href="/po-detail?po_number={quote_plus(str(row.PONumber or ''))}">{h(row.PONumber)}</a></td>
+                <td>{h(row.VendorName)}</td>
+                <td>{status_chip(row.POStatus or 'Open')}</td>
+                <td>{h(row.PODate)}</td>
+                <td>{h(row.Requestor)}</td>
+                <td class="right">{currency(row.POValue)}</td>
+                <td class="right">{currency(row.PostedExpenseAmount)}</td>
+                <td class="right">{currency(row.CurrentAppBalance)}</td>
+                <td class="right">{h(row.LineCount)}</td>
+            </tr>
+            """
+        if not po_rows:
+            po_rows = '<tr><td colspan="9"><div class="empty-state"><strong>No POs found for this project.</strong></div></td></tr>'
+
+        line_rows = ""
+        for row in line_rows_raw:
+            line_rows += f"""
+            <tr>
+                <td><a class="po-link" href="/po-detail?po_number={quote_plus(str(row.PONumber or ''))}">{h(row.PONumber)}</a></td>
+                <td>{h(row.VendorName)}</td>
+                <td>{h(row.Department)}</td>
+                <td>{h(row.LineDescription)}</td>
+                <td>{h(row.Unit)}</td>
+                <td class="right">{currency(row.UnitCost)}</td>
+                <td class="right">{h(row.Qty)}</td>
+                <td class="right">{currency(row.LineAmount)}</td>
+            </tr>
+            """
+        if not line_rows:
+            line_rows = '<tr><td colspan="8"><div class="empty-state"><strong>No line items found for this project.</strong></div></td></tr>'
+
+        content = f"""
+        <div class="card">
+            <h3>Select Project</h3>
+            <form method="get" action="/projects" class="filters">
+                <select name="project" onchange="this.form.submit()">{options}</select>
+                <noscript><button class="primary" type="submit">Open Project</button></noscript>
+            </form>
+        </div>
+        <div class="card">
+            <h3>Project POs</h3>
+            <p class="card-subtitle">POs for the selected project. Click a PO number to open the full PO.</p>
+            <div class="filter-hint"><span>Filter the PO table below.</span><button type="button" onclick="clearPOListFilters('projectPOTable')">Clear Filters</button></div>
+            <div class="table-wrap"><table id="projectPOTable"><thead><tr><th>PO</th><th>Vendor</th><th>Status</th><th>PO Date</th><th>Requestor</th><th class="right">PO Value</th><th class="right">Posted Expenses</th><th class="right">Current Balance</th><th class="right">Lines</th></tr><tr class="column-filter-row"><th><input data-col="0" oninput="filterPOListTable('projectPOTable')" placeholder="PO"></th><th><input data-col="1" oninput="filterPOListTable('projectPOTable')" placeholder="Vendor"></th><th><input data-col="2" oninput="filterPOListTable('projectPOTable')" placeholder="Status"></th><th><input data-col="3" oninput="filterPOListTable('projectPOTable')" placeholder="Date"></th><th><input data-col="4" oninput="filterPOListTable('projectPOTable')" placeholder="Requestor"></th><th><input data-col="5" oninput="filterPOListTable('projectPOTable')" placeholder="Value"></th><th><input data-col="6" oninput="filterPOListTable('projectPOTable')" placeholder="Posted"></th><th><input data-col="7" oninput="filterPOListTable('projectPOTable')" placeholder="Balance"></th><th><input data-col="8" oninput="filterPOListTable('projectPOTable')" placeholder="Lines"></th></tr></thead><tbody>{po_rows}</tbody></table></div>
+        </div>
+        <div class="card">
+            <h3>Project PO Line Items</h3>
+            <p class="card-subtitle">Line-item drilldown for the selected project.</p>
+            <div class="filter-hint"><span>Filter the line-item table below.</span><button type="button" onclick="clearPOListFilters('projectLineTable')">Clear Filters</button></div>
+            <div class="table-wrap"><table id="projectLineTable"><thead><tr><th>PO</th><th>Vendor</th><th>Department</th><th>Description</th><th>Unit</th><th class="right">Unit Cost</th><th class="right">Qty</th><th class="right">Line Amount</th></tr><tr class="column-filter-row"><th><input data-col="0" oninput="filterPOListTable('projectLineTable')" placeholder="PO"></th><th><input data-col="1" oninput="filterPOListTable('projectLineTable')" placeholder="Vendor"></th><th><input data-col="2" oninput="filterPOListTable('projectLineTable')" placeholder="Dept"></th><th><input data-col="3" oninput="filterPOListTable('projectLineTable')" placeholder="Description"></th><th><input data-col="4" oninput="filterPOListTable('projectLineTable')" placeholder="Unit"></th><th><input data-col="5" oninput="filterPOListTable('projectLineTable')" placeholder="Unit cost"></th><th><input data-col="6" oninput="filterPOListTable('projectLineTable')" placeholder="Qty"></th><th><input data-col="7" oninput="filterPOListTable('projectLineTable')" placeholder="Amount"></th></tr></thead><tbody>{line_rows}</tbody></table></div>
+        </div>
+        <script>
+        function filterPOListTable(tableId) {{ const table = document.getElementById(tableId); if (!table) return; const filters = Array.from(table.querySelectorAll('.column-filter-row input')).map(input => {{ return {{ col: Number(input.dataset.col), value: input.value.trim().toLowerCase() }}; }}); Array.from(table.querySelectorAll('tbody tr')).forEach(row => {{ const cells = Array.from(row.children); const show = filters.every(filter => !filter.value || ((cells[filter.col] || {{textContent:''}}).textContent.toLowerCase().includes(filter.value))); row.style.display = show ? '' : 'none'; }}); }}
+        function clearPOListFilters(tableId) {{ const table = document.getElementById(tableId); if (!table) return; table.querySelectorAll('.column-filter-row input').forEach(input => input.value = ''); filterPOListTable(tableId); }}
+        </script>
+        """
+        return shell("Projects", "Review project POs and line-item detail.", "Projects", content)
+    except Exception as e:
+        return shell("Projects", "Unable to load projects.", "Projects", f'<div class="notice error">Error loading Projects: {h(e)}</div>'), 500
 
 @app.route("/pos-balances")
 def pos_balances():
@@ -4773,7 +5158,7 @@ def pos_balances():
             <div class="project-bucket-grid">{render_open_balance_buckets(data['projects'])}</div>
         </div>
 
-        <div class="grid two visual-chart-row">
+        <div class="grid two visual-chart-row" style="margin-bottom:24px;">
             <div class="card">
                 <h3>PO Exposure by Project</h3>
                 <p class="card-subtitle">Issued value, line totals, and remaining balances by project.</p>
@@ -5192,6 +5577,7 @@ def po_packet(po_number):
             <h3>PO Line Items</h3>
             <div class="table-wrap"><table><tr>{line_headers}</tr>{line_rows}</table></div>
         </div>
+        {attachment_card(po.PONumber) if packet_type == 'internal' else ''}
         {posted_expense_card(posted_expenses) if packet_type == 'internal' else ''}
         {internal_timeline}
         """
@@ -5334,16 +5720,7 @@ def project_po_setup():
             mine_link = f'<a class="button secondary" href="/project-po-setup?mine=1">My Assigned PO Info Tasks</a>'
 
         content = f"""
-        <div class="grid kpis">
-            <div class="card kpi"><div class="label">Rows In View</div><div class="value">{len(rows)}</div><div class="trend">PO setup records</div></div>
-            <div class="card kpi"><div class="label">Missing Schedule</div><div class="value">{needs_schedule}</div><div class="trend">Need payment schedule</div></div>
-            <div class="card kpi"><div class="label">Missing Type</div><div class="value">{needs_type}</div><div class="trend">Need payment type</div></div>
-            <div class="card kpi"><div class="label">Missing Date</div><div class="value">{needs_date}</div><div class="trend">Need expected payment date</div></div>
-            <div class="card kpi"><div class="label">Missing Vendor</div><div class="value">{needs_vendor}</div><div class="trend">Need vendor name</div></div>
-            <div class="card kpi"><div class="label">Assigned</div><div class="value">{assigned}</div><div class="trend">Assigned to PM/user</div></div>
-            <div class="card kpi"><div class="label">Remaining Exposure</div><div class="value">{currency(total_amount)}</div><div class="trend">Rows in current view</div></div>
-        </div>
-        <div class="card">
+<div class="card">
             <div style="display:flex; justify-content:space-between; gap:12px; align-items:flex-start; flex-wrap:wrap;">
                 <div>
                     <h3>PO Setup Review Table</h3>
@@ -5357,7 +5734,7 @@ def project_po_setup():
                         <tr>
                             <th>PO</th>
                             <th class="project-filter-th">
-                                <div class="project-filter-head"><span>Project</span><button class="project-filter-button" type="button" onclick="togglePOProjectFilter()" title="Filter by project">▾</button></div>
+                                <div class="project-filter-head"><span>Project</span><button class="project-filter-button" type="button" onclick="togglePOProjectFilter()" title="Filter by project" aria-label="Filter by project"><span class="filter-icon">◇</span></button></div>
                                 <select id="poProjectFilter" class="project-filter-select" onchange="filterPOInfoReviewByProject()">{project_filter_options}</select>
                             </th>
                             <th>Vendor / Amount</th><th>Requestor</th><th>Payment Type</th><th>Payment Schedule</th><th>Assigned To</th><th>Status</th><th>Actions</th>
@@ -5665,8 +6042,9 @@ def vendors_page():
         ensure_expense_review_tables()
         conn = get_sql_connection()
         cursor = conn.cursor()
+        req_where_po, req_params_po = requestor_filter_sql("po")
         cursor.execute(
-            """
+            f"""
             WITH POVendors AS (
                 SELECT COALESCE(v.VendorName, 'Missing Vendor') AS VendorName,
                        COUNT(DISTINCT po.PONumber) AS POCount,
@@ -5674,6 +6052,7 @@ def vendors_page():
                        SUM(COALESCE(po.RemainingAmount, COALESCE(po.RevisedAmount, po.OriginalAmount, 0))) AS RemainingAmount
                 FROM dbo.PurchaseOrders po
                 LEFT JOIN dbo.Vendors v ON po.VendorId = v.VendorId
+                WHERE {req_where_po}
                 GROUP BY COALESCE(v.VendorName, 'Missing Vendor')
             ), ExpenseVendors AS (
                 SELECT COALESCE(NULLIF(LTRIM(RTRIM(VendorName)), ''), 'Missing Vendor') AS VendorName,
@@ -5691,7 +6070,8 @@ def vendors_page():
             FROM POVendors p
             FULL OUTER JOIN ExpenseVendors e ON p.VendorName = e.VendorName
             ORDER BY COALESCE(p.POAmount, 0) DESC, COALESCE(e.ExpenseAmount, 0) DESC;
-            """
+            """,
+            *req_params_po,
         )
         rows = cursor.fetchall()
 
@@ -5713,10 +6093,11 @@ def vendors_page():
                 INNER JOIN dbo.PurchaseOrders po ON l.PurchaseOrderId = po.PurchaseOrderId
                 LEFT JOIN dbo.Vendors v ON po.VendorId = v.VendorId
                 LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
-                WHERE LOWER(COALESCE(v.VendorName, 'Missing Vendor')) = LOWER(?)
+                WHERE LOWER(COALESCE(v.VendorName, 'Missing Vendor')) = LOWER(?) AND {req_where_po}
                 ORDER BY po.PONumber, l.IssuedPOLineId;
-                """,
+                """.format(req_where_po=req_where_po),
                 selected_vendor,
+                *req_params_po,
             )
             vendor_lines = cursor.fetchall()
             for line in vendor_lines:
@@ -5817,6 +6198,32 @@ def pos_in_pm_comments_page():
     except Exception as e:
         return shell("POs in PM Comments", "Unable to load POs in PM Comments.", "POs in PM Comments", f'<div class="notice error">Error loading POs in PM Comments: {h(e)}</div>'), 500
 
+
+
+@app.route("/purchase-request-attachment/<int:attachment_id>")
+def purchase_request_attachment(attachment_id):
+    allowed, reason = require_page_access("POs & Balances")
+    if not allowed:
+        return access_denied_response("POs & Balances", reason)
+    try:
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        ensure_request_attachment_table(cursor)
+        cursor.execute(
+            """
+            SELECT StoragePath, OriginalFileName
+            FROM dbo.PurchaseRequestAttachments
+            WHERE AttachmentId = ?;
+            """,
+            attachment_id,
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if not row or not os.path.exists(row.StoragePath):
+            return shell("Attachment", "File not found.", "POs & Balances", '<div class="notice error">Attachment file was not found.</div>'), 404
+        return send_from_directory(os.path.dirname(row.StoragePath), os.path.basename(row.StoragePath), as_attachment=False, download_name=row.OriginalFileName)
+    except Exception as e:
+        return shell("Attachment", "Unable to open attachment.", "POs & Balances", f'<div class="notice error">Error opening attachment: {h(e)}</div>'), 500
 
 @app.route("/download-expense-upload-template.csv")
 def download_expense_upload_template():
