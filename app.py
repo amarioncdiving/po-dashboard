@@ -3837,71 +3837,234 @@ def ensure_purchase_request_project_code_column(cursor):
     )
 
 
-def load_existing_project_options():
-    """Return project options from the actual project/PO setup data.
+def get_dbo_table_columns(cursor, table_name):
+    """Return available column names for a dbo table. Used so rollout forms keep working across older schema versions."""
+    try:
+        cursor.execute(
+            """
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = ?;
+            """,
+            table_name,
+        )
+        return {clean_text(r.COLUMN_NAME) for r in cursor.fetchall()}
+    except Exception:
+        return set()
 
-    Purchase requests must select an existing project. This list intentionally
-    does not create projects from the request form and does not depend on the
-    current user's PO requestor filter, because Admin/Accounting need to be able
-    to submit requests against any setup project.
+
+def add_project_option(options, seen, project_code, project_name):
+    code = clean_text(project_code)
+    name = clean_text(project_name)
+    if not code and not name:
+        return
+    key = (code.lower(), name.lower())
+    if key in seen:
+        return
+    seen.add(key)
+    value = f"{code}||{name}"
+    label = f"{code} - {name}" if code and name else (code or name)
+    options.append({"code": code, "name": name, "value": value, "label": label})
+
+
+def load_existing_project_options():
+    """Return project options from any existing project / PO setup source.
+
+    Purchase requests must choose from an existing project. This function is intentionally
+    defensive because older database versions may not have identical ProjectCode/ProjectName
+    columns on every table. It queries each source independently instead of letting one
+    missing join/column make the whole dropdown empty.
     """
+    conn = None
+    options = []
+    seen = set()
     try:
         conn = get_sql_connection()
         cursor = conn.cursor()
         ensure_project_code_columns(cursor)
         conn.commit()
-        cursor.execute(
-            """
-            ;WITH ProjectChoices AS (
-                SELECT
+
+        # 1) Canonical Projects table.
+        try:
+            cursor.execute(
+                """
+                SELECT DISTINCT
                     COALESCE(NULLIF(ProjectCode, ''), '') AS ProjectCode,
                     COALESCE(NULLIF(ProjectName, ''), '') AS ProjectName
                 FROM dbo.Projects
                 WHERE COALESCE(NULLIF(ProjectCode, ''), NULLIF(ProjectName, '')) IS NOT NULL
-
-                UNION
-
-                SELECT
-                    COALESCE(NULLIF(po.ProjectCode, ''), NULLIF(p.ProjectCode, ''), '') AS ProjectCode,
-                    COALESCE(NULLIF(p.ProjectName, ''), NULLIF(l.ProjectName, ''), '') AS ProjectName
-                FROM dbo.PurchaseOrders po
-                LEFT JOIN dbo.Projects p ON po.ProjectId = p.ProjectId
-                LEFT JOIN dbo.IssuedPOLines l ON po.PurchaseOrderId = l.PurchaseOrderId
-                WHERE COALESCE(NULLIF(po.ProjectCode, ''), NULLIF(p.ProjectCode, ''), NULLIF(p.ProjectName, ''), NULLIF(l.ProjectName, '')) IS NOT NULL
-
-                UNION
-
-                SELECT
-                    COALESCE(NULLIF(ProjectCode, ''), '') AS ProjectCode,
-                    COALESCE(NULLIF(ProjectName, ''), '') AS ProjectName
-                FROM dbo.IssuedPOLines
-                WHERE COALESCE(NULLIF(ProjectCode, ''), NULLIF(ProjectName, '')) IS NOT NULL
+                ORDER BY COALESCE(NULLIF(ProjectCode, ''), ''), COALESCE(NULLIF(ProjectName, ''), '');
+                """
             )
-            SELECT DISTINCT ProjectCode, ProjectName
-            FROM ProjectChoices
-            WHERE COALESCE(NULLIF(ProjectCode, ''), NULLIF(ProjectName, '')) IS NOT NULL
-            ORDER BY ProjectCode, ProjectName;
-            """
-        )
-        rows = cursor.fetchall()
-        conn.close()
-        options = []
-        seen = set()
-        for r in rows:
-            code = clean_text(getattr(r, "ProjectCode", ""))
-            name = clean_text(getattr(r, "ProjectName", ""))
-            if not code and not name:
-                continue
-            key = (code.lower(), name.lower())
-            if key in seen:
-                continue
-            seen.add(key)
-            value = f"{code}||{name}"
-            label = f"{code} - {name}" if code and name else (code or name)
-            options.append({"code": code, "name": name, "value": value, "label": label})
+            for r in cursor.fetchall():
+                add_project_option(options, seen, getattr(r, "ProjectCode", ""), getattr(r, "ProjectName", ""))
+        except Exception as e:
+            print(f"Project dropdown Projects query skipped: {e}")
+
+        # 2) PurchaseOrders table. This catches app-created POs or uploaded POs even if
+        # the Projects table was not populated cleanly in an earlier build.
+        po_cols = get_dbo_table_columns(cursor, "PurchaseOrders")
+        if po_cols:
+            po_code_expr = "COALESCE(NULLIF(po.ProjectCode, ''), NULLIF(p.ProjectCode, ''), '')" if "ProjectCode" in po_cols else "COALESCE(NULLIF(p.ProjectCode, ''), '')"
+            po_name_parts = []
+            if "ProjectName" in po_cols:
+                po_name_parts.append("NULLIF(po.ProjectName, '')")
+            po_name_parts.append("NULLIF(p.ProjectName, '')")
+            po_name_expr = "COALESCE(" + ", ".join(po_name_parts) + ", '')"
+            try:
+                cursor.execute(
+                    f"""
+                    SELECT DISTINCT
+                        {po_code_expr} AS ProjectCode,
+                        {po_name_expr} AS ProjectName
+                    FROM dbo.PurchaseOrders po
+                    LEFT JOIN dbo.Projects p ON po.ProjectId = p.ProjectId
+                    WHERE COALESCE(NULLIF({po_code_expr}, ''), NULLIF({po_name_expr}, '')) IS NOT NULL
+                    ORDER BY {po_code_expr}, {po_name_expr};
+                    """
+                )
+                for r in cursor.fetchall():
+                    add_project_option(options, seen, getattr(r, "ProjectCode", ""), getattr(r, "ProjectName", ""))
+            except Exception as e:
+                print(f"Project dropdown PurchaseOrders query skipped: {e}")
+
+        # 3) IssuedPOLines table. This is the most direct source for the setup CSV upload.
+        line_cols = get_dbo_table_columns(cursor, "IssuedPOLines")
+        if line_cols and ("ProjectCode" in line_cols or "ProjectName" in line_cols):
+            code_expr = "COALESCE(NULLIF(ProjectCode, ''), '')" if "ProjectCode" in line_cols else "''"
+            name_expr = "COALESCE(NULLIF(ProjectName, ''), '')" if "ProjectName" in line_cols else "''"
+            try:
+                cursor.execute(
+                    f"""
+                    SELECT DISTINCT
+                        {code_expr} AS ProjectCode,
+                        {name_expr} AS ProjectName
+                    FROM dbo.IssuedPOLines
+                    WHERE COALESCE(NULLIF({code_expr}, ''), NULLIF({name_expr}, '')) IS NOT NULL
+                    ORDER BY {code_expr}, {name_expr};
+                    """
+                )
+                for r in cursor.fetchall():
+                    add_project_option(options, seen, getattr(r, "ProjectCode", ""), getattr(r, "ProjectName", ""))
+            except Exception as e:
+                print(f"Project dropdown IssuedPOLines query skipped: {e}")
+
         return options
-    except Exception:
+    except Exception as e:
+        print(f"Project dropdown failed: {e}")
         return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def find_existing_project_source(cursor, project_code, project_name):
+    """Find a project only from existing project/PO setup data, never from free-text request input."""
+    code = clean_text(project_code)
+    name = clean_text(project_name)
+
+    ensure_project_code_columns(cursor)
+
+    # First, check Projects directly.
+    if code:
+        cursor.execute(
+            """
+            SELECT TOP 1 ProjectId, ProjectCode, ProjectName, Department
+            FROM dbo.Projects
+            WHERE ProjectCode = ? OR (ProjectName = ? AND ? <> '')
+            ORDER BY ProjectId;
+            """,
+            code,
+            name,
+            name,
+        )
+    else:
+        cursor.execute(
+            """
+            SELECT TOP 1 ProjectId, ProjectCode, ProjectName, Department
+            FROM dbo.Projects
+            WHERE ProjectName = ?
+            ORDER BY ProjectId;
+            """,
+            name,
+        )
+    project = cursor.fetchone()
+    if project:
+        return project
+
+    # If the Projects table is missing an entry but the project exists in setup PO data,
+    # normalize it into Projects so the purchase request can reference a real ProjectId.
+    po_cols = get_dbo_table_columns(cursor, "PurchaseOrders")
+    if po_cols:
+        po_code_expr = "COALESCE(NULLIF(po.ProjectCode, ''), '')" if "ProjectCode" in po_cols else "''"
+        po_name_expr = "COALESCE(NULLIF(po.ProjectName, ''), '')" if "ProjectName" in po_cols else "''"
+        dept_expr = "COALESCE(NULLIF(po.Department, ''), '')" if "Department" in po_cols else "''"
+        try:
+            where_parts = []
+            params = []
+            if code and "ProjectCode" in po_cols:
+                where_parts.append("po.ProjectCode = ?")
+                params.append(code)
+            if name and "ProjectName" in po_cols:
+                where_parts.append("po.ProjectName = ?")
+                params.append(name)
+            if where_parts:
+                cursor.execute(
+                    f"""
+                    SELECT TOP 1 {po_code_expr} AS ProjectCode, {po_name_expr} AS ProjectName, {dept_expr} AS Department
+                    FROM dbo.PurchaseOrders po
+                    WHERE {' OR '.join(where_parts)}
+                    ORDER BY po.PurchaseOrderId;
+                    """,
+                    *params,
+                )
+                row = cursor.fetchone()
+                if row:
+                    existing_code = clean_text(getattr(row, "ProjectCode", "")) or code
+                    existing_name = clean_text(getattr(row, "ProjectName", "")) or name or existing_code
+                    existing_dept = clean_text(getattr(row, "Department", ""))
+                    project_id = get_or_create_project(cursor, existing_name, existing_dept, existing_code)
+                    cursor.execute("SELECT TOP 1 ProjectId, ProjectCode, ProjectName, Department FROM dbo.Projects WHERE ProjectId = ?;", project_id)
+                    return cursor.fetchone()
+        except Exception as e:
+            print(f"Project validation PurchaseOrders fallback skipped: {e}")
+
+    line_cols = get_dbo_table_columns(cursor, "IssuedPOLines")
+    if line_cols:
+        code_expr = "COALESCE(NULLIF(ProjectCode, ''), '')" if "ProjectCode" in line_cols else "''"
+        name_expr = "COALESCE(NULLIF(ProjectName, ''), '')" if "ProjectName" in line_cols else "''"
+        dept_expr = "COALESCE(NULLIF(Department, ''), '')" if "Department" in line_cols else "''"
+        where_parts = []
+        params = []
+        if code and "ProjectCode" in line_cols:
+            where_parts.append("ProjectCode = ?")
+            params.append(code)
+        if name and "ProjectName" in line_cols:
+            where_parts.append("ProjectName = ?")
+            params.append(name)
+        if where_parts:
+            try:
+                cursor.execute(
+                    f"""
+                    SELECT TOP 1 {code_expr} AS ProjectCode, {name_expr} AS ProjectName, {dept_expr} AS Department
+                    FROM dbo.IssuedPOLines
+                    WHERE {' OR '.join(where_parts)}
+                    ORDER BY IssuedPOLineId;
+                    """,
+                    *params,
+                )
+                row = cursor.fetchone()
+                if row:
+                    existing_code = clean_text(getattr(row, "ProjectCode", "")) or code
+                    existing_name = clean_text(getattr(row, "ProjectName", "")) or name or existing_code
+                    existing_dept = clean_text(getattr(row, "Department", ""))
+                    project_id = get_or_create_project(cursor, existing_name, existing_dept, existing_code)
+                    cursor.execute("SELECT TOP 1 ProjectId, ProjectCode, ProjectName, Department FROM dbo.Projects WHERE ProjectId = ?;", project_id)
+                    return cursor.fetchone()
+            except Exception as e:
+                print(f"Project validation IssuedPOLines fallback skipped: {e}")
+
+    return None
 
 
 def validate_selected_project(cursor, selected_project_value):
@@ -3914,32 +4077,10 @@ def validate_selected_project(cursor, selected_project_value):
     if not project_code and not project_name:
         raise ValueError("Please select an existing project.")
 
-    ensure_project_code_columns(cursor)
-    if project_code:
-        cursor.execute(
-            """
-            SELECT TOP 1 ProjectId, ProjectCode, ProjectName, Department
-            FROM dbo.Projects
-            WHERE ProjectCode = ? OR (ProjectName = ? AND ? <> '');
-            """,
-            project_code,
-            project_name,
-            project_name,
-        )
-    else:
-        cursor.execute(
-            """
-            SELECT TOP 1 ProjectId, ProjectCode, ProjectName, Department
-            FROM dbo.Projects
-            WHERE ProjectName = ?;
-            """,
-            project_name,
-        )
-    project = cursor.fetchone()
+    project = find_existing_project_source(cursor, project_code, project_name)
     if not project:
-        raise ValueError("Selected project was not found. Add the project through issued PO setup before submitting purchase requests for it.")
+        raise ValueError("Selected project was not found in existing PO setup data. Upload issued POs for this project before submitting purchase requests for it.")
     return project
-
 
 def allowed_attachment(filename):
     if not filename or "." not in filename:
@@ -5138,7 +5279,7 @@ def purchase_request():
     )
     no_project_notice = ""
     if not project_options:
-        no_project_notice = '<div class="notice warning"><strong>No projects are available for purchase requests yet.</strong><br>Upload issued POs for project setup first. Purchase requests can only be submitted against projects already loaded into the app.</div>'
+        no_project_notice = '<div class="notice warning"><strong>No projects are available for purchase requests yet.</strong><br>Upload issued POs for the project setup first, then return to this form.</div>'
 
     message_html = ""
 
@@ -5189,7 +5330,7 @@ def purchase_request():
                             <select name="project_value" required>
                                 {project_select_options}
                             </select>
-                            <p class="field-help">Select a project already loaded through issued PO project setup. This form cannot create new projects.</p>
+                            <p class="field-help">Projects must already exist from issued PO project setup. This form cannot create new projects.</p>
                         </div>
                         <div class="form-field">
                             <label>Department *</label>
