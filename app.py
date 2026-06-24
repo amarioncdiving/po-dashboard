@@ -6229,10 +6229,8 @@ def upload_po():
             <h3>Project Setup CSV Template</h3>
             <p class="card-subtitle">Download the CSV template for the Phase 1 first-time project PO setup load.</p>
             <p><a class="button primary" href="/download-issued-po-template.csv">Download CSV Template</a></p>
-            <p class="field-help">The CSV no longer includes Department, Requestor, OriginalAmount, RevisedAmount, RemainingAmount, or POStatus. Uploaded POs are marked Open, and PO amount is calculated from line amounts.</p>
         </div>
     </div>
-    <div class="card"><h3>Expected CSV Columns</h3><p class="card-subtitle">The upload must include these exact headers. Department and requestor are selected above before upload.</p><code>{h(", ".join(REQUIRED_PO_COLUMNS))}</code></div>
     """
 
     return shell("Upload Issued POs", "Import first-time project setup POs and line items into Azure SQL.", "Upload Issued POs", content)
