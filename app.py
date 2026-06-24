@@ -509,7 +509,10 @@ def _coastal_logo_image_reader():
 
 
 def _safe_text(value):
-    return clean_text(value).replace("\n", " ")
+    value = clean_text(value)
+    if value is None:
+        return ""
+    return str(value).replace("\n", " ")
 
 
 def _money(value):
