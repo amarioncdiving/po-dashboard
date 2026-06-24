@@ -704,32 +704,42 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
         if not is_vendor:
             yy -= 15
             label_value(left_x + 10, yy, "Status", status, col_w - 20, 92, 1)
-        yy2 = y - 38
+        # Vendor / Delivery details are intentionally laid out as two side-by-side blocks
+        # so the vendor and ship-to information do not crowd the bottom of the card.
+        detail_top = y - 40
+        detail_bottom = y - box_h + 14
+        inner_x = right_x + 10
+        inner_w = col_w - 20
+        split_x = inner_x + (inner_w / 2)
+        c.setStrokeColor(light_line)
+        c.setLineWidth(0.6)
+        c.line(split_x, detail_top + 6, split_x, detail_bottom)
+
         c.setFillColor(navy)
-        c.setFont("Helvetica-Bold", 7.2)
-        c.drawString(right_x + 10, yy2, "VENDOR:")
+        c.setFont("Helvetica-Bold", 7.4)
+        c.drawString(inner_x, detail_top, "VENDOR:")
+        c.drawString(split_x + 10, detail_top, "SHIP TO:")
+
         c.setFillColor(text)
-        c.setFont("Helvetica", 8.2)
-        vendor_y = yy2 - 12
-        for vendor_line in wrap_pdf_text(vendor, 58)[:3]:
-            c.drawString(right_x + 10, vendor_y, vendor_line)
+        c.setFont("Helvetica", 8.4)
+        vendor_y = detail_top - 13
+        vendor_wrap_width = max(18, int(((inner_w / 2) - 10) / 4.2))
+        for vendor_line in wrap_pdf_text(vendor, vendor_wrap_width)[:5]:
+            c.drawString(inner_x, vendor_y, vendor_line)
             vendor_y -= 10
-        yy2 -= 50
-        c.setFillColor(navy)
-        c.setFont("Helvetica-Bold", 7.2)
-        c.drawString(right_x + 10, yy2, "SHIP TO:")
-        c.setFillColor(text)
-        c.setFont("Helvetica", 8.2)
+
         ship_lines = ["Coastal Engineering Group"]
         if project_code:
             ship_lines.append(f"Project: {project_code} - {project}")
         else:
             ship_lines.append(f"Project: {project}")
         ship_lines.append(f"Attn: {requestor}")
-        ship_y = yy2 - 12
+        ship_y = detail_top - 13
+        ship_wrap_width = max(18, int(((inner_w / 2) - 12) / 4.2))
         for ship_line in ship_lines[:4]:
-            c.drawString(right_x + 10, ship_y, _safe_text(ship_line)[:58])
-            ship_y -= 10
+            for wrapped_line in wrap_pdf_text(_safe_text(ship_line), ship_wrap_width)[:2]:
+                c.drawString(split_x + 10, ship_y, wrapped_line)
+                ship_y -= 10
         return y - box_h - 20
 
     def table_header(y, cols, widths):
