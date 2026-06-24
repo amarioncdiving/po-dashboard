@@ -895,6 +895,56 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
                     xx += w
                 y -= 18
             y -= 10
+
+        audit_entries = []
+        audit_entries.append((po_date, "PO Created / Loaded", requestor, f"PO created or loaded for {project}."))
+        setup_by = _safe_text(_row_value(po, "SetupUpdatedBy"))
+        setup_at = _safe_text(_row_value(po, "SetupUpdatedAt"))
+        if setup_by or setup_at:
+            audit_entries.append((setup_at or "Not recorded", "PO Setup Updated", setup_by or "System", "Setup, payment schedule, or review status updated."))
+        for exp in (posted_expenses or [])[:8]:
+            audit_entries.append((
+                _safe_text(_row_value(exp, "PostedAt")) or _safe_text(_row_value(exp, "TxDate")),
+                "Expense Posted",
+                _safe_text(_row_value(exp, "PostedBy")) or _safe_text(_row_value(exp, "ReviewerEmail")) or "System",
+                f"{_money(_row_value(exp, 'PostedAmount', _row_value(exp, 'Amount', 0)))} posted to this PO from {_safe_text(_row_value(exp, 'VendorName')) or 'expense row'}."
+            ))
+        audit_entries.append((datetime.now().strftime("%Y-%m-%d %I:%M %p"), "Packet Generated", "System", "Internal PO packet generated for review."))
+
+        if y < 150:
+            footer(f"PO {po_number}")
+            y = new_page()
+        y = section_title(y, "Audit Trail")
+        cols = ["Date / Time", "Action", "User", "Details"]
+        widths = [88, 108, 128, 210]
+        y = table_header(y, cols, widths)
+        c.setFont("Helvetica", 6.4)
+        for idx, (dt, action, user_name, detail) in enumerate(audit_entries[:14], start=1):
+            detail_lines = wrap_pdf_text(_safe_text(detail), 48)[:3]
+            row_h = max(20, 9 + len(detail_lines) * 8)
+            if y - row_h < 62:
+                footer(f"PO {po_number}")
+                y = new_page()
+                y = section_title(y, "Audit Trail Continued")
+                y = table_header(y, cols, widths)
+                c.setFont("Helvetica", 6.4)
+            c.setFillColor(colors.white if idx % 2 else panel)
+            c.setStrokeColor(light_line)
+            c.rect(margin, y - row_h, sum(widths), row_h, fill=1, stroke=1)
+            vals = [_safe_text(dt), _safe_text(action), _safe_text(user_name), "\n".join(detail_lines)]
+            xx = margin
+            for i, (val, w) in enumerate(zip(vals, widths)):
+                c.setFillColor(text)
+                if "\n" in val:
+                    yy = y - 12
+                    for dl in val.split("\n"):
+                        c.drawString(xx + 4, yy, dl[:62])
+                        yy -= 8
+                else:
+                    c.drawString(xx + 4, y - 12, val[:32])
+                xx += w
+            y -= row_h
+        y -= 10
         return y
 
     def terms_block(y):
@@ -908,24 +958,35 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
             "Vendor agrees to hold Coastal Engineering harmless from claims or liabilities arising from this Purchase Order.",
             "Coastal Engineering reserves the right to cancel this PO at any time for undelivered goods or services.",
         ]
-        if y < 250:
+        est_height = 220
+        if y < est_height + 55:
             footer(f"PO {po_number}")
             y = new_page()
         y = section_title(y, "Coastal Engineering PO Terms and Conditions")
         c.setFillColor(panel)
         c.setStrokeColor(light_line)
-        c.roundRect(margin, y - 172, W - 2 * margin, 172, 4, fill=1, stroke=1)
+        c.roundRect(margin, y - est_height, W - 2 * margin, est_height, 4, fill=1, stroke=1)
         c.setFillColor(text)
-        c.setFont("Helvetica", 5.9)
-        col_x = [margin + 10, margin + (W - 2 * margin) / 2 + 8]
-        col_y = [y - 14, y - 14]
-        for i, term in enumerate(terms):
-            col = 0 if i < 4 else 1
-            for txt in wrap_pdf_text("• " + term, 65):
-                c.drawString(col_x[col], col_y[col], txt)
-                col_y[col] -= 7.2
-            col_y[col] -= 2
-        return y - 188
+        c.setFont("Helvetica", 6.5)
+        yy = y - 16
+        max_chars = 122
+        for term in terms:
+            wrapped = wrap_pdf_text("• " + term, max_chars)
+            for txt in wrapped:
+                c.drawString(margin + 12, yy, txt)
+                yy -= 8.2
+            yy -= 3.2
+            if yy < 62:
+                footer(f"PO {po_number}")
+                y = new_page()
+                y = section_title(y, "Coastal Engineering PO Terms and Conditions Continued")
+                c.setFillColor(panel)
+                c.setStrokeColor(light_line)
+                c.roundRect(margin, y - est_height, W - 2 * margin, est_height, 4, fill=1, stroke=1)
+                c.setFillColor(text)
+                c.setFont("Helvetica", 6.5)
+                yy = y - 16
+        return y - est_height - 16
 
     y = header()
     y = two_column_details(y)
@@ -3616,7 +3677,7 @@ a, a:visited { color:#1d4ed8; }
 .vendor-packet .vendor-wave-footer strong { position:relative; z-index:2; display:block; text-align:center; letter-spacing:.04em; }
 .vendor-packet .vendor-wave-footer span { position:relative; z-index:2; display:block; text-align:center; color:#bfdbfe; font-size:11px; margin-top:4px; }
 .vendor-packet .vendor-terms-card { border:1px solid #bfdbfe; background:#f8fbff; border-radius:14px; padding:16px; margin-top:14px; page-break-inside:avoid; }
-.vendor-packet .terms-list { columns:2; column-gap:26px; margin:0; padding-left:18px; }
+.vendor-packet .terms-list { columns:1; column-gap:0; margin:0; padding-left:18px; }
 .vendor-packet .terms-list li { break-inside:avoid; margin:0 0 8px; font-size:11px; line-height:1.35; }
 .vendor-packet .packet-table th { background:#0b5dad; }
 
