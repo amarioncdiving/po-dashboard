@@ -705,8 +705,16 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
             yy -= 15
             label_value(left_x + 10, yy, "Status", status, col_w - 20, 92, 1)
         yy2 = y - 38
-        label_value(right_x + 10, yy2, "Vendor", vendor, col_w - 20, 72, 3)
-        yy2 -= 37
+        c.setFillColor(navy)
+        c.setFont("Helvetica-Bold", 7.2)
+        c.drawString(right_x + 10, yy2, "VENDOR:")
+        c.setFillColor(text)
+        c.setFont("Helvetica", 8.2)
+        vendor_y = yy2 - 12
+        for vendor_line in wrap_pdf_text(vendor, 58)[:3]:
+            c.drawString(right_x + 10, vendor_y, vendor_line)
+            vendor_y -= 10
+        yy2 -= 50
         c.setFillColor(navy)
         c.setFont("Helvetica-Bold", 7.2)
         c.drawString(right_x + 10, yy2, "SHIP TO:")
@@ -971,15 +979,15 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
         c.setStrokeColor(light_line)
         c.roundRect(margin, y - est_height, W - 2 * margin, est_height, 4, fill=1, stroke=1)
         c.setFillColor(text)
-        c.setFont("Helvetica", 7.0)
-        yy = y - 16
-        max_chars = 110
+        c.setFont("Helvetica", 8.0)
+        yy = y - 17
+        max_chars = 145
         for term in terms:
             wrapped = wrap_pdf_text("• " + term, max_chars)
             for txt in wrapped:
                 c.drawString(margin + 12, yy, txt)
-                yy -= 8.2
-            yy -= 3.2
+                yy -= 9.2
+            yy -= 3.8
             if yy < 62:
                 footer(f"PO {po_number}")
                 y = new_page()
@@ -988,8 +996,8 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
                 c.setStrokeColor(light_line)
                 c.roundRect(margin, y - est_height, W - 2 * margin, est_height, 4, fill=1, stroke=1)
                 c.setFillColor(text)
-                c.setFont("Helvetica", 7.0)
-                yy = y - 16
+                c.setFont("Helvetica", 8.0)
+                yy = y - 17
         return y - est_height - 16
 
     y = header()
@@ -2915,8 +2923,11 @@ body::before {
 .topbar h2 { margin:0; font-size:28px; letter-spacing:-.04em; }
 .topbar p { margin:8px 0 0; color:var(--muted); }
 .top-actions { display:flex; gap:12px; align-items:center; color:var(--muted); font-size:13px; }
-.button, button { border:1px solid var(--line); background:white; border-radius:12px; padding:10px 14px; cursor:pointer; font-weight:700; text-decoration:none; color:var(--text); display:inline-block; }
-.primary { background: var(--blue); color:white; border-color:var(--blue); }
+.button, button, a.primary, a.secondary { border:1px solid var(--line); background:white; border-radius:12px; padding:10px 14px; cursor:pointer; font-weight:700; text-decoration:none; color:var(--text); display:inline-flex; align-items:center; justify-content:center; gap:6px; line-height:1.1; white-space:nowrap; }
+.primary, a.primary { background: var(--blue); color:white !important; border-color:var(--blue); }
+.secondary, a.secondary { background:white; color:var(--text) !important; border-color:var(--line); }
+a.primary:visited { color:white !important; }
+a.secondary:visited { color:var(--text) !important; }
 .grid { display:grid; gap:16px; }
 .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .two { grid-template-columns: 1fr 1fr; }
@@ -3443,7 +3454,8 @@ a, a:visited { color:#1d4ed8; }
 .packet-field { background:#f8fafc; border:1px solid var(--line); border-radius:13px; padding:12px; }
 .packet-field span { display:block; color:var(--muted); font-size:11px; font-weight:900; text-transform:uppercase; letter-spacing:.05em; }
 .packet-field strong { display:block; margin-top:5px; font-size:14px; }
-.packet-actions { display:flex; gap:10px; justify-content:flex-end; margin-bottom:14px; }
+.packet-actions { display:flex; gap:10px; justify-content:flex-end; align-items:center; flex-wrap:wrap; margin-bottom:18px; }
+.packet-actions a, .packet-actions button { min-height:42px; }
 .approval-action-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-top:14px; }
 .approval-action-grid form { margin:0; }
 .approval-action-grid button { width:100%; }
@@ -6603,12 +6615,12 @@ def po_packet(po_number):
 
         packet_actions = f"""
         <div class="packet-actions">
-            <a class="secondary" href="/pos-balances">Back to POs &amp; Balances</a>
-            <a class="secondary" href="{internal_link}">Internal Web Packet</a>
-            <a class="secondary" href="{vendor_link}">Vendor Web Packet</a>
-            <a class="primary" href="{internal_pdf_link}" target="_blank" rel="noopener">Internal PDF</a>
-            <a class="primary" href="{vendor_pdf_link}" target="_blank" rel="noopener">Vendor PDF</a>
-            <button class="secondary" onclick="window.print()">Print This Page</button>
+            <a class="button secondary" href="/pos-balances">Back to POs &amp; Balances</a>
+            <a class="button secondary" href="{internal_link}">Internal Web Packet</a>
+            <a class="button secondary" href="{vendor_link}">Vendor Web Packet</a>
+            <a class="button primary" href="{internal_pdf_link}" target="_blank" rel="noopener">Internal PDF</a>
+            <a class="button primary" href="{vendor_pdf_link}" target="_blank" rel="noopener">Vendor PDF</a>
+            <button class="button secondary" onclick="window.print()">Print This Page</button>
         </div>
         """
 
