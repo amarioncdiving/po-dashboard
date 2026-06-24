@@ -540,6 +540,7 @@ def _row_value(row, name, default=""):
 
 
 def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="internal"):
+    # PDF layout cleanup: larger fonts, left-aligned line item columns, aligned tables, cleaned ship-to block.
     """Create formal document style PO packet PDFs.
 
     Selected design: Mockup C for both internal and vendor packets.
@@ -645,14 +646,14 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
         c.setLineWidth(0.7)
         c.line(margin, 42, W - margin, 42)
         c.setFillColor(muted)
-        c.setFont("Helvetica", 6.8)
+        c.setFont("Helvetica", 7.4)
         c.drawString(margin, 28, "Coastal Engineering Group")
         c.drawCentredString(W / 2, 28, "Generated " + datetime.now().strftime("%Y-%m-%d %I:%M %p"))
         c.drawRightString(W - margin, 28, page_label)
 
     def section_title(y, title_text):
         c.setFillColor(accent)
-        c.setFont("Helvetica-Bold", 8.8)
+        c.setFont("Helvetica-Bold", 9.5)
         c.drawString(margin, y, _safe_text(title_text).upper())
         c.setStrokeColor(accent)
         c.setLineWidth(0.8)
@@ -661,10 +662,10 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
 
     def label_value(x, y, label, value, width=150, label_w=72, max_lines=3):
         c.setFillColor(navy)
-        c.setFont("Helvetica-Bold", 6.7)
+        c.setFont("Helvetica-Bold", 7.2)
         c.drawString(x, y, _safe_text(label).upper() + ":")
         c.setFillColor(text)
-        c.setFont("Helvetica", 7.6)
+        c.setFont("Helvetica", 8.2)
         lines_wrapped = []
         for part in _safe_text(value).split("\n"):
             lines_wrapped.extend(wrap_pdf_text(part, max(12, int((width - label_w) / 4.1))))
@@ -706,20 +707,28 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
         yy2 = y - 38
         label_value(right_x + 10, yy2, "Vendor", vendor, col_w - 20, 72, 3)
         yy2 -= 37
-        deliver_to = "Coastal Engineering Group\n"
+        c.setFillColor(navy)
+        c.setFont("Helvetica-Bold", 7.2)
+        c.drawString(right_x + 10, yy2, "SHIP TO:")
+        c.setFillColor(text)
+        c.setFont("Helvetica", 8.2)
+        ship_lines = ["Coastal Engineering Group"]
         if project_code:
-            deliver_to += f"Project: {project_code} - {project}\n"
+            ship_lines.append(f"Project: {project_code} - {project}")
         else:
-            deliver_to += f"Project: {project}\n"
-        deliver_to += f"Attn: {requestor}"
-        label_value(right_x + 10, yy2, "Ship To", deliver_to, col_w - 20, 72, 4)
+            ship_lines.append(f"Project: {project}")
+        ship_lines.append(f"Attn: {requestor}")
+        ship_y = yy2 - 12
+        for ship_line in ship_lines[:4]:
+            c.drawString(right_x + 10, ship_y, _safe_text(ship_line)[:58])
+            ship_y -= 10
         return y - box_h - 20
 
     def table_header(y, cols, widths):
         c.setFillColor(accent)
         c.rect(margin, y - 18, sum(widths), 18, fill=1, stroke=0)
         c.setFillColor(colors.white)
-        c.setFont("Helvetica-Bold", 6.4)
+        c.setFont("Helvetica-Bold", 7.0)
         xx = margin
         for col, w in zip(cols, widths):
             c.drawString(xx + 4, y - 12, _safe_text(col).upper())
@@ -735,12 +744,12 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
         y = section_title(y, "Line Items")
         if is_vendor:
             cols = ["Line", "Description", "Unit", "Qty", "Unit Cost", "Line Amount"]
-            widths = [28, 242, 44, 48, 78, 94]
+            widths = [32, 238, 48, 48, 82, 92]
         else:
             cols = ["Line", "Description", "Unit", "Qty", "Unit Cost", "Line Amount", "Open"]
-            widths = [28, 190, 40, 44, 68, 82, 82]
+            widths = [32, 178, 48, 48, 72, 82, 80]
         y = table_header(y, cols, widths)
-        c.setFont("Helvetica", 6.9)
+        c.setFont("Helvetica", 7.5)
         total_width = sum(widths)
         if not lines:
             c.setFillColor(colors.white)
@@ -750,14 +759,14 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
             c.drawString(margin + 6, y - 14, "No PO line items available.")
             return y - 22
         for idx, line in enumerate(lines, start=1):
-            desc_lines = wrap_pdf_text(_safe_text(_row_value(line, "LineDescription")), 42 if is_vendor else 32)[:3]
-            row_h = max(20, 9 + len(desc_lines) * 8)
+            desc_lines = wrap_pdf_text(_safe_text(_row_value(line, "LineDescription")), 39 if is_vendor else 30)[:3]
+            row_h = max(22, 11 + len(desc_lines) * 9)
             if y - row_h < 70:
                 footer(f"PO {po_number}")
                 y = new_page()
                 y = section_title(y, "Line Items Continued")
                 y = table_header(y, cols, widths)
-                c.setFont("Helvetica", 6.9)
+                c.setFont("Helvetica", 7.5)
             c.setFillColor(colors.white if idx % 2 else panel)
             c.setStrokeColor(light_line)
             c.rect(margin, y - row_h, total_width, row_h, fill=1, stroke=1)
@@ -775,14 +784,12 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
             for i, (val, w) in enumerate(zip(vals, widths)):
                 c.setFillColor(text)
                 if "\n" in val:
-                    yy = y - 12
+                    yy = y - 13
                     for dl in val.split("\n"):
                         c.drawString(xx + 4, yy, dl)
-                        yy -= 8
-                elif i >= 3:
-                    c.drawRightString(xx + w - 4, y - 12, val)
+                        yy -= 9
                 else:
-                    c.drawString(xx + 4, y - 12, val[:48])
+                    c.drawString(xx + 4, y - 13, val[:48])
                 xx += w
             y -= row_h
         return y - 10
@@ -805,13 +812,13 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
         c.setFillColor(panel)
         c.roundRect(x, y - 18, 190, 18, 4, fill=1, stroke=0)
         c.setFillColor(navy)
-        c.setFont("Helvetica-Bold", 7)
+        c.setFont("Helvetica-Bold", 7.5)
         c.drawString(x + 10, y - 12, "TOTALS")
         yy = y - 32
         for label, val in labels:
             is_total = label.lower().startswith("total") or label.lower().startswith("current")
             c.setFillColor(navy if is_total else muted)
-            c.setFont("Helvetica-Bold" if is_total else "Helvetica", 7.3)
+            c.setFont("Helvetica-Bold" if is_total else "Helvetica", 8.0)
             c.drawString(x + 10, yy, label)
             c.drawRightString(x + 180, yy, _money(val))
             yy -= row_h
@@ -833,10 +840,10 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
             c.setStrokeColor(light_line)
             c.roundRect(x, y - 58, note_w, 58, 4, fill=1, stroke=1)
             c.setFillColor(navy)
-            c.setFont("Helvetica-Bold", 6.6)
+            c.setFont("Helvetica-Bold", 7.2)
             c.drawString(x + 9, y - 15, lbl.upper())
             c.setFillColor(text)
-            c.setFont("Helvetica", 6.8)
+            c.setFont("Helvetica", 7.4)
             yy = y - 27
             for ln in wrap_pdf_text(val, int(note_w / 4.2))[:3]:
                 c.drawString(x + 9, yy, ln)
@@ -853,7 +860,7 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
             c.setStrokeColor(light_line)
             c.roundRect(margin, y - 48, W - 2 * margin, 48, 4, fill=1, stroke=1)
             c.setFillColor(text)
-            c.setFont("Helvetica", 7.1)
+            c.setFont("Helvetica", 7.8)
             yy = y - 13
             for ln in wrap_pdf_text(payment_schedule, 112)[:4]:
                 c.drawString(margin + 10, yy, ln)
@@ -865,16 +872,16 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
                 y = new_page()
             y = section_title(y, "Posted Expenses")
             cols = ["Date", "Vendor", "Type", "Amount", "Posted By"]
-            widths = [70, 150, 95, 82, 137]
+            widths = [74, 154, 98, 86, 128]
             y = table_header(y, cols, widths)
-            c.setFont("Helvetica", 6.6)
+            c.setFont("Helvetica", 7.2)
             for idx, exp in enumerate(posted_expenses[:34], start=1):
                 if y < 62:
                     footer(f"PO {po_number}")
                     y = new_page()
                     y = section_title(y, "Posted Expenses Continued")
                     y = table_header(y, cols, widths)
-                    c.setFont("Helvetica", 6.6)
+                    c.setFont("Helvetica", 7.2)
                 c.setFillColor(colors.white if idx % 2 else panel)
                 c.setStrokeColor(light_line)
                 c.rect(margin, y - 18, sum(widths), 18, fill=1, stroke=1)
@@ -888,10 +895,7 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
                 xx = margin
                 for i, (val, w) in enumerate(zip(vals, widths)):
                     c.setFillColor(text)
-                    if i == 3:
-                        c.drawRightString(xx + w - 4, y - 12, val)
-                    else:
-                        c.drawString(xx + 4, y - 12, val[:34])
+                    c.drawString(xx + 4, y - 12, val[:34])
                     xx += w
                 y -= 18
             y -= 10
@@ -916,9 +920,9 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
             y = new_page()
         y = section_title(y, "Audit Trail")
         cols = ["Date / Time", "Action", "User", "Details"]
-        widths = [88, 108, 128, 210]
+        widths = [96, 112, 128, 204]
         y = table_header(y, cols, widths)
-        c.setFont("Helvetica", 6.4)
+        c.setFont("Helvetica", 7.0)
         for idx, (dt, action, user_name, detail) in enumerate(audit_entries[:14], start=1):
             detail_lines = wrap_pdf_text(_safe_text(detail), 48)[:3]
             row_h = max(20, 9 + len(detail_lines) * 8)
@@ -927,7 +931,7 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
                 y = new_page()
                 y = section_title(y, "Audit Trail Continued")
                 y = table_header(y, cols, widths)
-                c.setFont("Helvetica", 6.4)
+                c.setFont("Helvetica", 7.0)
             c.setFillColor(colors.white if idx % 2 else panel)
             c.setStrokeColor(light_line)
             c.rect(margin, y - row_h, sum(widths), row_h, fill=1, stroke=1)
@@ -967,9 +971,9 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
         c.setStrokeColor(light_line)
         c.roundRect(margin, y - est_height, W - 2 * margin, est_height, 4, fill=1, stroke=1)
         c.setFillColor(text)
-        c.setFont("Helvetica", 6.5)
+        c.setFont("Helvetica", 7.0)
         yy = y - 16
-        max_chars = 122
+        max_chars = 110
         for term in terms:
             wrapped = wrap_pdf_text("• " + term, max_chars)
             for txt in wrapped:
@@ -984,7 +988,7 @@ def _styled_po_packet_pdf_bytes(po, lines, posted_expenses, packet_type="interna
                 c.setStrokeColor(light_line)
                 c.roundRect(margin, y - est_height, W - 2 * margin, est_height, 4, fill=1, stroke=1)
                 c.setFillColor(text)
-                c.setFont("Helvetica", 6.5)
+                c.setFont("Helvetica", 7.0)
                 yy = y - 16
         return y - est_height - 16
 
