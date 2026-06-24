@@ -5,6 +5,9 @@ import csv
 import io
 import html
 import re
+import smtplib
+import ssl
+from email.message import EmailMessage
 from datetime import datetime, date
 from decimal import Decimal, InvalidOperation
 from urllib.parse import quote_plus
@@ -33,6 +36,18 @@ APP_ENVIRONMENT = os.getenv("APP_ENVIRONMENT", "Not set")
 SQL_SERVER_NAME = os.getenv("SQL_SERVER_NAME", "Not set")
 SQL_DATABASE_NAME = os.getenv("SQL_DATABASE_NAME", "Not set")
 ALLOWED_EMAIL_DOMAIN = os.getenv("ALLOWED_EMAIL_DOMAIN", "c-diving.com")
+
+# Email notification settings. Configure these in Azure App Service > Configuration.
+# If SMTP_HOST and EMAIL_FROM are not configured, emails are skipped safely and the app still works.
+APP_BASE_URL = os.getenv("APP_BASE_URL", "").rstrip("/")
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587") or "587")
+SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_USE_TLS = os.getenv("SMTP_USE_TLS", "true").lower() not in ["0", "false", "no"]
+EMAIL_FROM = os.getenv("EMAIL_FROM", "")
+EMAIL_REPLY_TO = os.getenv("EMAIL_REPLY_TO", "accounting@c-diving.com")
+EMAIL_NOTIFICATIONS_ENABLED = os.getenv("EMAIL_NOTIFICATIONS_ENABLED", "true").lower() not in ["0", "false", "no"]
 
 SQL_CONNECTION = (
     os.getenv("PODASHBOARD_SQL")
@@ -294,6 +309,345 @@ def load_assignable_users():
     conn.close()
     return rows
 
+
+
+# ------------------------------------------------------------
+# Email notification helpers
+# ------------------------------------------------------------
+
+def app_url(path="/"):
+    """Build an absolute URL for email buttons."""
+    path = str(path or "/")
+    if path.startswith("http://") or path.startswith("https://"):
+        return path
+    base = (APP_BASE_URL or (request.url_root.rstrip("/") if request else ""))
+    if not base:
+        return path
+    if not path.startswith("/"):
+        path = "/" + path
+    return base.rstrip("/") + path
+
+
+def clean_email(value):
+    value = clean_text(value).strip()
+    if "@" not in value:
+        return ""
+    return value.lower()
+
+
+def load_active_users_by_roles(role_names):
+    role_names = [clean_text(r) for r in (role_names or []) if clean_text(r)]
+    if not role_names:
+        return []
+    placeholders = ",".join("?" for _ in role_names)
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""
+        SELECT Email, DisplayName, RoleName
+        FROM dbo.DashboardUsers
+        WHERE IsActive = 1 AND RoleName IN ({placeholders})
+        ORDER BY RoleName, COALESCE(NULLIF(DisplayName, ''), Email);
+        """,
+        *role_names,
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+
+def user_display_name(row):
+    if not row:
+        return ""
+    return clean_text(getattr(row, "DisplayName", "")) or clean_text(getattr(row, "Email", ""))
+
+
+def unique_recipients(*recipient_groups):
+    seen = set()
+    recipients = []
+    for group in recipient_groups:
+        if not group:
+            continue
+        for item in group:
+            if hasattr(item, "Email"):
+                email = clean_email(getattr(item, "Email", ""))
+                name = clean_text(getattr(item, "DisplayName", "")) or email
+            elif isinstance(item, (tuple, list)):
+                email = clean_email(item[0] if item else "")
+                name = clean_text(item[1] if len(item) > 1 else "") or email
+            else:
+                email = clean_email(item)
+                name = email
+            if email and email not in seen:
+                seen.add(email)
+                recipients.append((email, name))
+    return recipients
+
+
+def html_button(label, url):
+    return f"""<p style=\"margin:20px 0;\"><a href=\"{h(url)}\" style=\"background:#2563eb;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:10px;font-weight:700;display:inline-block;\">{h(label)}</a></p>"""
+
+
+def send_email_notification(to_recipients, subject, html_body, text_body="", attachments=None, cc_recipients=None):
+    """Send an HTML email with optional attachments. Safe no-op if SMTP is not configured."""
+    recipients = unique_recipients(to_recipients)
+    cc = unique_recipients(cc_recipients)
+    if not recipients:
+        return {"sent": False, "reason": "No recipients"}
+    if not EMAIL_NOTIFICATIONS_ENABLED:
+        return {"sent": False, "reason": "Email notifications disabled"}
+    if not SMTP_HOST or not EMAIL_FROM:
+        print(f"EMAIL SKIPPED: SMTP_HOST/EMAIL_FROM not configured. Subject={subject}. To={[r[0] for r in recipients]}")
+        return {"sent": False, "reason": "SMTP not configured"}
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_FROM
+    msg["To"] = ", ".join(email for email, _name in recipients)
+    if cc:
+        msg["Cc"] = ", ".join(email for email, _name in cc)
+    if EMAIL_REPLY_TO:
+        msg["Reply-To"] = EMAIL_REPLY_TO
+    msg.set_content(text_body or re.sub(r"<[^>]+>", " ", html_body or ""))
+    msg.add_alternative(html_body or text_body or "", subtype="html")
+
+    for att in attachments or []:
+        try:
+            msg.add_attachment(
+                att.get("content", b""),
+                maintype=att.get("maintype", "application"),
+                subtype=att.get("subtype", "octet-stream"),
+                filename=att.get("filename", "attachment"),
+            )
+        except Exception as exc:
+            print(f"EMAIL ATTACHMENT SKIPPED: {exc}")
+
+    all_recipients = [email for email, _ in recipients] + [email for email, _ in cc]
+    try:
+        if SMTP_USE_TLS:
+            context = ssl.create_default_context()
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+                server.starttls(context=context)
+                if SMTP_USERNAME:
+                    server.login(SMTP_USERNAME, SMTP_PASSWORD)
+                server.send_message(msg, to_addrs=all_recipients)
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+                if SMTP_USERNAME:
+                    server.login(SMTP_USERNAME, SMTP_PASSWORD)
+                server.send_message(msg, to_addrs=all_recipients)
+        return {"sent": True, "recipients": all_recipients}
+    except Exception as exc:
+        print(f"EMAIL SEND FAILED: {exc}. Subject={subject}. To={all_recipients}")
+        return {"sent": False, "reason": str(exc)}
+
+
+def wrap_pdf_text(text, width=92):
+    text = clean_text(text)
+    if not text:
+        return [""]
+    words = text.replace("\r", "").split()
+    lines = []
+    line = ""
+    for word in words:
+        if len(line) + len(word) + 1 > width:
+            lines.append(line)
+            line = word
+        else:
+            line = (line + " " + word).strip()
+    if line:
+        lines.append(line)
+    return lines or [""]
+
+
+def pdf_escape(text):
+    return str(text or "").replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def simple_pdf_bytes(title, lines):
+    """Create a small valid text PDF without external dependencies."""
+    lines = [clean_text(x) for x in (lines or [])]
+    content_lines = ["BT", "/F1 16 Tf", "72 760 Td", f"({pdf_escape(title)}) Tj", "/F1 9 Tf", "0 -22 Td"]
+    for raw in lines:
+        for line in wrap_pdf_text(raw, 105):
+            content_lines.append(f"({pdf_escape(line)}) Tj")
+            content_lines.append("0 -13 Td")
+    content_lines.append("ET")
+    stream = "\n".join(content_lines).encode("latin-1", errors="replace")
+    objects = []
+    objects.append(b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n")
+    objects.append(b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n")
+    objects.append(b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n")
+    objects.append(b"4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n")
+    objects.append(b"5 0 obj << /Length " + str(len(stream)).encode() + b" >> stream\n" + stream + b"\nendstream endobj\n")
+    pdf = b"%PDF-1.4\n"
+    offsets = [0]
+    for obj in objects:
+        offsets.append(len(pdf))
+        pdf += obj
+    xref_offset = len(pdf)
+    pdf += f"xref\n0 {len(objects)+1}\n0000000000 65535 f \n".encode()
+    for off in offsets[1:]:
+        pdf += f"{off:010d} 00000 n \n".encode()
+    pdf += f"trailer << /Root 1 0 R /Size {len(objects)+1} >>\nstartxref\n{xref_offset}\n%%EOF\n".encode()
+    return pdf
+
+
+def po_packet_pdf_attachment(po_number, packet_type="internal"):
+    po, lines, posted_expenses = load_po_packet_data(po_number)
+    if not po:
+        return None
+    title = ("Vendor PO Packet" if packet_type == "vendor" else "Internal PO Packet") + f" - {po.PONumber}"
+    pdf_lines = [
+        "Coastal Engineering",
+        f"PO Number: {po.PONumber}",
+        f"Vendor: {po.VendorName}",
+        f"Project: {po.ProjectName}",
+        f"Department: {po.Department}",
+        f"Requestor: {po.Requestor}",
+        f"PO Date: {po.PODate}",
+        f"PO Value: {currency(po.POValue)}",
+    ]
+    if packet_type != "vendor":
+        pdf_lines += [
+            f"Posted Expenses: {currency(po.PostedExpenseAmount)}",
+            f"Current App Balance: {currency(po.RemainingAmount)}",
+            f"Payment Type: {po.PaymentType or ''}",
+            f"Expected Payment Date: {po.ExpectedPaymentDate or ''}",
+            f"Payment Schedule: {clean_text(po.PaymentSchedule)}",
+        ]
+    pdf_lines.append("")
+    pdf_lines.append("PO Line Items")
+    for line in lines[:80]:
+        pdf_lines.append(f"- {line.LineDescription or ''} | Qty {line.Qty or ''} | Unit {line.Unit or ''} | Amount {currency(line.LineAmount)}")
+    if packet_type == "vendor":
+        pdf_lines += [
+            "",
+            "Coastal Engineering PO Terms and Conditions:",
+            "Vendor must deliver goods or perform services by the required date. Delays without written approval may result in cancellation.",
+            "Invoicing & Payment: Include the PO number on all invoices. Send invoices to accounting@c-diving.com. Unless otherwise agreed, payment terms are Net 30 from receipt of a valid invoice and satisfactory delivery.",
+            "Changes: No substitutions or changes to quantity or delivery date without written approval from Coastal Engineering.",
+            "Inspection: All items are subject to inspection. Non-compliant goods or services may be rejected at the vendor's expense.",
+            "Warranties: Vendor warrants that goods and services are free from defects, conform to specifications, and are fit for their intended use.",
+            "Compliance: Vendor must comply with all applicable laws and regulations.",
+            "Indemnification: Vendor agrees to hold Coastal Engineering harmless from any claims or liabilities arising from this Purchase Order.",
+            "PO Cancellation: Coastal Engineering reserves the right to cancel this PO at any time for undelivered goods or services.",
+        ]
+    filename_type = "vendor" if packet_type == "vendor" else "internal"
+    return {
+        "filename": f"{po.PONumber}_{filename_type}_packet.pdf",
+        "content": simple_pdf_bytes(title, pdf_lines),
+        "maintype": "application",
+        "subtype": "pdf",
+    }
+
+
+def load_purchase_request_for_email(purchase_request_id):
+    conn = get_sql_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT TOP 1 PurchaseRequestId, RequestNumber, RequestedByEmail, RequestedByName,
+               RequestedAt, NeededByDate, VendorName, ProjectName, Department,
+               RequestTitle, RequestDescription, EstimatedAmount, Priority, RequestStatus,
+               ReviewerEmail, ReviewedAt, ReviewNotes, ConvertedPONumber, UpdatedAt
+        FROM dbo.PurchaseRequests
+        WHERE PurchaseRequestId = ?;
+        """,
+        purchase_request_id,
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+
+def purchase_request_summary_html(req):
+    return f"""
+    <table cellpadding="6" cellspacing="0" style="border-collapse:collapse;border:1px solid #e2e8f0;">
+      <tr><th align="left">Request</th><td>{h(req.RequestNumber)}</td></tr>
+      <tr><th align="left">Title</th><td>{h(req.RequestTitle)}</td></tr>
+      <tr><th align="left">Vendor</th><td>{h(req.VendorName)}</td></tr>
+      <tr><th align="left">Project</th><td>{h(req.ProjectName)}</td></tr>
+      <tr><th align="left">Department</th><td>{h(req.Department)}</td></tr>
+      <tr><th align="left">Amount</th><td>{currency(req.EstimatedAmount)}</td></tr>
+      <tr><th align="left">Priority</th><td>{h(req.Priority)}</td></tr>
+      <tr><th align="left">Needed By</th><td>{h(req.NeededByDate)}</td></tr>
+      <tr><th align="left">Requested By</th><td>{h(req.RequestedByName or req.RequestedByEmail)}</td></tr>
+    </table>
+    """
+
+
+def send_purchase_request_submitted_emails(purchase_request_id):
+    req = load_purchase_request_for_email(purchase_request_id)
+    if not req:
+        return
+    approvers = load_active_users_by_roles(["Admin", "Accounting", "Executive"])
+    approver_names = ", ".join(user_display_name(a) for a in approvers) or "Accounting/Admin"
+    review_url = app_url("/purchase-requests")
+    subject = f"Purchase request needs review: {req.RequestNumber}"
+    body = f"""
+    <h2>Purchase request approval needed</h2>
+    <p>A purchase request has been submitted and is ready for review.</p>
+    {purchase_request_summary_html(req)}
+    {html_button("Open Purchase Requests", review_url)}
+    """
+    send_email_notification(approvers, subject, body)
+
+    requester = clean_email(req.RequestedByEmail)
+    requester_subject = f"What happens now: {req.RequestNumber}"
+    requester_body = f"""
+    <h2>Your purchase request was submitted</h2>
+    <p>Your request is going to the following approver group for review: <strong>{h(approver_names)}</strong>.</p>
+    <p>You will receive another email after it is approved and converted to a PO.</p>
+    {purchase_request_summary_html(req)}
+    {html_button("View Purchase Requests", review_url)}
+    """
+    send_email_notification([requester], requester_subject, requester_body)
+
+
+def send_purchase_request_approved_email(purchase_request_id, po_number):
+    req = load_purchase_request_for_email(purchase_request_id)
+    if not req:
+        return
+    internal_url = app_url("/po-packet/" + quote_plus(str(po_number)) + "?type=internal")
+    vendor_url = app_url("/po-packet/" + quote_plus(str(po_number)) + "?type=vendor")
+    attachments = []
+    for packet_type in ["internal", "vendor"]:
+        att = po_packet_pdf_attachment(po_number, packet_type)
+        if att:
+            attachments.append(att)
+    body = f"""
+    <h2>Purchase request approved and converted to PO</h2>
+    <p>Purchase request <strong>{h(req.RequestNumber)}</strong> has been approved and converted to PO <strong>{h(po_number)}</strong>.</p>
+    {purchase_request_summary_html(req)}
+    {html_button("Open Internal PO Packet", internal_url)}
+    <p><a href="{h(vendor_url)}">Open Vendor PO Packet</a></p>
+    <p>The internal and vendor-facing PO packet PDFs are attached.</p>
+    """
+    recipients = unique_recipients([req.RequestedByEmail], [req.ReviewerEmail])
+    send_email_notification(recipients, f"Approved PO created: {po_number}", body, attachments=attachments)
+
+
+def send_po_upload_summary_email(import_result, filename, department, requestor_name, requestor_email=""):
+    admins_execs = load_active_users_by_roles(["Admin", "Executive"])
+    recipients = unique_recipients(admins_execs, [requestor_email])
+    if not recipients:
+        return
+    upload_url = app_url("/pos-balances")
+    body = f"""
+    <h2>Issued POs uploaded</h2>
+    <p>A new issued PO setup file was uploaded into the procurement app.</p>
+    <table cellpadding="6" cellspacing="0" style="border-collapse:collapse;border:1px solid #e2e8f0;">
+      <tr><th align="left">File</th><td>{h(filename)}</td></tr>
+      <tr><th align="left">Import Batch</th><td>{h(import_result.get('import_batch_id'))}</td></tr>
+      <tr><th align="left">Rows</th><td>{h(import_result.get('success_count'))} successful / {h(import_result.get('total_rows'))} total</td></tr>
+      <tr><th align="left">Department</th><td>{h(department)}</td></tr>
+      <tr><th align="left">Requestor</th><td>{h(requestor_name)}</td></tr>
+      <tr><th align="left">Status</th><td>{h(import_result.get('status'))}</td></tr>
+    </table>
+    {html_button("Open POs & Balances", upload_url)}
+    """
+    send_email_notification(recipients, "Issued PO upload summary", body)
 
 def role_can_access(role_name, page_name):
     allowed_roles = PAGE_ACCESS.get(page_name, [])
@@ -1719,6 +2073,11 @@ def create_purchase_request(form, files=None):
         saved_attachments = save_purchase_request_attachments(cursor, purchase_request_id, request_number, files or [])
         conn.commit()
 
+        try:
+            send_purchase_request_submitted_emails(purchase_request_id)
+        except Exception as email_error:
+            print(f"Purchase request email notification failed: {email_error}")
+
         return {
             "purchase_request_id": purchase_request_id,
             "request_number": request_number,
@@ -1901,6 +2260,7 @@ def update_purchase_request_status(form):
     reviewer_email = clean_text(form.get("reviewer_email")) or user["email"]
     review_notes = clean_text(form.get("review_notes"))
     converted_po_number = clean_text(form.get("converted_po_number"))
+    created_or_converted_po = ""
 
     valid_statuses = [
         "Submitted",
@@ -1923,6 +2283,7 @@ def update_purchase_request_status(form):
     try:
         if request_status in ["Approved", "Converted to PO"]:
             converted_po_number = create_or_update_po_from_purchase_request(cursor, purchase_request_id, converted_po_number)
+            created_or_converted_po = converted_po_number
             request_status = "Converted to PO"
             auto_note = f"Approved and auto-created PO {converted_po_number}."
             if review_notes:
@@ -1960,6 +2321,12 @@ def update_purchase_request_status(form):
 
     finally:
         conn.close()
+
+    if created_or_converted_po:
+        try:
+            send_purchase_request_approved_email(purchase_request_id, created_or_converted_po)
+        except Exception as email_error:
+            print(f"Purchase request approved email failed: {email_error}")
 
 
 # ------------------------------------------------------------
@@ -6594,6 +6961,15 @@ def upload_po():
                     errors_html = f'<div class="card"><h3>Validation Errors</h3><ul>{error_items}</ul></div>'
                 else:
                     result = import_po_rows(rows, uploaded_file.filename, selected_department, selected_requestor)
+                    selected_requestor_email = ""
+                    for display, role, email in requestor_options:
+                        if display == selected_requestor:
+                            selected_requestor_email = email
+                            break
+                    try:
+                        send_po_upload_summary_email(result, uploaded_file.filename, selected_department, selected_requestor, selected_requestor_email)
+                    except Exception as email_error:
+                        print(f"PO upload summary email failed: {email_error}")
                     message_html = '<div class="notice ok">Issued PO import completed.</div>'
                     result_html = f"""
                     <div class="card"><h3>Import Result</h3><table><tr><th>Import Batch ID</th><td>{result["import_batch_id"]}</td></tr><tr><th>Total Rows</th><td>{result["total_rows"]}</td></tr><tr><th>Success Count</th><td>{result["success_count"]}</td></tr><tr><th>Error Count</th><td>{result["error_count"]}</td></tr><tr><th>Status</th><td>{h(result["status"])}</td></tr><tr><th>Department Applied</th><td>{h(selected_department)}</td></tr><tr><th>Requestor Applied</th><td>{h(selected_requestor)}</td></tr></table></div>
