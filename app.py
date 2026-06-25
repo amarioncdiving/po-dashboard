@@ -104,6 +104,7 @@ PAGE_ACCESS = {
     "Forecasting": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "Project PO Setup": ["Admin", "Executive", "Accounting", "Project Manager"],
     "PO Setup Review": ["Admin", "Executive", "Accounting", "Project Manager"],
+    "PO Maintenance": ["Admin", "Executive", "Accounting"],
     "Missing PO Review": ["Admin", "Executive", "Accounting", "Project Manager"],
     "PO Summary": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
     "PO List": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
@@ -3837,234 +3838,47 @@ def ensure_purchase_request_project_code_column(cursor):
     )
 
 
-def get_dbo_table_columns(cursor, table_name):
-    """Return available column names for a dbo table. Used so rollout forms keep working across older schema versions."""
-    try:
-        cursor.execute(
-            """
-            SELECT COLUMN_NAME
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = ?;
-            """,
-            table_name,
-        )
-        return {clean_text(r.COLUMN_NAME) for r in cursor.fetchall()}
-    except Exception:
-        return set()
-
-
-def add_project_option(options, seen, project_code, project_name):
-    code = clean_text(project_code)
-    name = clean_text(project_name)
-    if not code and not name:
-        return
-    key = (code.lower(), name.lower())
-    if key in seen:
-        return
-    seen.add(key)
-    value = f"{code}||{name}"
-    label = f"{code} - {name}" if code and name else (code or name)
-    options.append({"code": code, "name": name, "value": value, "label": label})
-
-
 def load_existing_project_options():
-    """Return project options from any existing project / PO setup source.
-
-    Purchase requests must choose from an existing project. This function is intentionally
-    defensive because older database versions may not have identical ProjectCode/ProjectName
-    columns on every table. It queries each source independently instead of letting one
-    missing join/column make the whole dropdown empty.
-    """
-    conn = None
-    options = []
-    seen = set()
+    """Return active project options that already exist in the app. Purchase requests must select one of these."""
     try:
         conn = get_sql_connection()
         cursor = conn.cursor()
         ensure_project_code_columns(cursor)
         conn.commit()
-
-        # 1) Canonical Projects table.
-        try:
-            cursor.execute(
-                """
-                SELECT DISTINCT
-                    COALESCE(NULLIF(ProjectCode, ''), '') AS ProjectCode,
-                    COALESCE(NULLIF(ProjectName, ''), '') AS ProjectName
-                FROM dbo.Projects
-                WHERE COALESCE(NULLIF(ProjectCode, ''), NULLIF(ProjectName, '')) IS NOT NULL
-                ORDER BY COALESCE(NULLIF(ProjectCode, ''), ''), COALESCE(NULLIF(ProjectName, ''), '');
-                """
-            )
-            for r in cursor.fetchall():
-                add_project_option(options, seen, getattr(r, "ProjectCode", ""), getattr(r, "ProjectName", ""))
-        except Exception as e:
-            print(f"Project dropdown Projects query skipped: {e}")
-
-        # 2) PurchaseOrders table. This catches app-created POs or uploaded POs even if
-        # the Projects table was not populated cleanly in an earlier build.
-        po_cols = get_dbo_table_columns(cursor, "PurchaseOrders")
-        if po_cols:
-            po_code_expr = "COALESCE(NULLIF(po.ProjectCode, ''), NULLIF(p.ProjectCode, ''), '')" if "ProjectCode" in po_cols else "COALESCE(NULLIF(p.ProjectCode, ''), '')"
-            po_name_parts = []
-            if "ProjectName" in po_cols:
-                po_name_parts.append("NULLIF(po.ProjectName, '')")
-            po_name_parts.append("NULLIF(p.ProjectName, '')")
-            po_name_expr = "COALESCE(" + ", ".join(po_name_parts) + ", '')"
-            try:
-                cursor.execute(
-                    f"""
-                    SELECT DISTINCT
-                        {po_code_expr} AS ProjectCode,
-                        {po_name_expr} AS ProjectName
-                    FROM dbo.PurchaseOrders po
-                    LEFT JOIN dbo.Projects p ON po.ProjectId = p.ProjectId
-                    WHERE COALESCE(NULLIF({po_code_expr}, ''), NULLIF({po_name_expr}, '')) IS NOT NULL
-                    ORDER BY {po_code_expr}, {po_name_expr};
-                    """
-                )
-                for r in cursor.fetchall():
-                    add_project_option(options, seen, getattr(r, "ProjectCode", ""), getattr(r, "ProjectName", ""))
-            except Exception as e:
-                print(f"Project dropdown PurchaseOrders query skipped: {e}")
-
-        # 3) IssuedPOLines table. This is the most direct source for the setup CSV upload.
-        line_cols = get_dbo_table_columns(cursor, "IssuedPOLines")
-        if line_cols and ("ProjectCode" in line_cols or "ProjectName" in line_cols):
-            code_expr = "COALESCE(NULLIF(ProjectCode, ''), '')" if "ProjectCode" in line_cols else "''"
-            name_expr = "COALESCE(NULLIF(ProjectName, ''), '')" if "ProjectName" in line_cols else "''"
-            try:
-                cursor.execute(
-                    f"""
-                    SELECT DISTINCT
-                        {code_expr} AS ProjectCode,
-                        {name_expr} AS ProjectName
-                    FROM dbo.IssuedPOLines
-                    WHERE COALESCE(NULLIF({code_expr}, ''), NULLIF({name_expr}, '')) IS NOT NULL
-                    ORDER BY {code_expr}, {name_expr};
-                    """
-                )
-                for r in cursor.fetchall():
-                    add_project_option(options, seen, getattr(r, "ProjectCode", ""), getattr(r, "ProjectName", ""))
-            except Exception as e:
-                print(f"Project dropdown IssuedPOLines query skipped: {e}")
-
+        req_where, req_params = requestor_filter_sql("po")
+        cursor.execute(
+            f"""
+            SELECT DISTINCT
+                COALESCE(NULLIF(pr.ProjectCode, ''), NULLIF(po.ProjectCode, ''), '') AS ProjectCode,
+                COALESCE(NULLIF(pr.ProjectName, ''), NULLIF(l.ProjectName, ''), '') AS ProjectName
+            FROM dbo.PurchaseOrders po
+            LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
+            LEFT JOIN dbo.IssuedPOLines l ON po.PurchaseOrderId = l.PurchaseOrderId
+            WHERE {req_where}
+            ORDER BY COALESCE(NULLIF(pr.ProjectCode, ''), NULLIF(po.ProjectCode, ''), ''),
+                     COALESCE(NULLIF(pr.ProjectName, ''), NULLIF(l.ProjectName, ''), '');
+            """,
+            *req_params,
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        options = []
+        seen = set()
+        for r in rows:
+            code = clean_text(getattr(r, "ProjectCode", ""))
+            name = clean_text(getattr(r, "ProjectName", ""))
+            if not code and not name:
+                continue
+            key = (code.lower(), name.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            value = f"{code}||{name}"
+            label = f"{code} - {name}" if code and name else (code or name)
+            options.append({"code": code, "name": name, "value": value, "label": label})
         return options
-    except Exception as e:
-        print(f"Project dropdown failed: {e}")
+    except Exception:
         return []
-    finally:
-        if conn:
-            conn.close()
-
-
-def find_existing_project_source(cursor, project_code, project_name):
-    """Find a project only from existing project/PO setup data, never from free-text request input."""
-    code = clean_text(project_code)
-    name = clean_text(project_name)
-
-    ensure_project_code_columns(cursor)
-
-    # First, check Projects directly.
-    if code:
-        cursor.execute(
-            """
-            SELECT TOP 1 ProjectId, ProjectCode, ProjectName, Department
-            FROM dbo.Projects
-            WHERE ProjectCode = ? OR (ProjectName = ? AND ? <> '')
-            ORDER BY ProjectId;
-            """,
-            code,
-            name,
-            name,
-        )
-    else:
-        cursor.execute(
-            """
-            SELECT TOP 1 ProjectId, ProjectCode, ProjectName, Department
-            FROM dbo.Projects
-            WHERE ProjectName = ?
-            ORDER BY ProjectId;
-            """,
-            name,
-        )
-    project = cursor.fetchone()
-    if project:
-        return project
-
-    # If the Projects table is missing an entry but the project exists in setup PO data,
-    # normalize it into Projects so the purchase request can reference a real ProjectId.
-    po_cols = get_dbo_table_columns(cursor, "PurchaseOrders")
-    if po_cols:
-        po_code_expr = "COALESCE(NULLIF(po.ProjectCode, ''), '')" if "ProjectCode" in po_cols else "''"
-        po_name_expr = "COALESCE(NULLIF(po.ProjectName, ''), '')" if "ProjectName" in po_cols else "''"
-        dept_expr = "COALESCE(NULLIF(po.Department, ''), '')" if "Department" in po_cols else "''"
-        try:
-            where_parts = []
-            params = []
-            if code and "ProjectCode" in po_cols:
-                where_parts.append("po.ProjectCode = ?")
-                params.append(code)
-            if name and "ProjectName" in po_cols:
-                where_parts.append("po.ProjectName = ?")
-                params.append(name)
-            if where_parts:
-                cursor.execute(
-                    f"""
-                    SELECT TOP 1 {po_code_expr} AS ProjectCode, {po_name_expr} AS ProjectName, {dept_expr} AS Department
-                    FROM dbo.PurchaseOrders po
-                    WHERE {' OR '.join(where_parts)}
-                    ORDER BY po.PurchaseOrderId;
-                    """,
-                    *params,
-                )
-                row = cursor.fetchone()
-                if row:
-                    existing_code = clean_text(getattr(row, "ProjectCode", "")) or code
-                    existing_name = clean_text(getattr(row, "ProjectName", "")) or name or existing_code
-                    existing_dept = clean_text(getattr(row, "Department", ""))
-                    project_id = get_or_create_project(cursor, existing_name, existing_dept, existing_code)
-                    cursor.execute("SELECT TOP 1 ProjectId, ProjectCode, ProjectName, Department FROM dbo.Projects WHERE ProjectId = ?;", project_id)
-                    return cursor.fetchone()
-        except Exception as e:
-            print(f"Project validation PurchaseOrders fallback skipped: {e}")
-
-    line_cols = get_dbo_table_columns(cursor, "IssuedPOLines")
-    if line_cols:
-        code_expr = "COALESCE(NULLIF(ProjectCode, ''), '')" if "ProjectCode" in line_cols else "''"
-        name_expr = "COALESCE(NULLIF(ProjectName, ''), '')" if "ProjectName" in line_cols else "''"
-        dept_expr = "COALESCE(NULLIF(Department, ''), '')" if "Department" in line_cols else "''"
-        where_parts = []
-        params = []
-        if code and "ProjectCode" in line_cols:
-            where_parts.append("ProjectCode = ?")
-            params.append(code)
-        if name and "ProjectName" in line_cols:
-            where_parts.append("ProjectName = ?")
-            params.append(name)
-        if where_parts:
-            try:
-                cursor.execute(
-                    f"""
-                    SELECT TOP 1 {code_expr} AS ProjectCode, {name_expr} AS ProjectName, {dept_expr} AS Department
-                    FROM dbo.IssuedPOLines
-                    WHERE {' OR '.join(where_parts)}
-                    ORDER BY IssuedPOLineId;
-                    """,
-                    *params,
-                )
-                row = cursor.fetchone()
-                if row:
-                    existing_code = clean_text(getattr(row, "ProjectCode", "")) or code
-                    existing_name = clean_text(getattr(row, "ProjectName", "")) or name or existing_code
-                    existing_dept = clean_text(getattr(row, "Department", ""))
-                    project_id = get_or_create_project(cursor, existing_name, existing_dept, existing_code)
-                    cursor.execute("SELECT TOP 1 ProjectId, ProjectCode, ProjectName, Department FROM dbo.Projects WHERE ProjectId = ?;", project_id)
-                    return cursor.fetchone()
-            except Exception as e:
-                print(f"Project validation IssuedPOLines fallback skipped: {e}")
-
-    return None
 
 
 def validate_selected_project(cursor, selected_project_value):
@@ -4077,10 +3891,32 @@ def validate_selected_project(cursor, selected_project_value):
     if not project_code and not project_name:
         raise ValueError("Please select an existing project.")
 
-    project = find_existing_project_source(cursor, project_code, project_name)
+    ensure_project_code_columns(cursor)
+    if project_code:
+        cursor.execute(
+            """
+            SELECT TOP 1 ProjectId, ProjectCode, ProjectName, Department
+            FROM dbo.Projects
+            WHERE ProjectCode = ? OR (ProjectName = ? AND ? <> '');
+            """,
+            project_code,
+            project_name,
+            project_name,
+        )
+    else:
+        cursor.execute(
+            """
+            SELECT TOP 1 ProjectId, ProjectCode, ProjectName, Department
+            FROM dbo.Projects
+            WHERE ProjectName = ?;
+            """,
+            project_name,
+        )
+    project = cursor.fetchone()
     if not project:
-        raise ValueError("Selected project was not found in existing PO setup data. Upload issued POs for this project before submitting purchase requests for it.")
+        raise ValueError("Selected project was not found. Add the project through issued PO setup before submitting purchase requests for it.")
     return project
+
 
 def allowed_attachment(filename):
     if not filename or "." not in filename:
@@ -4224,6 +4060,7 @@ def shell(title, subtitle, active, content):
 
     accounting_nav_items = [
         ("Upload Issued POs", "/upload-po", "⬆️"),
+        ("PO Maintenance", "/po-maintenance", "🛠️"),
         ("Expense Upload / PO Matching", "/expense-upload", "🧾"),
         ("Expenses", "/expenses", "📄"),
         ("Missing PO Review", "/missing-po-review", "⚠️"),
@@ -8328,6 +8165,443 @@ def clear_view_as():
     resp = make_response(redirect(request.headers.get("Referer") or "/user-access"))
     resp.delete_cookie("PO_DASHBOARD_VIEW_AS")
     return resp
+
+
+# ------------------------------------------------------------
+# PO Maintenance / correction workflow
+# ------------------------------------------------------------
+
+def ensure_po_maintenance_schema(cursor):
+    """Create audit table and ensure project code columns exist for safe PO corrections."""
+    ensure_project_code_columns(cursor)
+    cursor.execute(
+        """
+        IF OBJECT_ID('dbo.POChangeAudit', 'U') IS NULL
+        BEGIN
+            CREATE TABLE dbo.POChangeAudit (
+                POChangeAuditId INT IDENTITY(1,1) PRIMARY KEY,
+                ChangeType NVARCHAR(100) NOT NULL,
+                OldPONumber NVARCHAR(100) NULL,
+                NewPONumber NVARCHAR(100) NULL,
+                OldProjectCode NVARCHAR(100) NULL,
+                NewProjectCode NVARCHAR(100) NULL,
+                OldProjectName NVARCHAR(255) NULL,
+                NewProjectName NVARCHAR(255) NULL,
+                OldVendorName NVARCHAR(255) NULL,
+                NewVendorName NVARCHAR(255) NULL,
+                OldDepartment NVARCHAR(100) NULL,
+                NewDepartment NVARCHAR(100) NULL,
+                OldRequestor NVARCHAR(255) NULL,
+                NewRequestor NVARCHAR(255) NULL,
+                Reason NVARCHAR(MAX) NOT NULL,
+                ChangedBy NVARCHAR(255) NULL,
+                ChangedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+            );
+        END;
+        """
+    )
+
+
+def sql_col_exists(cursor, table_name, column_name):
+    cursor.execute("SELECT COL_LENGTH(?, ?) AS ColLen", f"dbo.{table_name}", column_name)
+    row = cursor.fetchone()
+    return bool(row and row.ColLen is not None)
+
+
+def sql_table_exists(cursor, table_name):
+    cursor.execute("SELECT OBJECT_ID(?, 'U') AS ObjId", f"dbo.{table_name}")
+    row = cursor.fetchone()
+    return bool(row and row.ObjId)
+
+
+def update_if_table_column(cursor, table_name, column_name, new_value, where_column, old_value):
+    if sql_table_exists(cursor, table_name) and sql_col_exists(cursor, table_name, column_name) and sql_col_exists(cursor, table_name, where_column):
+        cursor.execute(f"UPDATE dbo.{table_name} SET {column_name} = ? WHERE {where_column} = ?", new_value, old_value)
+
+
+def load_active_dashboard_users_for_select(cursor):
+    try:
+        cursor.execute("SELECT Email, DisplayName FROM dbo.DashboardUsers WHERE IsActive = 1 ORDER BY DisplayName, Email")
+        return cursor.fetchall()
+    except Exception:
+        return []
+
+
+def po_maintenance_row_summary(cursor, po_number):
+    cursor.execute(
+        """
+        SELECT TOP 1
+            po.PurchaseOrderId,
+            po.PONumber,
+            po.ProjectCode,
+            COALESCE(p.ProjectName, l.ProjectName, '') AS ProjectName,
+            COALESCE(v.VendorName, l.VendorName, '') AS VendorName,
+            COALESCE(po.Department, l.Department, '') AS Department,
+            COALESCE(po.Requestor, l.Requestor, '') AS Requestor,
+            COALESCE(po.POStatus, l.POStatus, 'Open') AS POStatus,
+            COALESCE(po.PODate, l.PODate) AS PODate,
+            COALESCE(SUM(l.LineAmount), po.RevisedAmount, po.OriginalAmount, 0) AS LineTotal,
+            COUNT(l.IssuedPOLineId) AS LineCount
+        FROM dbo.PurchaseOrders po
+        LEFT JOIN dbo.Projects p ON p.ProjectId = po.ProjectId
+        LEFT JOIN dbo.IssuedPOLines l ON l.PONumber = po.PONumber
+        LEFT JOIN dbo.Vendors v ON v.VendorId = po.VendorId
+        WHERE po.PONumber = ?
+        GROUP BY po.PurchaseOrderId, po.PONumber, po.ProjectCode, p.ProjectName, l.ProjectName, v.VendorName, l.VendorName,
+                 po.Department, l.Department, po.Requestor, l.Requestor, po.POStatus, l.POStatus, po.PODate, l.PODate,
+                 po.RevisedAmount, po.OriginalAmount
+        """,
+        po_number,
+    )
+    return cursor.fetchone()
+
+
+def update_existing_po_values(cursor, old_po, new_po, project_code, project_name, vendor_name, department, requestor, reason, changed_by):
+    old_po = clean_text(old_po)
+    new_po = clean_text(new_po)
+    project_code = clean_text(project_code)
+    project_name = clean_text(project_name)
+    vendor_name = clean_text(vendor_name)
+    department = clean_text(department)
+    requestor = clean_text(requestor)
+    reason = clean_text(reason)
+    changed_by = clean_text(changed_by)
+
+    if not old_po:
+        raise ValueError("Original PO number is required.")
+    if not new_po:
+        raise ValueError("PO number is required.")
+    if not reason:
+        raise ValueError("A reason for the change is required.")
+
+    current = po_maintenance_row_summary(cursor, old_po)
+    if not current:
+        raise ValueError("The selected PO was not found.")
+    if new_po.lower() != old_po.lower():
+        cursor.execute("SELECT COUNT(*) AS ExistingCount FROM dbo.PurchaseOrders WHERE LOWER(PONumber) = LOWER(?)", new_po)
+        if cursor.fetchone().ExistingCount:
+            raise ValueError("That new PO number already exists. Choose a unique PO number.")
+
+    # Ensure vendor/project records exist or get updated when possible.
+    vendor_id = get_or_create_vendor(cursor, vendor_name or current.VendorName or "Unknown Vendor")
+    project_id = get_or_create_project(cursor, project_name or current.ProjectName or "Unassigned Project", department or current.Department or "", project_code or current.ProjectCode or None)
+
+    # Primary PO record update.
+    cursor.execute(
+        """
+        UPDATE dbo.PurchaseOrders
+        SET PONumber = ?, VendorId = ?, ProjectId = ?, ProjectCode = ?, Department = ?, Requestor = ?, UpdatedAt = SYSUTCDATETIME()
+        WHERE PONumber = ?;
+        """,
+        new_po,
+        vendor_id,
+        project_id,
+        project_code,
+        department,
+        requestor,
+        old_po,
+    )
+
+    # Line items hold denormalized PO/project/vendor fields.
+    cursor.execute(
+        """
+        UPDATE dbo.IssuedPOLines
+        SET PONumber = ?, VendorName = ?, ProjectCode = ?, ProjectName = ?, Department = ?, Requestor = ?
+        WHERE PONumber = ?;
+        """,
+        new_po,
+        vendor_name,
+        project_code,
+        project_name,
+        department,
+        requestor,
+        old_po,
+    )
+
+    # Related records that may point to this PO number.
+    for table_name, columns in {
+        "ExpenseReviewItems": ["CorrectPONumber", "MatchedPONumber", "PostedPONumber", "ExtractedPONumber"],
+        "PurchaseRequests": ["ConvertedPONumber"],
+        "PurchaseRequestAttachments": ["PONumber"],
+    }.items():
+        for column_name in columns:
+            update_if_table_column(cursor, table_name, column_name, new_po, column_name, old_po)
+
+    cursor.execute(
+        """
+        INSERT INTO dbo.POChangeAudit
+            (ChangeType, OldPONumber, NewPONumber, OldProjectCode, NewProjectCode, OldProjectName, NewProjectName,
+             OldVendorName, NewVendorName, OldDepartment, NewDepartment, OldRequestor, NewRequestor, Reason, ChangedBy)
+        VALUES ('PO Maintenance Update', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """,
+        old_po,
+        new_po,
+        current.ProjectCode,
+        project_code,
+        current.ProjectName,
+        project_name,
+        current.VendorName,
+        vendor_name,
+        current.Department,
+        department,
+        current.Requestor,
+        requestor,
+        reason,
+        changed_by,
+    )
+
+
+def bulk_update_project_code(cursor, project_name, new_project_code, reason, changed_by):
+    project_name = clean_text(project_name)
+    new_project_code = clean_text(new_project_code)
+    reason = clean_text(reason)
+    changed_by = clean_text(changed_by)
+    if not project_name:
+        raise ValueError("Project name is required for bulk project code update.")
+    if not new_project_code:
+        raise ValueError("New project code is required.")
+    if not reason:
+        raise ValueError("A reason for the bulk project code update is required.")
+
+    cursor.execute("SELECT TOP 1 ProjectCode FROM dbo.Projects WHERE ProjectName = ?", project_name)
+    row = cursor.fetchone()
+    old_code = row.ProjectCode if row else ""
+
+    cursor.execute("UPDATE dbo.Projects SET ProjectCode = ? WHERE ProjectName = ?", new_project_code, project_name)
+    cursor.execute("UPDATE dbo.PurchaseOrders SET ProjectCode = ?, UpdatedAt = SYSUTCDATETIME() WHERE ProjectId IN (SELECT ProjectId FROM dbo.Projects WHERE ProjectName = ?)", new_project_code, project_name)
+    cursor.execute("UPDATE dbo.IssuedPOLines SET ProjectCode = ? WHERE ProjectName = ?", new_project_code, project_name)
+    cursor.execute(
+        """
+        INSERT INTO dbo.POChangeAudit
+            (ChangeType, OldProjectCode, NewProjectCode, OldProjectName, NewProjectName, Reason, ChangedBy)
+        VALUES ('Bulk Project Code Update', ?, ?, ?, ?, ?, ?);
+        """,
+        old_code,
+        new_project_code,
+        project_name,
+        project_name,
+        reason,
+        changed_by,
+    )
+
+
+@app.route("/po-maintenance", methods=["GET", "POST"])
+def po_maintenance():
+    allowed, reason = require_page_access("PO Maintenance")
+    if not allowed:
+        return access_denied_response("PO Maintenance", reason)
+
+    message_html = ""
+    selected_po = clean_text(request.args.get("po"))
+    q = clean_text(request.args.get("q"))
+
+    try:
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        ensure_po_maintenance_schema(cursor)
+
+        if request.method == "POST":
+            action = clean_text(request.form.get("action"))
+            try:
+                if action == "update_po":
+                    update_existing_po_values(
+                        cursor,
+                        request.form.get("old_po_number"),
+                        request.form.get("new_po_number"),
+                        request.form.get("project_code"),
+                        request.form.get("project_name"),
+                        request.form.get("vendor_name"),
+                        request.form.get("department"),
+                        request.form.get("requestor"),
+                        request.form.get("reason"),
+                        get_current_user().get("email") or "Unknown",
+                    )
+                    conn.commit()
+                    selected_po = clean_text(request.form.get("new_po_number")) or selected_po
+                    message_html = '<div class="notice ok">PO maintenance update saved.</div>'
+                elif action == "bulk_project_code":
+                    bulk_update_project_code(
+                        cursor,
+                        request.form.get("bulk_project_name"),
+                        request.form.get("bulk_project_code"),
+                        request.form.get("bulk_reason"),
+                        get_current_user().get("email") or "Unknown",
+                    )
+                    conn.commit()
+                    message_html = '<div class="notice ok">Project code update saved for matching project records.</div>'
+                else:
+                    message_html = '<div class="notice error">Unknown PO maintenance action.</div>'
+            except Exception as e:
+                conn.rollback()
+                message_html = f'<div class="notice error">{h(e)}</div>'
+
+        # Search/list POs.
+        search_where = ""
+        search_params = []
+        if q:
+            like = f"%{q}%"
+            search_where = "WHERE po.PONumber LIKE ? OR v.VendorName LIKE ? OR p.ProjectName LIKE ? OR po.ProjectCode LIKE ?"
+            search_params = [like, like, like, like]
+        cursor.execute(
+            f"""
+            SELECT TOP 100
+                po.PONumber,
+                po.ProjectCode,
+                COALESCE(p.ProjectName, '') AS ProjectName,
+                COALESCE(v.VendorName, '') AS VendorName,
+                po.Department,
+                po.Requestor,
+                po.POStatus,
+                COALESCE(SUM(l.LineAmount), po.RevisedAmount, po.OriginalAmount, 0) AS POValue,
+                COUNT(l.IssuedPOLineId) AS LineCount
+            FROM dbo.PurchaseOrders po
+            LEFT JOIN dbo.Projects p ON p.ProjectId = po.ProjectId
+            LEFT JOIN dbo.Vendors v ON v.VendorId = po.VendorId
+            LEFT JOIN dbo.IssuedPOLines l ON l.PONumber = po.PONumber
+            {search_where}
+            GROUP BY po.PONumber, po.ProjectCode, p.ProjectName, v.VendorName, po.Department, po.Requestor, po.POStatus, po.RevisedAmount, po.OriginalAmount
+            ORDER BY po.PONumber;
+            """,
+            *search_params,
+        )
+        pos = cursor.fetchall()
+
+        # Project names for bulk update.
+        cursor.execute("SELECT DISTINCT ProjectName FROM dbo.Projects WHERE ProjectName IS NOT NULL AND LTRIM(RTRIM(ProjectName)) <> '' ORDER BY ProjectName")
+        project_names = [r.ProjectName for r in cursor.fetchall()]
+
+        users = load_active_dashboard_users_for_select(cursor)
+
+        selected = po_maintenance_row_summary(cursor, selected_po) if selected_po else None
+        line_rows = []
+        expense_rows = []
+        audit_rows = []
+        if selected:
+            cursor.execute(
+                """
+                SELECT TOP 200 IssuedPOLineId, LineDescription, Unit, UnitCost, Qty, LineAmount, ProjectCode, ProjectName, VendorName
+                FROM dbo.IssuedPOLines
+                WHERE PONumber = ?
+                ORDER BY IssuedPOLineId;
+                """,
+                selected.PONumber,
+            )
+            line_rows = cursor.fetchall()
+            try:
+                ensure_expense_review_tables()
+                cursor.execute(
+                    """
+                    SELECT TOP 100 ExpenseReviewItemId, TxDate, TxType, VendorName, Amount, ReviewDecision, PostedToPO, PostedAmount, PostedAt, PostedBy
+                    FROM dbo.ExpenseReviewItems
+                    WHERE CorrectPONumber = ? OR MatchedPONumber = ? OR PostedPONumber = ?
+                    ORDER BY COALESCE(PostedAt, UpdatedAt, CreatedAt) DESC;
+                    """,
+                    selected.PONumber,
+                    selected.PONumber,
+                    selected.PONumber,
+                )
+                expense_rows = cursor.fetchall()
+            except Exception:
+                expense_rows = []
+            cursor.execute(
+                """
+                SELECT TOP 25 ChangeType, OldPONumber, NewPONumber, OldProjectCode, NewProjectCode, Reason, ChangedBy, ChangedAt
+                FROM dbo.POChangeAudit
+                WHERE OldPONumber = ? OR NewPONumber = ? OR OldProjectName = ? OR NewProjectName = ?
+                ORDER BY ChangedAt DESC;
+                """,
+                selected.PONumber,
+                selected.PONumber,
+                selected.ProjectName,
+                selected.ProjectName,
+            )
+            audit_rows = cursor.fetchall()
+
+        conn.close()
+
+    except Exception as e:
+        return shell("PO Maintenance", "Edit uploaded POs safely with audit tracking.", "PO Maintenance", f'<div class="notice error">Error loading PO Maintenance: {h(e)}</div>')
+
+    po_list_rows = ""
+    for po in pos:
+        po_list_rows += f"""
+        <tr>
+            <td><a class="po-link" href="/po-maintenance?po={quote_plus(str(po.PONumber or ''))}">{h(po.PONumber)}</a></td>
+            <td>{h(po.ProjectCode)}</td>
+            <td>{h(po.ProjectName)}</td>
+            <td>{h(po.VendorName)}</td>
+            <td>{h(po.Requestor)}</td>
+            <td>{status_chip(po.POStatus or 'Open')}</td>
+            <td class="right">{currency(po.POValue)}</td>
+            <td class="right">{int(po.LineCount or 0)}</td>
+        </tr>
+        """
+    if not po_list_rows:
+        po_list_rows = '<tr><td colspan="8">No POs found.</td></tr>'
+
+    dept_options = ''.join(f'<option value="{h(d)}">{h(d)}</option>' for d in DEPARTMENT_OPTIONS)
+    requestor_options = ''.join(f'<option value="{h(u.Email)}">{h(u.DisplayName or u.Email)} · {h(u.Email)}</option>' for u in users)
+
+    selected_html = ""
+    if selected:
+        # Rebuild selected option markup with current values selected.
+        dept_options_selected = ''.join(f'<option value="{h(d)}" {"selected" if clean_text(selected.Department)==d else ""}>{h(d)}</option>' for d in DEPARTMENT_OPTIONS)
+        requestor_options_selected = ''.join(f'<option value="{h(u.Email)}" {"selected" if clean_text(selected.Requestor).lower()==str(u.Email).lower() else ""}>{h(u.DisplayName or u.Email)} · {h(u.Email)}</option>' for u in users)
+        if selected.Requestor and all(str(selected.Requestor).lower() != str(u.Email).lower() for u in users):
+            requestor_options_selected = f'<option value="{h(selected.Requestor)}" selected>{h(selected.Requestor)}</option>' + requestor_options_selected
+
+        line_table_rows = ''.join(f"<tr><td>{h(r.LineDescription)}</td><td>{h(r.Unit)}</td><td>{h(r.Qty)}</td><td class='right'>{currency(r.UnitCost)}</td><td class='right'>{currency(r.LineAmount)}</td></tr>" for r in line_rows) or '<tr><td colspan="5">No line items found.</td></tr>'
+        expense_table_rows = ''.join(f"<tr><td>{h(r.TxDate)}</td><td>{h(r.TxType)}</td><td>{h(r.VendorName)}</td><td class='right'>{currency(r.Amount)}</td><td>{h(r.ReviewDecision)}</td><td>{'Posted' if r.PostedToPO else 'Not Posted'}</td><td class='right'>{currency(r.PostedAmount)}</td></tr>" for r in expense_rows) or '<tr><td colspan="7">No linked expense review rows found.</td></tr>'
+        audit_table_rows = ''.join(f"<tr><td>{h(r.ChangedAt)}</td><td>{h(r.ChangeType)}</td><td>{h(r.OldPONumber)} → {h(r.NewPONumber)}</td><td>{h(r.OldProjectCode)} → {h(r.NewProjectCode)}</td><td>{h(r.ChangedBy)}</td><td>{h(r.Reason)}</td></tr>" for r in audit_rows) or '<tr><td colspan="6">No audit changes recorded yet.</td></tr>'
+        selected_html = f"""
+        <div class="card">
+            <h3>Edit Selected PO</h3>
+            <p class="card-subtitle">Use this for setup corrections such as PO number cleanup, missing project code, vendor/requestor corrections, or department cleanup. A reason is required and an audit record is saved.</p>
+            <form method="post" class="form-grid">
+                <input type="hidden" name="action" value="update_po">
+                <input type="hidden" name="old_po_number" value="{h(selected.PONumber)}">
+                <div class="form-field"><label>PO Number</label><input name="new_po_number" value="{h(selected.PONumber)}" required></div>
+                <div class="form-field"><label>Project Code</label><input name="project_code" value="{h(selected.ProjectCode)}" placeholder="Example: 26-018"></div>
+                <div class="form-field"><label>Project Name</label><input name="project_name" value="{h(selected.ProjectName)}" required></div>
+                <div class="form-field"><label>Vendor</label><input name="vendor_name" value="{h(selected.VendorName)}" required></div>
+                <div class="form-field"><label>Department</label><select name="department"><option value="">Select department</option>{dept_options_selected}</select></div>
+                <div class="form-field"><label>Requestor</label><select name="requestor"><option value="">Select requestor</option>{requestor_options_selected}</select></div>
+                <div class="form-field full"><label>Reason for Change</label><textarea name="reason" required placeholder="Example: Project setup cleanup; added missing project code; corrected vendor PO number."></textarea></div>
+                <div class="form-field full"><button class="primary" type="submit">Save PO Maintenance Update</button> <a class="button secondary" href="/po-packet/{quote_plus(str(selected.PONumber or ''))}?type=internal">Open PO Packet</a></div>
+            </form>
+        </div>
+        <div class="grid two">
+            <div class="card"><h3>Linked Line Items</h3><div class="table-wrap"><table><tr><th>Description</th><th>Unit</th><th>Qty</th><th class="right">Unit Cost</th><th class="right">Line Amount</th></tr>{line_table_rows}</table></div></div>
+            <div class="card"><h3>Linked Posted / Reviewed Expenses</h3><div class="table-wrap"><table><tr><th>Date</th><th>Type</th><th>Vendor</th><th class="right">Amount</th><th>Decision</th><th>Posting</th><th class="right">Posted Amount</th></tr>{expense_table_rows}</table></div></div>
+        </div>
+        <div class="card"><h3>PO Change Audit</h3><div class="table-wrap"><table><tr><th>Changed At</th><th>Type</th><th>PO Change</th><th>Project Code Change</th><th>Changed By</th><th>Reason</th></tr>{audit_table_rows}</table></div></div>
+        """
+    else:
+        selected_html = '<div class="card"><h3>Select a PO to edit</h3><p class="card-subtitle">Click a PO number in the list below to open its maintenance form.</p></div>'
+
+    project_options = ''.join(f'<option value="{h(name)}">{h(name)}</option>' for name in project_names)
+    content = f"""
+    {message_html}
+    <div class="notice info"><strong>PO Maintenance</strong><br>Use this page for controlled corrections to existing uploaded/app-created POs. Changes update related PO lines, expense matches, attachments, and converted purchase request links where applicable.</div>
+    {selected_html}
+    <div class="card">
+        <h3>Bulk Project Code Update</h3>
+        <p class="card-subtitle">Use this when a whole project was uploaded without a project code. This updates the project code on matching project, PO, and line item records.</p>
+        <form method="post" class="form-grid">
+            <input type="hidden" name="action" value="bulk_project_code">
+            <div class="form-field"><label>Project</label><select name="bulk_project_name" required><option value="">Select project</option>{project_options}</select></div>
+            <div class="form-field"><label>New Project Code</label><input name="bulk_project_code" placeholder="Example: 26-018" required></div>
+            <div class="form-field full"><label>Reason</label><textarea name="bulk_reason" required placeholder="Example: Added missing project code after initial PO upload."></textarea></div>
+            <div class="form-field full"><button class="primary" type="submit">Update Project Code</button></div>
+        </form>
+    </div>
+    <div class="card">
+        <h3>Find Existing PO</h3>
+        <form method="get" class="search-row"><input name="q" value="{h(q)}" placeholder="Search PO, project, vendor, or project code"><button class="secondary" type="submit">Search</button><a class="button secondary" href="/po-maintenance">Clear</a></form>
+        <div class="table-wrap"><table><tr><th>PO</th><th>Project Code</th><th>Project</th><th>Vendor</th><th>Requestor</th><th>Status</th><th class="right">Value</th><th class="right">Lines</th></tr>{po_list_rows}</table></div>
+    </div>
+    """
+    return shell("PO Maintenance", "Safely edit PO numbers and project codes with an audit trail.", "PO Maintenance", content)
 
 @app.route("/user-access", methods=["GET", "POST"])
 def user_access():
