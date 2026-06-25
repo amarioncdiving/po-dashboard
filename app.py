@@ -3839,26 +3839,33 @@ def ensure_purchase_request_project_code_column(cursor):
 
 
 def load_existing_project_options():
-    """Return active project options that already exist in the app. Purchase requests must select one of these."""
+    """Return the same project list used by the Projects page Select Project dropdown.
+
+    The Projects tab gets its options from uploaded issued PO line/project setup data
+    (IssuedPOLines joined to PurchaseOrders/Projects). New Purchase Request should use
+    that same source so the two dropdowns stay in sync.
+    """
     try:
         conn = get_sql_connection()
         cursor = conn.cursor()
         ensure_project_code_columns(cursor)
         conn.commit()
-        req_where, req_params = requestor_filter_sql("po")
+        req_where_line, req_params_line = requestor_filter_sql("l")
         cursor.execute(
             f"""
             SELECT DISTINCT
-                COALESCE(NULLIF(pr.ProjectCode, ''), NULLIF(po.ProjectCode, ''), '') AS ProjectCode,
+                COALESCE(NULLIF(pr.ProjectCode, ''), NULLIF(l.ProjectCode, ''), '') AS ProjectCode,
                 COALESCE(NULLIF(pr.ProjectName, ''), NULLIF(l.ProjectName, ''), '') AS ProjectName
-            FROM dbo.PurchaseOrders po
+            FROM dbo.IssuedPOLines l
+            LEFT JOIN dbo.PurchaseOrders po ON l.PurchaseOrderId = po.PurchaseOrderId
             LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
-            LEFT JOIN dbo.IssuedPOLines l ON po.PurchaseOrderId = l.PurchaseOrderId
-            WHERE {req_where}
-            ORDER BY COALESCE(NULLIF(pr.ProjectCode, ''), NULLIF(po.ProjectCode, ''), ''),
-                     COALESCE(NULLIF(pr.ProjectName, ''), NULLIF(l.ProjectName, ''), '');
+            WHERE {req_where_line}
+              AND COALESCE(NULLIF(pr.ProjectCode, ''), NULLIF(l.ProjectCode, ''), NULLIF(pr.ProjectName, ''), NULLIF(l.ProjectName, '')) IS NOT NULL
+            ORDER BY
+                COALESCE(NULLIF(pr.ProjectCode, ''), NULLIF(l.ProjectCode, ''), ''),
+                COALESCE(NULLIF(pr.ProjectName, ''), NULLIF(l.ProjectName, ''), '');
             """,
-            *req_params,
+            *req_params_line,
         )
         rows = cursor.fetchall()
         conn.close()
@@ -3892,6 +3899,8 @@ def validate_selected_project(cursor, selected_project_value):
         raise ValueError("Please select an existing project.")
 
     ensure_project_code_columns(cursor)
+
+    # First try the normalized Projects table.
     if project_code:
         cursor.execute(
             """
@@ -3913,10 +3922,51 @@ def validate_selected_project(cursor, selected_project_value):
             project_name,
         )
     project = cursor.fetchone()
-    if not project:
-        raise ValueError("Selected project was not found. Add the project through issued PO setup before submitting purchase requests for it.")
-    return project
+    if project:
+        return project
 
+    # If the Projects tab can see it from uploaded issued PO setup, accept that
+    # existing setup project and create the missing normalized Projects row.
+    cursor.execute(
+        """
+        SELECT TOP 1
+            COALESCE(NULLIF(ProjectCode, ''), ?) AS ProjectCode,
+            COALESCE(NULLIF(ProjectName, ''), ?) AS ProjectName,
+            COALESCE(NULLIF(Department, ''), '') AS Department
+        FROM dbo.IssuedPOLines
+        WHERE (? <> '' AND ProjectCode = ?)
+           OR (? <> '' AND ProjectName = ?)
+        ORDER BY IssuedPOLineId;
+        """,
+        project_code,
+        project_name,
+        project_code,
+        project_code,
+        project_name,
+        project_name,
+    )
+    line_project = cursor.fetchone()
+    if not line_project:
+        raise ValueError("Selected project was not found in the uploaded issued PO project setup data.")
+
+    project_id = get_or_create_project(
+        cursor,
+        clean_text(line_project.ProjectName),
+        clean_text(line_project.Department),
+        clean_text(line_project.ProjectCode),
+    )
+    cursor.execute(
+        """
+        SELECT TOP 1 ProjectId, ProjectCode, ProjectName, Department
+        FROM dbo.Projects
+        WHERE ProjectId = ?;
+        """,
+        project_id,
+    )
+    project = cursor.fetchone()
+    if not project:
+        raise ValueError("Selected project was found in PO setup, but could not be linked to the project table.")
+    return project
 
 def allowed_attachment(filename):
     if not filename or "." not in filename:
@@ -8384,6 +8434,69 @@ def bulk_update_project_code(cursor, project_name, new_project_code, reason, cha
         changed_by,
     )
 
+def void_existing_po(cursor, po_number, reason, changed_by):
+    """Void a PO while keeping it visible in PO lists.
+
+    Voiding keeps the PO/line records for audit/history, but sets the financial
+    value to zero and marks the status as Voided so dashboards and packets no
+    longer show an available amount. Linked expense review rows are preserved.
+    """
+    po_number = clean_text(po_number)
+    reason = clean_text(reason)
+    changed_by = clean_text(changed_by)
+    if not po_number:
+        raise ValueError("PO number is required to void a PO.")
+    if not reason:
+        raise ValueError("A reason is required to void a PO.")
+
+    current = po_maintenance_row_summary(cursor, po_number)
+    if not current:
+        raise ValueError("The selected PO was not found.")
+    if clean_text(getattr(current, "POStatus", "")).lower() == "voided":
+        raise ValueError("This PO is already voided.")
+
+    old_value = getattr(current, "LineTotal", 0) or 0
+    audit_reason = f"VOID PO - previous displayed amount {currency(old_value)}. {reason}"
+
+    # Header-level values. Keep the PO visible, but make its value/balance zero.
+    for col in ["OriginalAmount", "RevisedAmount", "RemainingAmount"]:
+        update_if_table_column(cursor, "PurchaseOrders", col, 0, "PONumber", po_number)
+    update_if_table_column(cursor, "PurchaseOrders", "POStatus", "Voided", "PONumber", po_number)
+    update_if_table_column(cursor, "PurchaseOrders", "SetupStatus", "Voided", "PONumber", po_number)
+
+    if sql_table_exists(cursor, "PurchaseOrders") and sql_col_exists(cursor, "PurchaseOrders", "UpdatedAt"):
+        cursor.execute("UPDATE dbo.PurchaseOrders SET UpdatedAt = SYSUTCDATETIME() WHERE PONumber = ?", po_number)
+
+    # Denormalized upload/line values. This makes existing PO lists and packets
+    # show 0.00 even when they calculate from line totals.
+    for col in ["LineAmount", "OriginalAmount", "RevisedAmount", "RemainingAmount"]:
+        update_if_table_column(cursor, "IssuedPOLines", col, 0, "PONumber", po_number)
+    update_if_table_column(cursor, "IssuedPOLines", "POStatus", "Voided", "PONumber", po_number)
+
+    cursor.execute(
+        """
+        INSERT INTO dbo.POChangeAudit
+            (ChangeType, OldPONumber, NewPONumber, OldProjectCode, NewProjectCode, OldProjectName, NewProjectName,
+             OldVendorName, NewVendorName, OldDepartment, NewDepartment, OldRequestor, NewRequestor, Reason, ChangedBy)
+        VALUES ('PO Voided', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """,
+        po_number,
+        po_number,
+        current.ProjectCode,
+        current.ProjectCode,
+        current.ProjectName,
+        current.ProjectName,
+        current.VendorName,
+        current.VendorName,
+        current.Department,
+        current.Department,
+        current.Requestor,
+        current.Requestor,
+        audit_reason,
+        changed_by,
+    )
+
+
 
 @app.route("/po-maintenance", methods=["GET", "POST"])
 def po_maintenance():
@@ -8429,6 +8542,16 @@ def po_maintenance():
                     )
                     conn.commit()
                     message_html = '<div class="notice ok">Project code update saved for matching project records.</div>'
+                elif action == "void_po":
+                    void_existing_po(
+                        cursor,
+                        request.form.get("void_po_number"),
+                        request.form.get("void_reason"),
+                        get_current_user().get("email") or "Unknown",
+                    )
+                    conn.commit()
+                    selected_po = clean_text(request.form.get("void_po_number")) or selected_po
+                    message_html = '<div class="notice ok">PO voided. It will stay visible in PO lists, but its amount and balance are now $0.00.</div>'
                 else:
                     message_html = '<div class="notice error">Unknown PO maintenance action.</div>'
             except Exception as e:
@@ -8532,7 +8655,7 @@ def po_maintenance():
             <td>{h(po.VendorName)}</td>
             <td>{h(po.Requestor)}</td>
             <td>{status_chip(po.POStatus or 'Open')}</td>
-            <td class="right">{currency(po.POValue)}</td>
+            <td class="right">{currency(0 if clean_text(po.POStatus).lower() == "voided" else po.POValue)}</td>
             <td class="right">{int(po.LineCount or 0)}</td>
         </tr>
         """
@@ -8570,6 +8693,16 @@ def po_maintenance():
                 <div class="form-field full"><button class="primary" type="submit">Save PO Maintenance Update</button> <a class="button secondary" href="/po-packet/{quote_plus(str(selected.PONumber or ''))}?type=internal">Open PO Packet</a></div>
             </form>
         </div>
+        <div class="card danger-zone">
+            <h3>Void PO</h3>
+            <p class="card-subtitle">Use this when a PO should remain in the records but no longer carry any value. The PO status will become Voided, header amounts and line amounts will be set to $0.00, and an audit record will be saved. Linked expense history is preserved.</p>
+            <form method="post" class="form-grid" onsubmit="return confirm('Void this PO and set its amount to $0.00? This keeps the PO visible but removes its value from balances.');">
+                <input type="hidden" name="action" value="void_po">
+                <input type="hidden" name="void_po_number" value="{h(selected.PONumber)}">
+                <div class="form-field full"><label>Reason for Void</label><textarea name="void_reason" required placeholder="Example: PO cancelled; duplicate upload; vendor PO replaced by another PO."></textarea></div>
+                <div class="form-field full"><button class="secondary" type="submit">Void PO and Set Amount to $0.00</button></div>
+            </form>
+        </div>
         <div class="grid two">
             <div class="card"><h3>Linked Line Items</h3><div class="table-wrap"><table><tr><th>Description</th><th>Unit</th><th>Qty</th><th class="right">Unit Cost</th><th class="right">Line Amount</th></tr>{line_table_rows}</table></div></div>
             <div class="card"><h3>Linked Posted / Reviewed Expenses</h3><div class="table-wrap"><table><tr><th>Date</th><th>Type</th><th>Vendor</th><th class="right">Amount</th><th>Decision</th><th>Posting</th><th class="right">Posted Amount</th></tr>{expense_table_rows}</table></div></div>
@@ -8582,7 +8715,7 @@ def po_maintenance():
     project_options = ''.join(f'<option value="{h(name)}">{h(name)}</option>' for name in project_names)
     content = f"""
     {message_html}
-    <div class="notice info"><strong>PO Maintenance</strong><br>Use this page for controlled corrections to existing uploaded/app-created POs. Changes update related PO lines, expense matches, attachments, and converted purchase request links where applicable.</div>
+    <div class="notice info"><strong>PO Maintenance</strong><br>Use this page for controlled corrections to existing uploaded/app-created POs. You can edit setup details or void a PO. Voided POs stay visible in PO lists but show $0.00 for amount/balance.</div>
     {selected_html}
     <div class="card">
         <h3>Bulk Project Code Update</h3>
