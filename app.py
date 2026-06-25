@@ -1342,16 +1342,26 @@ def get_or_create_vendor(cursor, vendor_name):
 
 
 def ensure_project_code_columns(cursor):
-    """Add ProjectCode to project/PO tables for the Phase 1 setup template."""
+    """Add ProjectCode to project/PO tables when the table exists.
+
+    Older deployments may not have every optional table yet. The previous version
+    tried to ALTER all three tables unconditionally when COL_LENGTH returned NULL,
+    which can fail if a table does not exist and then prevent the purchase request
+    project dropdown from loading.
+    """
     for table_name in ["Projects", "PurchaseOrders", "IssuedPOLines"]:
-        cursor.execute(
-            f"""
-            IF COL_LENGTH('dbo.{table_name}', 'ProjectCode') IS NULL
-            BEGIN
-                ALTER TABLE dbo.{table_name} ADD ProjectCode NVARCHAR(100) NULL;
-            END
-            """
-        )
+        try:
+            cursor.execute(
+                f"""
+                IF OBJECT_ID('dbo.{table_name}', 'U') IS NOT NULL
+                   AND COL_LENGTH('dbo.{table_name}', 'ProjectCode') IS NULL
+                BEGIN
+                    ALTER TABLE dbo.{table_name} ADD ProjectCode NVARCHAR(100) NULL;
+                END
+                """
+            )
+        except Exception as e:
+            print(f"ProjectCode column check skipped for {table_name}: {e}")
 
 
 def get_or_create_project(cursor, project_name, department, project_code=None):
@@ -5261,6 +5271,50 @@ def action_form(request_id, status, label, css_class="secondary", extra_fields="
 @app.route("/")
 def home():
     return redirect("/my-dashboard")
+
+
+@app.route("/debug-project-options")
+def debug_project_options():
+    allowed, reason = require_page_access("User Access")
+    if not allowed:
+        return access_denied_response("Project Dropdown Diagnostics", reason)
+    options = load_existing_project_options()
+    rows = []
+    conn = None
+    try:
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        for table_name in ["Projects", "PurchaseOrders", "IssuedPOLines"]:
+            cols = sorted(get_dbo_table_columns(cursor, table_name))
+            count = "n/a"
+            try:
+                if cols:
+                    cursor.execute("SELECT COUNT(*) AS Cnt FROM dbo." + table_name + ";")
+                    count = cursor.fetchone().Cnt
+            except Exception as e:
+                count = "error: " + str(e)
+            rows.append({"table": table_name, "count": count, "columns": ", ".join(cols) if cols else "not found or unavailable"})
+    finally:
+        if conn:
+            conn.close()
+    option_rows = ''.join(
+        '<tr><td>' + h(o.get('code')) + '</td><td>' + h(o.get('name')) + '</td><td>' + h(o.get('label')) + '</td></tr>'
+        for o in options
+    ) or '<tr><td colspan="3">No project options returned</td></tr>'
+    table_rows = ''.join(
+        '<tr><td>' + h(r['table']) + '</td><td>' + h(r['count']) + '</td><td>' + h(r['columns']) + '</td></tr>'
+        for r in rows
+    )
+    return render_page("Project Dropdown Diagnostics", """
+    <div class="card">
+      <h2>Project Dropdown Diagnostics</h2>
+      <p class="muted">Use this page only if the New Purchase Request project dropdown is empty.</p>
+      <h3>Project options returned</h3>
+      <div class="table-wrap"><table><thead><tr><th>Code</th><th>Name</th><th>Label</th></tr></thead><tbody>{option_rows}</tbody></table></div>
+      <h3>Source table check</h3>
+      <div class="table-wrap"><table><thead><tr><th>Table</th><th>Rows</th><th>Columns</th></tr></thead><tbody>{table_rows}</tbody></table></div>
+    </div>
+    """.format(option_rows=option_rows, table_rows=table_rows))
 
 
 @app.route("/purchase-request", methods=["GET", "POST"])
