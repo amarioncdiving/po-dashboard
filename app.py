@@ -3838,116 +3838,165 @@ def ensure_purchase_request_project_code_column(cursor):
     )
 
 
-def load_existing_project_options():
-    """Return the same project list used by the Projects page Select Project dropdown.
+def _dedupe_project_option(options, code, name):
+    code = clean_text(code)
+    name = clean_text(name)
+    value = code or name
+    if not value:
+        return
+    key = value.lower()
+    if key in options["seen"]:
+        return
+    options["seen"].add(key)
+    label = (code + " - " if code else "") + (name or "Unnamed Project")
+    options["rows"].append({"code": code, "name": name, "value": value, "label": label})
 
-    The Projects tab gets its options from uploaded issued PO line/project setup data
-    (IssuedPOLines joined to PurchaseOrders/Projects). New Purchase Request should use
-    that same source so the two dropdowns stay in sync.
+
+def load_existing_project_options():
+    """Return project options for New Purchase Request.
+
+    July 1 rollout-safe behavior:
+    - The Projects tab proves the project data exists in uploaded setup data.
+    - This function first uses the same IssuedPOLines -> PurchaseOrders -> Projects source.
+    - If that returns nothing, it falls back to direct Projects, IssuedPOLines, and
+      PurchaseOrders sources one-by-one so a single table shape issue cannot make
+      the request dropdown empty.
+    - It intentionally does NOT filter by requestor, because Admin/Accounting need
+      to submit purchase requests against any active/setup project.
     """
+    conn = None
+    options = {"seen": set(), "rows": []}
     try:
         conn = get_sql_connection()
         cursor = conn.cursor()
-        ensure_project_code_columns(cursor)
-        conn.commit()
-        req_where_line, req_params_line = requestor_filter_sql("l")
-        cursor.execute(
-            f"""
+        try:
+            ensure_project_code_columns(cursor)
+            conn.commit()
+        except Exception:
+            # Do not block the dropdown if optional rollout columns cannot be added.
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+        queries = [
+            # Same core source as the Projects tab: uploaded issued PO lines joined
+            # to PurchaseOrders/Projects. No requestor filter for purchase requests.
+            """
             SELECT DISTINCT
-                COALESCE(NULLIF(pr.ProjectCode, ''), NULLIF(l.ProjectCode, ''), '') AS ProjectCode,
-                COALESCE(NULLIF(pr.ProjectName, ''), NULLIF(l.ProjectName, ''), '') AS ProjectName
+                COALESCE(pr.ProjectCode, '') AS ProjectCode,
+                COALESCE(pr.ProjectName, l.ProjectName, '') AS ProjectName
             FROM dbo.IssuedPOLines l
             LEFT JOIN dbo.PurchaseOrders po ON l.PurchaseOrderId = po.PurchaseOrderId
             LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
-            WHERE {req_where_line}
-              AND COALESCE(NULLIF(pr.ProjectCode, ''), NULLIF(l.ProjectCode, ''), NULLIF(pr.ProjectName, ''), NULLIF(l.ProjectName, '')) IS NOT NULL
-            ORDER BY
-                COALESCE(NULLIF(pr.ProjectCode, ''), NULLIF(l.ProjectCode, ''), ''),
-                COALESCE(NULLIF(pr.ProjectName, ''), NULLIF(l.ProjectName, ''), '');
+            WHERE COALESCE(pr.ProjectCode, pr.ProjectName, l.ProjectName, '') <> ''
+            ORDER BY COALESCE(pr.ProjectCode, ''), COALESCE(pr.ProjectName, l.ProjectName, '');
             """,
-            *req_params_line,
-        )
-        rows = cursor.fetchall()
+            # Direct issued PO line fallback. This is the most important fallback
+            # because uploaded setup files usually carry ProjectName even if the
+            # normalized Projects table link is incomplete.
+            """
+            SELECT DISTINCT
+                COALESCE(ProjectCode, '') AS ProjectCode,
+                COALESCE(ProjectName, '') AS ProjectName
+            FROM dbo.IssuedPOLines
+            WHERE COALESCE(ProjectCode, ProjectName, '') <> ''
+            ORDER BY COALESCE(ProjectCode, ''), COALESCE(ProjectName, '');
+            """,
+            # Normalized project fallback.
+            """
+            SELECT DISTINCT
+                COALESCE(ProjectCode, '') AS ProjectCode,
+                COALESCE(ProjectName, '') AS ProjectName
+            FROM dbo.Projects
+            WHERE COALESCE(ProjectCode, ProjectName, '') <> ''
+              AND COALESCE(IsActive, 1) = 1
+            ORDER BY COALESCE(ProjectCode, ''), COALESCE(ProjectName, '');
+            """,
+            # PO header/project fallback.
+            """
+            SELECT DISTINCT
+                COALESCE(po.ProjectCode, pr.ProjectCode, '') AS ProjectCode,
+                COALESCE(pr.ProjectName, '') AS ProjectName
+            FROM dbo.PurchaseOrders po
+            LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
+            WHERE COALESCE(po.ProjectCode, pr.ProjectCode, pr.ProjectName, '') <> ''
+            ORDER BY COALESCE(po.ProjectCode, pr.ProjectCode, ''), COALESCE(pr.ProjectName, '');
+            """,
+        ]
+
+        for sql in queries:
+            try:
+                cursor.execute(sql)
+                for r in cursor.fetchall():
+                    _dedupe_project_option(options, getattr(r, "ProjectCode", ""), getattr(r, "ProjectName", ""))
+            except Exception:
+                # Keep going. One missing column/table shape should not empty the dropdown.
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                continue
+
         conn.close()
-        options = []
-        seen = set()
-        for r in rows:
-            code = clean_text(getattr(r, "ProjectCode", ""))
-            name = clean_text(getattr(r, "ProjectName", ""))
-            if not code and not name:
-                continue
-            key = (code.lower(), name.lower())
-            if key in seen:
-                continue
-            seen.add(key)
-            value = f"{code}||{name}"
-            label = f"{code} - {name}" if code and name else (code or name)
-            options.append({"code": code, "name": name, "value": value, "label": label})
-        return options
+        return options["rows"]
     except Exception:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
         return []
 
 
 def validate_selected_project(cursor, selected_project_value):
-    selected_project_value = clean_text(selected_project_value)
-    if "||" in selected_project_value:
-        project_code, project_name = [clean_text(x) for x in selected_project_value.split("||", 1)]
-    else:
-        project_code, project_name = "", selected_project_value
+    """Validate a selected project from the New Purchase Request dropdown.
 
-    if not project_code and not project_name:
+    The dropdown now uses the same value as the Projects tab: ProjectCode when
+    available, otherwise ProjectName. This validator accepts that same value and
+    links it to the normalized Projects row. If the Projects row is missing but
+    the uploaded issued PO setup line exists, it creates only the normalized
+    Projects record from already-uploaded setup data.
+    """
+    selected_project = clean_text(selected_project_value)
+    if not selected_project:
         raise ValueError("Please select an existing project.")
 
     ensure_project_code_columns(cursor)
 
-    # First try the normalized Projects table.
-    if project_code:
-        cursor.execute(
-            """
-            SELECT TOP 1 ProjectId, ProjectCode, ProjectName, Department
-            FROM dbo.Projects
-            WHERE ProjectCode = ? OR (ProjectName = ? AND ? <> '');
-            """,
-            project_code,
-            project_name,
-            project_name,
-        )
-    else:
-        cursor.execute(
-            """
-            SELECT TOP 1 ProjectId, ProjectCode, ProjectName, Department
-            FROM dbo.Projects
-            WHERE ProjectName = ?;
-            """,
-            project_name,
-        )
+    cursor.execute(
+        """
+        SELECT TOP 1 ProjectId, ProjectCode, ProjectName, Department
+        FROM dbo.Projects
+        WHERE ProjectCode = ? OR ProjectName = ?
+        ORDER BY ProjectId;
+        """,
+        selected_project,
+        selected_project,
+    )
     project = cursor.fetchone()
     if project:
         return project
 
-    # If the Projects tab can see it from uploaded issued PO setup, accept that
-    # existing setup project and create the missing normalized Projects row.
     cursor.execute(
         """
         SELECT TOP 1
-            COALESCE(NULLIF(ProjectCode, ''), ?) AS ProjectCode,
-            COALESCE(NULLIF(ProjectName, ''), ?) AS ProjectName,
-            COALESCE(NULLIF(Department, ''), '') AS Department
-        FROM dbo.IssuedPOLines
-        WHERE (? <> '' AND ProjectCode = ?)
-           OR (? <> '' AND ProjectName = ?)
-        ORDER BY IssuedPOLineId;
+            COALESCE(pr.ProjectCode, l.ProjectCode, '') AS ProjectCode,
+            COALESCE(pr.ProjectName, l.ProjectName, '') AS ProjectName,
+            COALESCE(NULLIF(l.Department, ''), NULLIF(pr.Department, ''), '') AS Department
+        FROM dbo.IssuedPOLines l
+        LEFT JOIN dbo.PurchaseOrders po ON l.PurchaseOrderId = po.PurchaseOrderId
+        LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
+        WHERE COALESCE(pr.ProjectCode, l.ProjectCode, '') = ?
+           OR COALESCE(pr.ProjectName, l.ProjectName, '') = ?
+        ORDER BY l.IssuedPOLineId;
         """,
-        project_code,
-        project_name,
-        project_code,
-        project_code,
-        project_name,
-        project_name,
+        selected_project,
+        selected_project,
     )
     line_project = cursor.fetchone()
     if not line_project:
-        raise ValueError("Selected project was not found in the uploaded issued PO project setup data.")
+        raise ValueError("Selected project was not found in the same project setup data used by the Projects tab.")
 
     project_id = get_or_create_project(
         cursor,
@@ -3967,36 +4016,6 @@ def validate_selected_project(cursor, selected_project_value):
     if not project:
         raise ValueError("Selected project was found in PO setup, but could not be linked to the project table.")
     return project
-
-def allowed_attachment(filename):
-    if not filename or "." not in filename:
-        return False
-    ext = filename.rsplit(".", 1)[1].lower()
-    return ext in ALLOWED_ATTACHMENT_EXTENSIONS
-
-
-def ensure_request_attachment_table(cursor):
-    cursor.execute(
-        """
-        IF OBJECT_ID('dbo.PurchaseRequestAttachments', 'U') IS NULL
-        BEGIN
-            CREATE TABLE dbo.PurchaseRequestAttachments (
-                AttachmentId INT IDENTITY(1,1) PRIMARY KEY,
-                PurchaseRequestId INT NOT NULL,
-                RequestNumber NVARCHAR(100) NULL,
-                PONumber NVARCHAR(100) NULL,
-                OriginalFileName NVARCHAR(260) NOT NULL,
-                StoredFileName NVARCHAR(260) NOT NULL,
-                StoragePath NVARCHAR(1000) NOT NULL,
-                ContentType NVARCHAR(200) NULL,
-                FileSize BIGINT NULL,
-                UploadedBy NVARCHAR(255) NULL,
-                UploadedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
-            );
-        END
-        """
-    )
-
 
 def save_purchase_request_attachments(cursor, purchase_request_id, request_number, files):
     files = files or []
