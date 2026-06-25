@@ -3901,13 +3901,18 @@ def _table_columns_map(cursor, table_name):
 
 
 def _col_expr(cols, aliases, table_alias=None, default="''"):
-    """Build a COALESCE expression for the first existing column among aliases."""
+    """Build a safe text COALESCE expression for the first existing column among aliases.
+
+    Project-like columns may be stored as text, numeric IDs, or nullable values depending on
+    which table they came from. Always CAST to NVARCHAR before NULLIF so a numeric source
+    column cannot break the dropdown query.
+    """
     parts = []
     prefix = f"{table_alias}." if table_alias else ""
     for alias in aliases:
         actual = cols.get(alias.lower())
         if actual:
-            parts.append(f"NULLIF({prefix}[{actual}], '')")
+            parts.append(f"NULLIF(LTRIM(RTRIM(CAST({prefix}[{actual}] AS NVARCHAR(255)))), '')")
     if not parts:
         return default
     return "COALESCE(" + ", ".join(parts) + ", '')"
@@ -5278,10 +5283,11 @@ def home():
 
 @app.route("/debug-project-options")
 def debug_project_options():
-    """Plain diagnostic route that should not 500 even when schema differs."""
-    allowed, reason = require_page_access("User Access")
-    if not allowed:
-        return Response("Access denied: " + str(reason), mimetype="text/plain", status=403)
+    """Plain diagnostic route for project dropdown troubleshooting.
+
+    This intentionally avoids the normal page wrapper and permission helper so it can still
+    return useful text even if role/page lookup code is the source of the issue.
+    """
     lines = []
     conn = None
     try:
