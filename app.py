@@ -86,40 +86,63 @@ ALLOWED_ATTACHMENT_EXTENSIONS = {"pdf", "png", "jpg", "jpeg", "doc", "docx", "xl
 VALID_ROLES = [
     "Admin",
     "Executive",
-    "Accounting",
-    "Project Manager",
-    "Viewer",
+    "Project Manager - Dredging Only",
+    "Project Manager - Diving",
+    "Division Manager - Diving",
+    "Purchaser - All Departments",
+    "Bookkeeping - All Departments",
     "No Access",
 ]
 
+# Legacy role names are kept as aliases so an older user row does not break the app
+# before Admin has a chance to reassign the user to the new July 1 role package.
+ROLE_ALIASES = {
+    "Accounting": "Bookkeeping - All Departments",
+    "Project Manager": "Project Manager - Diving",
+    "Viewer": "Bookkeeping - All Departments",
+}
+
+ROLE_GROUP_ALL_PO_VIEW = ["Admin", "Executive", "Purchaser - All Departments", "Bookkeeping - All Departments"]
+ROLE_GROUP_NON_DREDGING_VIEW = ["Division Manager - Diving"]
+ROLE_GROUP_DREDGING_VIEW = ["Project Manager - Dredging Only"]
+ROLE_GROUP_ASSIGNED_NON_DREDGING_VIEW = ["Project Manager - Diving"]
+ROLE_GROUP_CAN_CREATE_REQUEST = [
+    "Admin",
+    "Executive",
+    "Project Manager - Dredging Only",
+    "Project Manager - Diving",
+    "Division Manager - Diving",
+    "Purchaser - All Departments",
+]
+ROLE_GROUP_CAN_REVIEW_REQUESTS = ["Admin", "Executive", "Division Manager - Diving"]
+ROLE_GROUP_ADMIN_ONLY = ["Admin"]
 
 PAGE_ACCESS = {
-    "Dashboard": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
-    "My Dashboard": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
-    "New Purchase Request": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
-    "Purchase Requests": ["Admin", "Executive", "Accounting"],
-    "Approver Queue": ["Admin", "Executive", "Accounting"],
-    "POs & Balances": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
-    "Projects": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
-    "Forecasting": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
-    "Project PO Setup": ["Admin", "Executive", "Accounting", "Project Manager"],
-    "PO Setup Review": ["Admin", "Executive", "Accounting", "Project Manager"],
-    "PO Maintenance": ["Admin", "Executive", "Accounting"],
-    "Missing PO Review": ["Admin", "Executive", "Accounting", "Project Manager"],
-    "PO Summary": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
-    "PO List": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
-    "PO Detail": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
-    "Upload Issued POs": ["Admin", "Accounting"],
-    "Expense Upload / PO Matching": ["Admin", "Accounting"],
-    "Expenses": ["Admin", "Executive", "Accounting", "Project Manager"],
-    "Missing PO Review": ["Admin", "Executive", "Accounting", "Project Manager"],
-    "Vendors": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
-    "POs in PM Comments": ["Admin", "Executive", "Accounting", "Project Manager"],
-    "Import History": ["Admin", "Accounting"],
-    "Exceptions": ["Admin", "Executive", "Accounting"],
-    "Exports": ["Admin", "Executive", "Accounting"],
+    "Dashboard": ["Admin", "Executive", "Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving", "Purchaser - All Departments", "Bookkeeping - All Departments"],
+    "My Dashboard": ["Admin", "Executive", "Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving", "Purchaser - All Departments", "Bookkeeping - All Departments"],
+    "New Purchase Request": ROLE_GROUP_CAN_CREATE_REQUEST,
+    "Purchase Requests": ["Admin", "Executive", "Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving", "Purchaser - All Departments"],
+    "Approver Queue": ["Admin", "Executive", "Division Manager - Diving"],
+    "POs & Balances": ["Admin", "Executive", "Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving", "Purchaser - All Departments", "Bookkeeping - All Departments"],
+    "Projects": ["Admin", "Executive", "Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving", "Purchaser - All Departments", "Bookkeeping - All Departments"],
+    "Forecasting": ["Admin", "Executive"],
+    "Project PO Setup": ["Admin"],
+    "PO Setup Review": ["Admin", "Executive"],
+    "PO Maintenance": ["Admin"],
+    "PO Summary": ["Admin", "Executive", "Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving", "Purchaser - All Departments", "Bookkeeping - All Departments"],
+    "PO List": ["Admin", "Executive", "Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving", "Purchaser - All Departments", "Bookkeeping - All Departments"],
+    "PO Detail": ["Admin", "Executive", "Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving", "Purchaser - All Departments", "Bookkeeping - All Departments"],
+    "Upload Issued POs": ["Admin"],
+    "Expense Upload / PO Matching": ["Admin"],
+    "Expenses": ["Admin", "Executive"],
+    "Missing PO Review": ["Admin", "Executive"],
+    "Vendors": ["Admin", "Executive", "Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving", "Purchaser - All Departments", "Bookkeeping - All Departments"],
+    "POs in PM Comments": ["Admin", "Executive"],
+    "Import History": ["Admin", "Executive", "Purchaser - All Departments", "Bookkeeping - All Departments"],
+    "Exceptions": ["Admin", "Executive"],
+    "Exports": ["Admin", "Executive"],
     "User Access": ["Admin", "Executive"],
-    "Who Am I": ["Admin", "Executive", "Accounting", "Project Manager", "Viewer"],
+    "Who Am I": ["Admin", "Executive", "Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving", "Purchaser - All Departments", "Bookkeeping - All Departments"],
 }
 
 
@@ -219,6 +242,27 @@ def normalize_header(header):
 # Authentication / role helpers
 # ------------------------------------------------------------
 
+def normalize_role(role_name):
+    role = clean_text(role_name) or "No Access"
+    return ROLE_ALIASES.get(role, role)
+
+
+def role_is_admin(role_name):
+    return normalize_role(role_name) == "Admin"
+
+
+def role_can_create_purchase_request(role_name):
+    return normalize_role(role_name) in ROLE_GROUP_CAN_CREATE_REQUEST
+
+
+def role_can_review_requests(role_name):
+    return normalize_role(role_name) in ROLE_GROUP_CAN_REVIEW_REQUESTS
+
+
+def role_can_maintain_pos(role_name):
+    return normalize_role(role_name) == "Admin"
+
+
 def get_current_user():
     user_email = request.headers.get("X-MS-CLIENT-PRINCIPAL-NAME", "")
     user_id = request.headers.get("X-MS-CLIENT-PRINCIPAL-ID", "")
@@ -279,7 +323,7 @@ def get_user_access():
 
         if row:
             access["display_name"] = row.DisplayName or ""
-            access["role"] = row.RoleName or "No Access"
+            access["role"] = normalize_role(row.RoleName or "No Access")
             access["is_active"] = bool(row.IsActive)
             access["found_in_sql"] = True
 
@@ -1113,8 +1157,8 @@ def send_purchase_request_submitted_emails(purchase_request_id):
     req = load_purchase_request_for_email(purchase_request_id)
     if not req:
         return
-    approvers = load_active_users_by_roles(["Admin", "Accounting", "Executive"])
-    approver_names = ", ".join(user_display_name(a) for a in approvers) or "Accounting/Admin"
+    approvers = load_active_users_by_roles(["Admin", "Executive", "Division Manager - Diving"])
+    approver_names = ", ".join(user_display_name(a) for a in approvers) or "Admin/Executive/Division Manager"
     review_url = app_url("/purchase-requests")
     subject = f"Purchase request needs review: {req.RequestNumber}"
     body = f"""
@@ -1183,7 +1227,7 @@ def send_po_upload_summary_email(import_result, filename, department, requestor_
 
 def role_can_access(role_name, page_name):
     allowed_roles = PAGE_ACCESS.get(page_name, [])
-    return role_name in allowed_roles
+    return normalize_role(role_name) in allowed_roles
 
 
 def require_page_access(page_name):
@@ -2426,7 +2470,7 @@ def purchase_request_status_badge(status):
 
 
 def can_review_purchase_requests(role):
-    return role in ["Admin", "Executive", "Accounting"]
+    return role_can_review_requests(role)
 
 
 def generate_purchase_request_number(cursor):
@@ -2447,12 +2491,29 @@ def generate_purchase_request_number(cursor):
     return f"{today_prefix}-{next_number:04d}"
 
 
+def purchase_request_visibility_sql(alias="pr"):
+    role = normalize_role(current_data_role())
+    email = current_data_email()
+    dept_expr = f"COALESCE({alias}.Department, '')"
+    req_email_expr = f"COALESCE({alias}.RequestedByEmail, '')"
+    if role in ["Admin", "Executive", "Purchaser - All Departments"]:
+        return "1=1", []
+    if role == "Division Manager - Diving":
+        return f"LOWER({dept_expr}) <> 'dredging'", []
+    if role == "Project Manager - Dredging Only":
+        return f"LOWER({dept_expr}) = 'dredging'", []
+    if role == "Project Manager - Diving" and email:
+        return f"LOWER({dept_expr}) <> 'dredging' AND LOWER({req_email_expr}) = LOWER(?)", [email]
+    return "1=0", []
+
+
 def load_purchase_request_stats():
     conn = get_sql_connection()
     cursor = conn.cursor()
 
+    req_where, req_params = purchase_request_visibility_sql("pr")
     cursor.execute(
-        """
+        f"""
         SELECT
             COUNT(*) AS TotalRequests,
             SUM(CASE WHEN RequestStatus = 'Submitted' THEN 1 ELSE 0 END) AS SubmittedRequests,
@@ -2462,8 +2523,10 @@ def load_purchase_request_stats():
             SUM(CASE WHEN RequestStatus = 'Rejected' THEN 1 ELSE 0 END) AS RejectedRequests,
             SUM(CASE WHEN RequestStatus = 'Converted to PO' THEN 1 ELSE 0 END) AS ConvertedRequests,
             SUM(COALESCE(EstimatedAmount, 0)) AS TotalEstimatedAmount
-        FROM dbo.PurchaseRequests;
-        """
+        FROM dbo.PurchaseRequests pr
+        WHERE {req_where};
+        """,
+        *req_params,
     )
 
     row = cursor.fetchone()
@@ -2487,6 +2550,7 @@ def load_purchase_requests(limit=100):
     ensure_purchase_request_project_code_column(cursor)
     conn.commit()
 
+    req_where, req_params = purchase_request_visibility_sql("pr")
     cursor.execute(
         f"""
         SELECT TOP {int(limit)}
@@ -2510,9 +2574,11 @@ def load_purchase_requests(limit=100):
             ReviewNotes,
             ConvertedPONumber,
             UpdatedAt
-        FROM dbo.PurchaseRequests
+        FROM dbo.PurchaseRequests pr
+        WHERE {req_where}
         ORDER BY RequestedAt DESC;
-        """
+        """,
+        *req_params,
     )
 
     rows = cursor.fetchall()
@@ -2833,6 +2899,13 @@ def update_purchase_request_status(form):
     cursor = conn.cursor()
 
     try:
+        cursor.execute("SELECT TOP 1 Department FROM dbo.PurchaseRequests WHERE PurchaseRequestId = ?;", purchase_request_id)
+        request_row = cursor.fetchone()
+        request_department = clean_text(getattr(request_row, "Department", "")) if request_row else ""
+        reviewer_role = normalize_role(get_user_access().get("role"))
+        if reviewer_role == "Division Manager - Diving" and request_department.lower() == "dredging":
+            raise ValueError("Division Manager - Diving cannot update Dredging purchase requests.")
+
         if request_status in ["Approved", "Converted to PO"]:
             converted_po_number = create_or_update_po_from_purchase_request(cursor, purchase_request_id, converted_po_number)
             created_or_converted_po = converted_po_number
@@ -3772,7 +3845,7 @@ a, a:visited { color:#1d4ed8; }
 def get_view_as_email():
     """Admin/Executive helper for viewing user-specific context while keeping the real admin/executive sidebar."""
     access = get_user_access()
-    if access.get("role") not in ["Admin", "Executive"]:
+    if normalize_role(access.get("role")) not in ["Admin", "Executive"]:
         return ""
     return clean_text(request.cookies.get("PO_DASHBOARD_VIEW_AS")) or ""
 
@@ -3816,14 +3889,44 @@ def current_data_email():
     return current_working_email()
 
 
+def current_visibility_scope():
+    role = normalize_role(current_data_role())
+    email = current_data_email()
+    if role in ROLE_GROUP_ALL_PO_VIEW:
+        return "all", email
+    if role in ROLE_GROUP_DREDGING_VIEW:
+        return "dredging_only", email
+    if role in ROLE_GROUP_NON_DREDGING_VIEW:
+        return "non_dredging", email
+    if role in ROLE_GROUP_ASSIGNED_NON_DREDGING_VIEW and email:
+        return "assigned_non_dredging", email
+    return "none", email
+
+
 def should_filter_pos_to_requestor():
-    return current_data_role() == "Project Manager" and bool(current_data_email())
+    scope, _email = current_visibility_scope()
+    return scope == "assigned_non_dredging"
 
 
 def requestor_filter_sql(alias):
-    if should_filter_pos_to_requestor():
-        return f"LOWER(COALESCE({alias}.Requestor, '')) = LOWER(?)", [current_data_email()]
-    return "1=1", []
+    """Return the PO/project visibility predicate for the current working user.
+
+    Current Phase 1 data model uses Department for Dredging separation and the
+    PO Requestor/assigned-to email as the Project Manager assignment. When we add
+    a dedicated ProjectManagerEmail field later, this is the one function to update.
+    """
+    scope, email = current_visibility_scope()
+    dept_expr = f"COALESCE({alias}.Department, '')"
+    req_expr = f"COALESCE({alias}.Requestor, '')"
+    if scope == "all":
+        return "1=1", []
+    if scope == "dredging_only":
+        return f"LOWER({dept_expr}) = 'dredging'", []
+    if scope == "non_dredging":
+        return f"LOWER({dept_expr}) <> 'dredging'", []
+    if scope == "assigned_non_dredging":
+        return f"LOWER({dept_expr}) <> 'dredging' AND LOWER({req_expr}) = LOWER(?)", [email]
+    return "1=0", []
 
 
 
@@ -3853,16 +3956,14 @@ def _dedupe_project_option(options, code, name):
 
 
 def load_existing_project_options():
-    """Return project options for New Purchase Request.
+    """Return project options for New Purchase Request using the same uploaded setup data as Projects.
 
-    July 1 rollout-safe behavior:
-    - The Projects tab proves the project data exists in uploaded setup data.
-    - This function first uses the same IssuedPOLines -> PurchaseOrders -> Projects source.
-    - If that returns nothing, it falls back to direct Projects, IssuedPOLines, and
-      PurchaseOrders sources one-by-one so a single table shape issue cannot make
-      the request dropdown empty.
-    - It intentionally does NOT filter by requestor, because Admin/Accounting need
-      to submit purchase requests against any active/setup project.
+    This version applies the July 1 role visibility rules:
+    - Admin / Executive / Purchaser: all projects
+    - Dredging PM: Dredging projects only
+    - Diving PM: assigned non-Dredging projects only using Requestor email in current Phase 1 data
+    - Division Manager - Diving: all non-Dredging projects
+    - Bookkeeping has no New Purchase Request page access, so it should not reach this function.
     """
     conn = None
     options = {"seen": set(), "rows": []}
@@ -3873,70 +3974,82 @@ def load_existing_project_options():
             ensure_project_code_columns(cursor)
             conn.commit()
         except Exception:
-            # Do not block the dropdown if optional rollout columns cannot be added.
             try:
                 conn.rollback()
             except Exception:
                 pass
 
-        queries = [
-            # Same core source as the Projects tab: uploaded issued PO lines joined
-            # to PurchaseOrders/Projects. No requestor filter for purchase requests.
-            """
-            SELECT DISTINCT
-                COALESCE(pr.ProjectCode, '') AS ProjectCode,
-                COALESCE(pr.ProjectName, l.ProjectName, '') AS ProjectName
-            FROM dbo.IssuedPOLines l
-            LEFT JOIN dbo.PurchaseOrders po ON l.PurchaseOrderId = po.PurchaseOrderId
-            LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
-            WHERE COALESCE(pr.ProjectCode, pr.ProjectName, l.ProjectName, '') <> ''
-            ORDER BY COALESCE(pr.ProjectCode, ''), COALESCE(pr.ProjectName, l.ProjectName, '');
-            """,
-            # Direct issued PO line fallback. This is the most important fallback
-            # because uploaded setup files usually carry ProjectName even if the
-            # normalized Projects table link is incomplete.
-            """
-            SELECT DISTINCT
-                COALESCE(ProjectCode, '') AS ProjectCode,
-                COALESCE(ProjectName, '') AS ProjectName
-            FROM dbo.IssuedPOLines
-            WHERE COALESCE(ProjectCode, ProjectName, '') <> ''
-            ORDER BY COALESCE(ProjectCode, ''), COALESCE(ProjectName, '');
-            """,
-            # Normalized project fallback.
-            """
-            SELECT DISTINCT
-                COALESCE(ProjectCode, '') AS ProjectCode,
-                COALESCE(ProjectName, '') AS ProjectName
-            FROM dbo.Projects
-            WHERE COALESCE(ProjectCode, ProjectName, '') <> ''
-              AND COALESCE(IsActive, 1) = 1
-            ORDER BY COALESCE(ProjectCode, ''), COALESCE(ProjectName, '');
-            """,
-            # PO header/project fallback.
-            """
-            SELECT DISTINCT
-                COALESCE(po.ProjectCode, pr.ProjectCode, '') AS ProjectCode,
-                COALESCE(pr.ProjectName, '') AS ProjectName
-            FROM dbo.PurchaseOrders po
-            LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
-            WHERE COALESCE(po.ProjectCode, pr.ProjectCode, pr.ProjectName, '') <> ''
-            ORDER BY COALESCE(po.ProjectCode, pr.ProjectCode, ''), COALESCE(pr.ProjectName, '');
-            """,
+        # Primary source: uploaded issued PO setup lines. This is the same data source
+        # that makes the Projects tab dropdown work, and it includes Department and Requestor.
+        line_where, line_params = requestor_filter_sql("l")
+        primary_queries = [
+            (
+                f"""
+                SELECT DISTINCT
+                    COALESCE(l.ProjectCode, '') AS ProjectCode,
+                    COALESCE(l.ProjectName, '') AS ProjectName
+                FROM dbo.IssuedPOLines l
+                WHERE COALESCE(l.ProjectCode, l.ProjectName, '') <> ''
+                  AND {line_where}
+                ORDER BY COALESCE(l.ProjectCode, ''), COALESCE(l.ProjectName, '');
+                """,
+                line_params,
+            )
         ]
 
-        for sql in queries:
+        # Secondary source: PO headers joined to Projects. Also has Department/Requestor on po.
+        po_where, po_params = requestor_filter_sql("po")
+        primary_queries.append(
+            (
+                f"""
+                SELECT DISTINCT
+                    COALESCE(po.ProjectCode, pr.ProjectCode, '') AS ProjectCode,
+                    COALESCE(pr.ProjectName, '') AS ProjectName
+                FROM dbo.PurchaseOrders po
+                LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
+                WHERE COALESCE(po.ProjectCode, pr.ProjectCode, pr.ProjectName, '') <> ''
+                  AND {po_where}
+                ORDER BY COALESCE(po.ProjectCode, pr.ProjectCode, ''), COALESCE(pr.ProjectName, '');
+                """,
+                po_params,
+            )
+        )
+
+        for sql, params in primary_queries:
             try:
-                cursor.execute(sql)
+                cursor.execute(sql, *params)
                 for r in cursor.fetchall():
                     _dedupe_project_option(options, getattr(r, "ProjectCode", ""), getattr(r, "ProjectName", ""))
             except Exception:
-                # Keep going. One missing column/table shape should not empty the dropdown.
                 try:
                     conn.rollback()
                 except Exception:
                     pass
                 continue
+
+        # Final fallback for all-department users only. Do not use this for PM visibility,
+        # because Projects may not yet have Requestor/PM assignment in Phase 1.
+        scope, _email = current_visibility_scope()
+        if not options["rows"] and scope == "all":
+            try:
+                cursor.execute(
+                    """
+                    SELECT DISTINCT
+                        COALESCE(ProjectCode, '') AS ProjectCode,
+                        COALESCE(ProjectName, '') AS ProjectName
+                    FROM dbo.Projects
+                    WHERE COALESCE(ProjectCode, ProjectName, '') <> ''
+                      AND COALESCE(IsActive, 1) = 1
+                    ORDER BY COALESCE(ProjectCode, ''), COALESCE(ProjectName, '');
+                    """
+                )
+                for r in cursor.fetchall():
+                    _dedupe_project_option(options, getattr(r, "ProjectCode", ""), getattr(r, "ProjectName", ""))
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
 
         conn.close()
         return options["rows"]
@@ -3947,7 +4060,6 @@ def load_existing_project_options():
         except Exception:
             pass
         return []
-
 
 def validate_selected_project(cursor, selected_project_value):
     """Validate a selected project from the New Purchase Request dropdown.
@@ -5019,7 +5131,7 @@ def count_po_setup_actions_for_current_user():
             """,
             view_email,
         )
-    elif access["role"] == "Project Manager" and user["email"]:
+    elif normalize_role(access["role"]) == "Project Manager - Diving" and user["email"]:
         cursor.execute(
             """
             SELECT COUNT(*) AS ActionCount
@@ -5029,7 +5141,7 @@ def count_po_setup_actions_for_current_user():
             """,
             user["email"],
         )
-    elif access["role"] in ["Admin", "Executive", "Accounting"]:
+    elif normalize_role(access["role"]) in ["Admin", "Executive"]:
         cursor.execute(
             """
             SELECT COUNT(*) AS ActionCount
@@ -5538,7 +5650,7 @@ def my_dashboard():
         return access_denied_response("My Dashboard", reason)
 
     access = get_user_access()
-    role = access["role"]
+    role = normalize_role(access["role"])
     display_name = access["display_name"] or access["email"] or "User"
 
     try:
@@ -5642,20 +5754,19 @@ def my_dashboard():
                 </div>
             </div>
             """
-        elif role == "Accounting":
+        elif role == "Purchaser - All Departments":
             role_content = f"""
             {common_kpis}
             <div class="grid two">
                 <div class="card">
-                    <h3>Accounting Workspace</h3>
-                    <p class="card-subtitle">Upload, review requests, resolve exceptions, and export records.</p>
-                    <p><a class="button primary" href="/upload-po">Upload Issued POs</a></p>
-                    <p><a class="button" href="/purchase-requests">Review Purchase Requests</a></p>
-                    <p><a class="button" href="/purchase-request">Create Purchase Request</a></p>
+                    <h3>Purchaser Workspace</h3>
+                    <p class="card-subtitle">Submit and view purchase requests and look up POs across all departments.</p>
+                    <p><a class="button primary" href="/purchase-request">Create Purchase Request</a></p>
+                    <p><a class="button" href="/purchase-requests">View Purchase Requests</a></p>
+                    <p><a class="button" href="/pos-balances">Open POs & Balances</a></p>
+                    <p><a class="button" href="/projects">Open Projects</a></p>
+                    <p><a class="button" href="/vendors">Open Vendors</a></p>
                     <p><a class="button" href="/import-history">Review Import History</a></p>
-                    <p><a class="button" href="/project-po-setup">PO Info Review</a></p>
-                    <p><a class="button" href="/exceptions">Review Data Exceptions</a></p>
-                    <p><a class="button" href="/exports">Download Exports</a></p>
                 </div>
                 <div class="card">
                     <h3>Import / Request Snapshot</h3>
@@ -5669,7 +5780,7 @@ def my_dashboard():
             </div>
             <div class="card"><h3>Recent Imports</h3><div class="table-wrap"><table><tr><th>Batch ID</th><th>File Name</th><th>Uploaded At</th><th>Total Rows</th><th>Success</th><th>Errors</th><th>Status</th></tr>{import_rows}</table></div></div>
             """
-        elif role == "Project Manager":
+        elif role in ["Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving"]:
             role_content = f"""
             {common_kpis}
             <div class="grid two">
@@ -5689,11 +5800,11 @@ def my_dashboard():
             {common_kpis}
             <div class="grid two">
                 <div class="card">
-                    <h3>Viewer Dashboard</h3>
-                    <p class="card-subtitle">Submit requests and view read-only PO information.</p>
-                    <p><a class="button primary" href="/purchase-request">Create Purchase Request</a></p>
-                    <p><a class="button" href="/pos-balances">Open POs & Balances</a></p>
-                    <p><a class="button" href="/po-list">Browse PO List</a></p>
+                    <h3>Bookkeeping Lookup</h3>
+                    <p class="card-subtitle">Read-only PO lookup across all departments, including amounts, balances, and packets.</p>
+                    <p><a class="button primary" href="/pos-balances">Open POs & Balances</a></p>
+                    <p><a class="button" href="/projects">Open Projects</a></p>
+                    <p><a class="button" href="/vendors">Open Vendors</a></p>
                     <p><a class="button" href="/po-detail">Search PO Detail</a></p>
                 </div>
                 <div class="card"><h3>Top Vendors</h3><div class="table-wrap"><table><tr><th>Vendor</th><th class="right">POs</th><th class="right">Line Total</th></tr>{vendor_rows}</table></div></div>
@@ -8219,7 +8330,7 @@ def export_issued_lines_csv():
 @app.route("/set-view-as", methods=["POST"])
 def set_view_as():
     access = get_user_access()
-    if access.get("role") not in ["Admin", "Executive"]:
+    if normalize_role(access.get("role")) not in ["Admin", "Executive"]:
         return access_denied_response("User Access", "Only Admin or Executive users can use View As.")
     email = clean_text(request.form.get("view_as_email")) or ""
     resp = make_response(redirect("/user-access"))
@@ -8763,7 +8874,7 @@ def user_access():
 
     message_html = ""
 
-    if request.method == "POST" and get_user_access().get("role") != "Admin":
+    if request.method == "POST" and normalize_role(get_user_access().get("role")) != "Admin":
         message_html = '<div class="notice error">Only Admin users can add or update user access. Executive users can use View As only.</div>'
     elif request.method == "POST":
         email = clean_text(request.form.get("email"))
@@ -8895,7 +9006,7 @@ def user_access():
             </form>
         </div>
         <div class="card"><h3>Current Dashboard Users</h3><p class="card-subtitle">Edit display name spelling, access level, or disabled status directly from this table. Save each row after making changes.</p><div class="table-wrap"><table><tr><th>Email</th><th>Display Name</th><th>Role</th><th>Status</th><th>Updated At</th><th>Action</th></tr>{user_rows}</table></div></div>
-        <div class="card"><h3>Role Guide</h3><table><tr><th>Role</th><th>Access</th></tr><tr><td>Admin</td><td>Everything, including User Access</td></tr><tr><td>Executive</td><td>Summary, PO pages, purchase request review, Exceptions, Exports</td></tr><tr><td>Accounting</td><td>PO pages, request review, Uploads, Import History, Exceptions, Exports</td></tr><tr><td>Project Manager</td><td>Submit requests, PO Summary, PO List, PO Detail</td></tr><tr><td>Viewer</td><td>Submit requests, read-only PO Summary/List/Detail</td></tr><tr><td>No Access</td><td>Can sign in through Microsoft, but cannot view dashboard data</td></tr></table></div>
+        <div class="card"><h3>Role Guide</h3><table><tr><th>Role</th><th>Access</th></tr><tr><td>Admin</td><td>Everything, including user management, PO Maintenance, PO number corrections, project code corrections, uploads, approvals, and voiding POs.</td></tr><tr><td>Executive</td><td>Can view all departments and review/approve purchase requests, but cannot edit users, void POs, or maintain PO numbers/project codes.</td></tr><tr><td>Project Manager - Dredging Only</td><td>Can view all Dredging POs and submit Dredging purchase requests.</td></tr><tr><td>Project Manager - Diving</td><td>Can view assigned non-Dredging POs and submit requests for assigned non-Dredging projects.</td></tr><tr><td>Division Manager - Diving</td><td>Can view all non-Dredging POs and approve non-Dredging purchase requests.</td></tr><tr><td>Purchaser - All Departments</td><td>Can view all departments and submit purchase requests, but cannot approve, void, or maintain POs.</td></tr><tr><td>Bookkeeping - All Departments</td><td>Read-only PO lookup across all departments, including amounts, balances, and PO packet downloads. No purchase request access.</td></tr><tr><td>No Access</td><td>Blocked from dashboard access.</td></tr></table></div>
         """
 
         return shell("User Access", "Add users, correct names, change roles, and disable access.", "User Access", content)
