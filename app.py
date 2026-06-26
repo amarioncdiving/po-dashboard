@@ -134,6 +134,7 @@ PAGE_ACCESS = {
     "PO Detail": ["Admin", "Executive", "Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving", "Purchaser - All Departments", "Bookkeeping - All Departments"],
     "Upload Issued POs": ["Admin"],
     "Expense Upload / PO Matching": ["Admin"],
+    "Clear Expense Data": ["Admin"],
     "Expenses": ["Admin", "Executive"],
     "Missing PO Review": ["Admin", "Executive"],
     "Vendors": ["Admin", "Executive", "Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving", "Purchaser - All Departments", "Bookkeeping - All Departments"],
@@ -4334,6 +4335,7 @@ def shell(title, subtitle, active, content):
         ("Upload Issued POs", "/upload-po", "⬆️"),
         ("PO Maintenance", "/po-maintenance", "🛠️"),
         ("Expense Upload / PO Matching", "/expense-upload", "🧾"),
+        ("Clear Expense Data", "/admin/clear-expense-data", "🧹"),
         ("Expenses", "/expenses", "📄"),
         ("Missing PO Review", "/missing-po-review", "⚠️"),
         ("Vendors", "/vendors", "🏢"),
@@ -7814,6 +7816,149 @@ def expense_review_unpost():
     conn.commit()
     conn.close()
     return redirect(request.headers.get("Referer") or "/expenses")
+
+
+def load_expense_reset_counts(cursor):
+    """Return current expense row/batch counts for the Admin reset confirmation page."""
+    counts = {
+        "review_items": 0,
+        "posted_items": 0,
+        "posted_amount": 0,
+        "batches": 0,
+        "legacy_expense_lines": 0,
+    }
+    cursor.execute('''
+        IF OBJECT_ID('dbo.ExpenseReviewItems', 'U') IS NOT NULL
+            SELECT COUNT(*) AS Cnt,
+                   SUM(CASE WHEN COALESCE(PostedToPO, 0) = 1 THEN 1 ELSE 0 END) AS PostedCnt,
+                   SUM(CASE WHEN COALESCE(PostedToPO, 0) = 1 THEN COALESCE(PostedAmount, Amount, 0) ELSE 0 END) AS PostedAmt
+            FROM dbo.ExpenseReviewItems;
+        ELSE
+            SELECT 0 AS Cnt, 0 AS PostedCnt, 0 AS PostedAmt;
+    ''')
+    row = cursor.fetchone()
+    if row:
+        counts["review_items"] = int(row.Cnt or 0)
+        counts["posted_items"] = int(row.PostedCnt or 0)
+        counts["posted_amount"] = float(row.PostedAmt or 0)
+
+    cursor.execute('''
+        IF OBJECT_ID('dbo.ExpenseUploadBatches', 'U') IS NOT NULL
+            SELECT COUNT(*) AS Cnt FROM dbo.ExpenseUploadBatches;
+        ELSE
+            SELECT 0 AS Cnt;
+    ''')
+    row = cursor.fetchone()
+    if row:
+        counts["batches"] = int(row.Cnt or 0)
+
+    cursor.execute('''
+        IF OBJECT_ID('dbo.ExpenseLines', 'U') IS NOT NULL
+            SELECT COUNT(*) AS Cnt FROM dbo.ExpenseLines;
+        ELSE
+            SELECT 0 AS Cnt;
+    ''')
+    row = cursor.fetchone()
+    if row:
+        counts["legacy_expense_lines"] = int(row.Cnt or 0)
+    return counts
+
+
+@app.route("/admin/clear-expense-data", methods=["GET", "POST"])
+def admin_clear_expense_data():
+    allowed, reason = require_page_access("Clear Expense Data")
+    if not allowed:
+        return access_denied_response("Clear Expense Data", reason)
+
+    actual_access = get_user_access()
+    if normalize_role(actual_access.get("role")) != "Admin":
+        return access_denied_response("Clear Expense Data", "Only a real Admin account can clear expense data.")
+
+    try:
+        ensure_expense_review_tables()
+        conn = get_sql_connection()
+        cursor = conn.cursor()
+        counts = load_expense_reset_counts(cursor)
+        message_html = ""
+
+        if request.method == "POST":
+            action = clean_text(request.form.get("action"))
+            confirm_text = clean_text(request.form.get("confirm_text"))
+            if action == "cancel":
+                conn.close()
+                return redirect("/expense-upload")
+            if confirm_text != "CLEAR EXPENSES":
+                message_html = '<div class="notice error">Confirmation did not match. Type CLEAR EXPENSES exactly to continue.</div>'
+            else:
+                cleared_by = get_current_user().get("email") or actual_access.get("email") or "Admin"
+                before_counts = dict(counts)
+                cursor.execute('''
+                    IF OBJECT_ID('dbo.ExpenseReviewItems', 'U') IS NOT NULL
+                        DELETE FROM dbo.ExpenseReviewItems;
+                ''')
+                cursor.execute('''
+                    IF OBJECT_ID('dbo.ExpenseUploadBatches', 'U') IS NOT NULL
+                        DELETE FROM dbo.ExpenseUploadBatches;
+                ''')
+                cursor.execute('''
+                    IF OBJECT_ID('dbo.ExpenseLines', 'U') IS NOT NULL
+                        DELETE FROM dbo.ExpenseLines;
+                ''')
+                cursor.execute('''
+                    IF OBJECT_ID('dbo.ImportBatches', 'U') IS NOT NULL
+                       AND COL_LENGTH('dbo.ImportBatches', 'ImportType') IS NOT NULL
+                       AND COL_LENGTH('dbo.ImportBatches', 'BatchStatus') IS NOT NULL
+                    BEGIN
+                        UPDATE dbo.ImportBatches
+                        SET BatchStatus = 'Cleared - Expense Reset'
+                        WHERE LOWER(COALESCE(ImportType, '')) LIKE '%expense%';
+                    END
+                ''')
+                conn.commit()
+                counts = load_expense_reset_counts(cursor)
+                message_html = f'''
+                <div class="notice success">
+                    Expense data cleared by {h(cleared_by)}. Removed {h(before_counts["review_items"])} review rows, {h(before_counts["batches"])} upload batches, and {h(before_counts["legacy_expense_lines"])} legacy expense rows. PO setup, issued POs, projects, vendors, users, and purchase requests were not deleted.
+                </div>
+                '''
+
+        conn.close()
+
+        content = f'''
+        {message_html}
+        <div class="notice error">
+            <strong>ALERT: YOU'RE ABOUT TO CLEAR ALL EXPENSE DATA.</strong><br>
+            This will delete prior expense upload rows, review/matching decisions, and posted expense rows that reduce PO balances. It will not delete issued POs, projects, vendors, purchase requests, users, or PO maintenance history.
+        </div>
+
+        <div class="card">
+            <h3>Current Expense Data</h3>
+            <div class="status-card-grid">
+                <div class="status-card blue"><div class="label">Expense Review Rows</div><div class="value">{h(counts["review_items"])}</div><div class="trend">Rows from uploaded expense files</div></div>
+                <div class="status-card green"><div class="label">Posted to PO</div><div class="value">{h(counts["posted_items"])}</div><div class="trend">Rows currently reducing PO balances</div></div>
+                <div class="status-card amber"><div class="label">Posted Amount</div><div class="value">{currency(counts["posted_amount"])}</div><div class="trend">Will be removed from balance calculations</div></div>
+                <div class="status-card slate"><div class="label">Upload Batches</div><div class="value">{h(counts["batches"])}</div><div class="trend">Expense upload history rows</div></div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>Confirm Clear Expense Data</h3>
+            <p class="card-subtitle">Use this only when you are intentionally clearing prior test/upload expense data before a clean upload.</p>
+            <form method="post">
+                <div class="form-field full">
+                    <label>Type CLEAR EXPENSES to continue</label>
+                    <input name="confirm_text" autocomplete="off" placeholder="CLEAR EXPENSES">
+                </div>
+                <div class="request-actions" style="justify-content:flex-start; gap:10px;">
+                    <a class="button secondary" href="/expense-upload">Go Back</a>
+                    <button class="danger" type="submit" name="action" value="clear">Continue to Delete</button>
+                </div>
+            </form>
+        </div>
+        '''
+        return shell("Clear Expense Data", "Admin-only reset for expense upload testing.", "Clear Expense Data", content)
+    except Exception as e:
+        return shell("Clear Expense Data", "Unable to clear expense data.", "Clear Expense Data", f'<div class="notice error">Error loading expense reset page: {h(e)}</div>'), 500
 
 
 @app.route("/expense-upload", methods=["GET", "POST"])
