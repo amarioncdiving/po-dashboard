@@ -8832,17 +8832,44 @@ def user_access():
         users = cursor.fetchall()
         conn.close()
 
-        user_rows = ""
-        for row in users:
-            active_badge = '<span class="badge green">Active</span>' if row.IsActive else '<span class="badge red">Inactive</span>'
-            user_rows += f"<tr><td>{h(row.Email)}</td><td>{h(row.DisplayName)}</td><td><span class=\"badge blue\">{h(row.RoleName)}</span></td><td>{active_badge}</td><td>{h(row.UpdatedAt)}</td></tr>"
-
-        if not user_rows:
-            user_rows = '<tr><td colspan="5">No users found.</td></tr>'
-
         role_options = ""
         for role in VALID_ROLES:
             role_options += f'<option value="{h(role)}">{h(role)}</option>'
+
+        user_rows = ""
+        for row in users:
+            active_badge = '<span class="badge green">Active</span>' if row.IsActive else '<span class="badge red">Disabled</span>'
+            row_role_options = ""
+            for role in VALID_ROLES:
+                selected = "selected" if str(row.RoleName or "") == role else ""
+                row_role_options += f'<option value="{h(role)}" {selected}>{h(role)}</option>'
+            active_selected = "selected" if row.IsActive else ""
+            disabled_selected = "" if row.IsActive else "selected"
+            user_rows += f"""
+            <tr>
+                <td>
+                    <input type="hidden" name="email" value="{h(row.Email)}" form="user-edit-{h(row.DashboardUserId)}">
+                    <strong>{h(row.Email)}</strong>
+                    <div class="small-muted">Login email is the unique user key.</div>
+                </td>
+                <td><input type="text" name="display_name" value="{h(row.DisplayName)}" form="user-edit-{h(row.DashboardUserId)}"></td>
+                <td><select name="role_name" form="user-edit-{h(row.DashboardUserId)}">{row_role_options}</select></td>
+                <td>
+                    {active_badge}<br>
+                    <select name="is_active" form="user-edit-{h(row.DashboardUserId)}">
+                        <option value="1" {active_selected}>Active</option>
+                        <option value="0" {disabled_selected}>Disabled</option>
+                    </select>
+                </td>
+                <td>{h(row.UpdatedAt)}</td>
+                <td>
+                    <form id="user-edit-{h(row.DashboardUserId)}" method="post" action="/user-access"></form>
+                    <button class="secondary" type="submit" form="user-edit-{h(row.DashboardUserId)}">Save Changes</button>
+                </td>
+            </tr>"""
+
+        if not user_rows:
+            user_rows = '<tr><td colspan="6">No users found.</td></tr>'
 
         content = f"""
         {message_html}
@@ -8857,21 +8884,21 @@ def user_access():
             </form>
         </div>
         <div class="card">
-            <h3>Add or Update User Access</h3>
-            <p class="card-subtitle">Admins can add users or update their dashboard role. Executive users can use View As but cannot change access.</p>
+            <h3>Add New User Access</h3>
+            <p class="card-subtitle">Admins can add new users here. To correct spelling, change access level, or disable someone, use the editable Current Dashboard Users table below. Executive users can use View As but cannot change access.</p>
             <form method="post" action="/user-access">
                 <p><label>Email</label><br><input type="text" name="email" placeholder="person@c-diving.com" required></p>
                 <p><label>Display Name</label><br><input type="text" name="display_name" placeholder="Person Name"></p>
                 <p><label>Role</label><br><select name="role_name" required>{role_options}</select></p>
-                <p><label>Status</label><br><select name="is_active"><option value="1">Active</option><option value="0">Inactive</option></select></p>
+                <p><label>Status</label><br><select name="is_active"><option value="1">Active</option><option value="0">Disabled</option></select></p>
                 <p><button class="primary" type="submit">Save User Access</button></p>
             </form>
         </div>
-        <div class="card"><h3>Current Dashboard Users</h3><p class="card-subtitle">Users listed here can be assigned roles for the procurement dashboard.</p><div class="table-wrap"><table><tr><th>Email</th><th>Display Name</th><th>Role</th><th>Status</th><th>Updated At</th></tr>{user_rows}</table></div></div>
+        <div class="card"><h3>Current Dashboard Users</h3><p class="card-subtitle">Edit display name spelling, access level, or disabled status directly from this table. Save each row after making changes.</p><div class="table-wrap"><table><tr><th>Email</th><th>Display Name</th><th>Role</th><th>Status</th><th>Updated At</th><th>Action</th></tr>{user_rows}</table></div></div>
         <div class="card"><h3>Role Guide</h3><table><tr><th>Role</th><th>Access</th></tr><tr><td>Admin</td><td>Everything, including User Access</td></tr><tr><td>Executive</td><td>Summary, PO pages, purchase request review, Exceptions, Exports</td></tr><tr><td>Accounting</td><td>PO pages, request review, Uploads, Import History, Exceptions, Exports</td></tr><tr><td>Project Manager</td><td>Submit requests, PO Summary, PO List, PO Detail</td></tr><tr><td>Viewer</td><td>Submit requests, read-only PO Summary/List/Detail</td></tr><tr><td>No Access</td><td>Can sign in through Microsoft, but cannot view dashboard data</td></tr></table></div>
         """
 
-        return shell("User Access", "Manage SQL-backed dashboard roles and permissions.", "User Access", content)
+        return shell("User Access", "Add users, correct names, change roles, and disable access.", "User Access", content)
 
     except Exception as e:
         content = f'<div class="notice error">Error loading user access: {h(e)}</div>'
