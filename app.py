@@ -2230,9 +2230,10 @@ def load_expense_upload_page_data(status_filter="All"):
 def load_summary_data():
     conn = get_sql_connection()
     cursor = conn.cursor()
+    req_where, req_params = requestor_filter_sql("l")
 
     cursor.execute(
-        """
+        f"""
         WITH UniquePOs AS (
             SELECT
                 PONumber,
@@ -2241,12 +2242,14 @@ def load_summary_data():
                 MAX(POStatus) AS POStatus,
                 MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
                 MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
-            FROM dbo.IssuedPOLines
+            FROM dbo.IssuedPOLines l
+            WHERE {req_where}
             GROUP BY PONumber
         ),
         LineTotals AS (
             SELECT SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount
-            FROM dbo.IssuedPOLines
+            FROM dbo.IssuedPOLines l
+            WHERE {req_where}
         )
         SELECT
             COUNT(*) AS TotalPOs,
@@ -2255,7 +2258,9 @@ def load_summary_data():
             (SELECT TotalLineAmount FROM LineTotals) AS TotalLineAmount,
             SUM(RemainingAmount) AS TotalRemainingAmount
         FROM UniquePOs;
-        """
+        """,
+        *req_params,
+        *req_params,
     )
     row = cursor.fetchone()
 
@@ -2268,19 +2273,21 @@ def load_summary_data():
     }
 
     cursor.execute(
-        """
+        f"""
         WITH UniquePOs AS (
             SELECT
                 PONumber,
                 MAX(VendorName) AS VendorName,
                 MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
                 MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
-            FROM dbo.IssuedPOLines
+            FROM dbo.IssuedPOLines l
+            WHERE {req_where}
             GROUP BY PONumber
         ),
         VendorLines AS (
             SELECT VendorName, SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount
-            FROM dbo.IssuedPOLines
+            FROM dbo.IssuedPOLines l
+            WHERE {req_where}
             GROUP BY VendorName
         )
         SELECT
@@ -2293,24 +2300,28 @@ def load_summary_data():
         LEFT JOIN VendorLines v ON u.VendorName = v.VendorName
         GROUP BY u.VendorName
         ORDER BY TotalPOValue DESC;
-        """
+        """,
+        *req_params,
+        *req_params,
     )
     vendors = cursor.fetchall()
 
     cursor.execute(
-        """
+        f"""
         WITH UniquePOs AS (
             SELECT
                 PONumber,
                 MAX(ProjectName) AS ProjectName,
                 MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
                 MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
-            FROM dbo.IssuedPOLines
+            FROM dbo.IssuedPOLines l
+            WHERE {req_where}
             GROUP BY PONumber
         ),
         ProjectLines AS (
             SELECT ProjectName, SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount
-            FROM dbo.IssuedPOLines
+            FROM dbo.IssuedPOLines l
+            WHERE {req_where}
             GROUP BY ProjectName
         )
         SELECT
@@ -2323,7 +2334,9 @@ def load_summary_data():
         LEFT JOIN ProjectLines p ON u.ProjectName = p.ProjectName
         GROUP BY u.ProjectName
         ORDER BY TotalPOValue DESC;
-        """
+        """,
+        *req_params,
+        *req_params,
     )
     projects = cursor.fetchall()
 
@@ -2346,13 +2359,14 @@ def load_summary_data():
     conn.close()
     return overall, vendors, projects, imports
 
-
 def load_personal_dashboard_data():
     conn = get_sql_connection()
     cursor = conn.cursor()
 
+    req_where, req_params = requestor_filter_sql("l")
+
     cursor.execute(
-        """
+        f"""
         WITH UniquePOs AS (
             SELECT
                 PONumber,
@@ -2363,7 +2377,8 @@ def load_personal_dashboard_data():
                 MAX(COALESCE(RevisedAmount, OriginalAmount, 0)) AS POValue,
                 SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount,
                 MAX(COALESCE(RemainingAmount, 0)) AS RemainingAmount
-            FROM dbo.IssuedPOLines
+            FROM dbo.IssuedPOLines l
+            WHERE {req_where}
             GROUP BY PONumber
         )
         SELECT
@@ -2375,7 +2390,8 @@ def load_personal_dashboard_data():
             SUM(RemainingAmount) AS TotalRemainingAmount,
             SUM(CASE WHEN ABS(COALESCE(POValue, 0) - COALESCE(TotalLineAmount, 0)) > 0.01 THEN 1 ELSE 0 END) AS AmountMismatchCount
         FROM UniquePOs;
-        """
+        """,
+        *req_params,
     )
     row = cursor.fetchone()
 
@@ -2390,28 +2406,32 @@ def load_personal_dashboard_data():
     }
 
     cursor.execute(
-        """
+        f"""
         SELECT TOP 5
             VendorName,
             COUNT(DISTINCT PONumber) AS POCount,
             SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount
-        FROM dbo.IssuedPOLines
+        FROM dbo.IssuedPOLines l
+        WHERE {req_where}
         GROUP BY VendorName
         ORDER BY TotalLineAmount DESC;
-        """
+        """,
+        *req_params,
     )
     top_vendors = cursor.fetchall()
 
     cursor.execute(
-        """
+        f"""
         SELECT TOP 5
             ProjectName,
             COUNT(DISTINCT PONumber) AS POCount,
             SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount
-        FROM dbo.IssuedPOLines
+        FROM dbo.IssuedPOLines l
+        WHERE {req_where}
         GROUP BY ProjectName
         ORDER BY TotalLineAmount DESC;
-        """
+        """,
+        *req_params,
     )
     top_projects = cursor.fetchall()
 
@@ -3957,13 +3977,37 @@ def should_filter_pos_to_requestor():
 def requestor_filter_sql(alias):
     """Return the PO/project visibility predicate for the current working user.
 
-    Current Phase 1 data model uses Department for Dredging separation and the
-    PO Requestor/assigned-to email as the Project Manager assignment. When we add
-    a dedicated ProjectManagerEmail field later, this is the one function to update.
+    July 1 role security rule:
+    - Dredging visibility is based on the Department field only.
+    - PM-Dredging sees Department = Dredging only.
+    - Division Manager-Diving sees Department <> Dredging only.
+    - PM-Diving sees assigned non-Dredging only.
+
+    Some older uploaded POs have Department populated on IssuedPOLines but not
+    consistently on PurchaseOrders. For PurchaseOrders queries, this function
+    falls back to the related issued PO line department so restricted users do
+    not see cross-department POs just because a header field is blank.
     """
     scope, email = current_visibility_scope()
-    dept_expr = f"COALESCE({alias}.Department, '')"
-    req_expr = f"COALESCE({alias}.Requestor, '')"
+    clean_alias = str(alias or "").strip()
+
+    if clean_alias.lower() in ["po", "purchaseorders"]:
+        dept_expr = (
+            f"COALESCE(NULLIF({alias}.Department, ''), "
+            f"(SELECT TOP 1 lvis.Department FROM dbo.IssuedPOLines lvis "
+            f"WHERE lvis.PONumber = {alias}.PONumber AND COALESCE(lvis.Department, '') <> '' "
+            f"ORDER BY lvis.IssuedPOLineId), '')"
+        )
+        req_expr = (
+            f"COALESCE(NULLIF({alias}.Requestor, ''), "
+            f"(SELECT TOP 1 lvis.Requestor FROM dbo.IssuedPOLines lvis "
+            f"WHERE lvis.PONumber = {alias}.PONumber AND COALESCE(lvis.Requestor, '') <> '' "
+            f"ORDER BY lvis.IssuedPOLineId), '')"
+        )
+    else:
+        dept_expr = f"COALESCE({alias}.Department, '')"
+        req_expr = f"COALESCE({alias}.Requestor, '')"
+
     if scope == "all":
         return "1=1", []
     if scope == "dredging_only":
@@ -4525,7 +4569,8 @@ def load_pos_balances_data():
                 SUM(COALESCE(LineAmount, 0)) AS TotalLineAmount,
                 MAX(COALESCE(RemainingAmount, 0)) AS UploadedRemainingAmount,
                 COUNT(*) AS LineCount
-            FROM dbo.IssuedPOLines
+            FROM dbo.IssuedPOLines l
+            WHERE {req_where}
             GROUP BY PONumber
         ),
         {posted_cte},
