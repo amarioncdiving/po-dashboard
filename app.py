@@ -1232,7 +1232,7 @@ def role_can_access(role_name, page_name):
 
 def require_page_access(page_name):
     user = get_current_user()
-    access = get_user_access()
+    actual_access = get_user_access()
 
     if not user["is_authenticated"]:
         return False, "Microsoft login was not detected."
@@ -1240,14 +1240,26 @@ def require_page_access(page_name):
     if not user["is_allowed_domain"]:
         return False, f"Your email domain is not allowed. Expected @{user['allowed_domain']}."
 
-    if not access["found_in_sql"]:
+    if not actual_access["found_in_sql"]:
         return False, "Your account has not been added to the dashboard access list."
 
-    if not access["is_active"]:
+    if not actual_access["is_active"]:
         return False, "Your dashboard account is inactive."
 
+    # User Access itself remains available to the real Admin/Executive so they can
+    # change users or clear View As even while testing a restricted role.
+    if page_name == "User Access" and role_can_access(actual_access["role"], page_name):
+        return True, ""
+
+    access = get_effective_user_access()
+    if not access.get("found_in_sql"):
+        return False, "The selected view-as account has not been added to the dashboard access list."
+
+    if not access.get("is_active"):
+        return False, "The selected view-as dashboard account is inactive."
+
     if not role_can_access(access["role"], page_name):
-        return False, f"Your role, {access['role']}, does not have access to {page_name}."
+        return False, f"Your effective role, {access['role']}, does not have access to {page_name}."
 
     return True, ""
 
@@ -3843,7 +3855,7 @@ a, a:visited { color:#1d4ed8; }
 
 
 def get_view_as_email():
-    """Admin/Executive helper for viewing user-specific context while keeping the real admin/executive sidebar."""
+    """Admin/Executive helper for role testing and user-specific data filtering."""
     access = get_user_access()
     if normalize_role(access.get("role")) not in ["Admin", "Executive"]:
         return ""
@@ -3851,7 +3863,6 @@ def get_view_as_email():
 
 def current_working_email():
     return get_view_as_email() or get_current_user().get("email") or ""
-
 
 
 def lookup_dashboard_user_by_email(email):
@@ -3876,17 +3887,52 @@ def lookup_dashboard_user_by_email(email):
         return None
 
 
-def current_data_role():
+def get_effective_user_access():
+    """Return the access profile the app should behave as.
+
+    When an Admin/Executive uses View As, menus, page-access checks, and data
+    filtering should use the selected user's role so role testing actually looks
+    different. The real signed-in user is still used for permission to start/clear
+    View As and for true Admin-only user-management POST actions.
+    """
+    actual = get_user_access()
     view_email = get_view_as_email()
-    if view_email:
-        row = lookup_dashboard_user_by_email(view_email)
-        if row and getattr(row, "IsActive", 0):
-            return clean_text(row.RoleName) or "No Access"
-    return get_user_access().get("role") or "No Access"
+    if not view_email:
+        return actual
+
+    row = lookup_dashboard_user_by_email(view_email)
+    if not row or not getattr(row, "IsActive", 0):
+        return {
+            "email": view_email,
+            "display_name": "",
+            "role": "No Access",
+            "is_active": False,
+            "found_in_sql": bool(row),
+            "lookup_error": "View-as user is inactive or was not found.",
+            "is_view_as": True,
+            "actual_email": actual.get("email", ""),
+            "actual_role": actual.get("role", "No Access"),
+        }
+
+    return {
+        "email": clean_text(getattr(row, "Email", view_email)).lower(),
+        "display_name": clean_text(getattr(row, "DisplayName", "")),
+        "role": normalize_role(getattr(row, "RoleName", "No Access") or "No Access"),
+        "is_active": True,
+        "found_in_sql": True,
+        "lookup_error": "",
+        "is_view_as": True,
+        "actual_email": actual.get("email", ""),
+        "actual_role": actual.get("role", "No Access"),
+    }
+
+
+def current_data_role():
+    return get_effective_user_access().get("role") or "No Access"
 
 
 def current_data_email():
-    return current_working_email()
+    return get_effective_user_access().get("email") or current_working_email()
 
 
 def current_visibility_scope():
@@ -4223,11 +4269,12 @@ def view_as_notice():
     view_email = get_view_as_email()
     if not view_email:
         return ""
-    return f'<div class="view-as-banner"><strong>Viewing as:</strong> {h(view_email)} <a class="button secondary" href="/clear-view-as">Clear view-as</a></div>'
+    effective = get_effective_user_access()
+    return f'<div class="view-as-banner"><strong>Viewing as:</strong> {h(view_email)} · Effective role: {h(effective.get("role", "No Access"))} <a class="button secondary" href="/clear-view-as">Clear view-as</a></div>'
 
 
 def shell(title, subtitle, active, content):
-    access = get_user_access()
+    access = get_effective_user_access()
     role = access["role"]
 
     procurement_nav_items = [
@@ -4302,9 +4349,10 @@ def shell(title, subtitle, active, content):
             <div style="font-weight:800; font-size:13px; margin-bottom:10px;">Signed-In Role</div>
             <div><span class="status-dot"></span>{h(role)}</div>
             <div style="margin-top:14px; color:#bfdbfe; font-size:12px;">
-                User<br>
+                {"Viewing As" if access.get("is_view_as") else "User"}<br>
                 <strong style="color:white;">{h(access["email"] or "Not detected")}</strong>
             </div>
+            {f'<div style="margin-top:10px; color:#93c5fd; font-size:11px;">Actual signed-in user<br><strong style="color:white;">{h(access.get("actual_email") or "")}</strong></div>' if access.get("is_view_as") else ""}
         </div>
     </aside>
 
