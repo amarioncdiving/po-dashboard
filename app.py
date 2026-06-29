@@ -5781,8 +5781,8 @@ def purchase_requests():
             <tr>
                 <td><strong>{h(row.RequestNumber)}</strong><br><span style="color:var(--muted);">{h(row.RequestedAt)}</span></td>
                 <td><strong>{h(row.RequestTitle)}</strong><br><span style="color:var(--muted);">{h(description)}</span></td>
-                <td>{h(row.VendorName)}</td>
-                <td>{h(row.ProjectName)}</td>
+                <td><a class="vendor-detail-link" href="/vendors?vendor={quote_plus(str(row.VendorName or ''))}">{h(row.VendorName)}</a></td>
+                <td><a class="vendor-detail-link" href="/projects?project={quote_plus(str(row.ProjectName or ''))}">{h(row.ProjectName)}</a></td>
                 <td>{h(row.Department)}</td>
                 <td>{h(row.NeededByDate)}</td>
                 <td class="right">{currency(row.EstimatedAmount)}</td>
@@ -5885,13 +5885,17 @@ def my_dashboard():
 
         vendor_rows = ""
         for row in data["top_vendors"]:
-            vendor_rows += f"<tr><td>{h(row.VendorName)}</td><td class=\"right\">{row.POCount}</td><td class=\"right\">{currency(row.TotalLineAmount)}</td></tr>"
+            vendor_name = clean_text(row.VendorName) or "Missing Vendor"
+            vendor_url = "/vendors?vendor=" + quote_plus(vendor_name)
+            vendor_rows += f'<tr><td><a class="vendor-detail-link" href="{vendor_url}">{h(vendor_name)}</a></td><td class="right">{row.POCount}</td><td class="right">{currency(row.TotalLineAmount)}</td></tr>' 
         if not vendor_rows:
             vendor_rows = '<tr><td colspan="3">No vendor data found.</td></tr>'
 
         project_rows = ""
         for row in data["top_projects"]:
-            project_rows += f"<tr><td>{h(row.ProjectName)}</td><td class=\"right\">{row.POCount}</td><td class=\"right\">{currency(row.TotalLineAmount)}</td></tr>"
+            project_name = clean_text(row.ProjectName) or "Unnamed Project"
+            project_url = "/projects?project=" + quote_plus(project_name)
+            project_rows += f'<tr><td><a class="vendor-detail-link" href="{project_url}">{h(project_name)}</a></td><td class="right">{row.POCount}</td><td class="right">{currency(row.TotalLineAmount)}</td></tr>' 
         if not project_rows:
             project_rows = '<tr><td colspan="3">No project data found.</td></tr>'
 
@@ -5908,12 +5912,12 @@ def my_dashboard():
 
         common_kpis = f"""
         <div class="grid kpis">
-            <div class="card kpi"><div class="label">Total POs</div><div class="value">{overall["total_pos"]}</div><div class="trend">Unique PO numbers</div></div>
-            <div class="card kpi"><div class="label">Open POs</div><div class="value">{overall["open_pos"]}</div><div class="trend">Currently open</div></div>
-            <div class="card kpi"><div class="label">Total PO Value</div><div class="value">{currency(overall["total_po_value"])}</div><div class="trend">Revised/original PO value</div></div>
-            <div class="card kpi"><div class="label">Line Item Total</div><div class="value">{currency(overall["total_line_amount"])}</div><div class="trend">Imported line total</div></div>
-            <div class="card kpi"><div class="label">Remaining</div><div class="value">{currency(overall["total_remaining_amount"])}</div><div class="trend">Current PO balance</div></div>
-            <div class="card kpi"><div class="label">Purchase Requests</div><div class="value">{pr_stats["submitted_requests"]}</div><div class="trend">Submitted and waiting</div></div>
+            <a class="card kpi action-card blue" href="/pos-balances#posBalancesPOListTable"><div class="label">Total POs</div><div class="value">{overall["total_pos"]}</div><div class="trend">PO list drilldown</div></a>
+            <a class="card kpi action-card green" href="/pos-balances#posBalancesPOListTable"><div class="label">Open POs</div><div class="value">{overall["open_pos"]}</div><div class="trend">Open PO drilldown</div></a>
+            <a class="card kpi action-card blue" href="/pos-balances#posBalancesPOListTable"><div class="label">Total PO Value</div><div class="value">{currency(overall["total_po_value"])}</div><div class="trend">PO value drilldown</div></a>
+            <a class="card kpi action-card blue" href="/pos-balances#posBalancesLineTable"><div class="label">Line Item Total</div><div class="value">{currency(overall["total_line_amount"])}</div><div class="trend">Line-item drilldown</div></a>
+            <a class="card kpi action-card amber" href="/pos-balances#posBalancesPOListTable"><div class="label">Remaining</div><div class="value">{currency(overall["total_remaining_amount"])}</div><div class="trend">Balance drilldown</div></a>
+            <a class="card kpi action-card blue" href="/purchase-requests?status=Submitted"><div class="label">Purchase Requests</div><div class="value">{pr_stats["submitted_requests"]}</div><div class="trend">Submitted request drilldown</div></a>
         </div>
         """
 
@@ -5941,7 +5945,6 @@ def my_dashboard():
                     </table>
                 </div>
             </div>
-            <div class="card"><h3>Recent Imports</h3><div class="table-wrap"><table><tr><th>Batch ID</th><th>File Name</th><th>Uploaded At</th><th>Total Rows</th><th>Success</th><th>Errors</th><th>Status</th></tr>{import_rows}</table></div></div>
             """
         elif role == "Executive":
             role_content = f"""
@@ -5992,7 +5995,6 @@ def my_dashboard():
                     </table>
                 </div>
             </div>
-            <div class="card"><h3>Recent Imports</h3><div class="table-wrap"><table><tr><th>Batch ID</th><th>File Name</th><th>Uploaded At</th><th>Total Rows</th><th>Success</th><th>Errors</th><th>Status</th></tr>{import_rows}</table></div></div>
             """
         elif role in ["Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving"]:
             role_content = f"""
@@ -6184,8 +6186,8 @@ def po_list():
             po_rows += f"""
             <tr>
                 <td><a href="{po_url}">{h(row.PONumber)}</a></td>
-                <td>{h(row.VendorName)}</td>
-                <td>{h(row.ProjectName)}</td>
+                <td><a class="vendor-detail-link" href="/vendors?vendor={quote_plus(str(row.VendorName or ''))}">{h(row.VendorName)}</a></td>
+                <td><a class="vendor-detail-link" href="/projects?project={quote_plus(str(row.ProjectName or ''))}">{h(row.ProjectName)}</a></td>
                 <td>{h(row.Department)}</td>
                 <td><span class="badge {status_class}">{h(status_text)}</span></td>
                 <td>{h(row.PODate)}</td>
@@ -6573,7 +6575,7 @@ def pos_balances():
             bar_width = 0 if max_project_value == 0 else max(5, float(row.POValue or 0) / max_project_value * 100)
             project_rows += f"""
             <tr>
-                <td><strong>{h(row.ProjectName)}</strong></td>
+                <td><a class="vendor-detail-link" href="/projects?project={quote_plus(str(row.ProjectName or ''))}"><strong>{h(row.ProjectName)}</strong></a></td>
                 <td class="right">{row.POCount}</td>
                 <td class="right">{currency(row.POValue)}</td>
                 <td class="right">{currency(row.TotalLineAmount)}</td>
@@ -6591,7 +6593,7 @@ def pos_balances():
         for row in data["vendors"]:
             bar_width = 0 if max_vendor_value == 0 else max(5, float(row.POValue or 0) / max_vendor_value * 100)
             vendor_bar_rows += f"""
-            <div class="mini-bar-row"><span>{h(row.VendorName)}</span><div><b style="width:{bar_width}%"></b></div><em>{currency(row.POValue)}</em></div>
+            <div class="mini-bar-row"><span><a class="vendor-detail-link" href="/vendors?vendor={quote_plus(str(row.VendorName or ''))}">{h(row.VendorName)}</a></span><div><b style="width:{bar_width}%"></b></div><em>{currency(row.POValue)}</em></div>
             """
         if not vendor_bar_rows:
             vendor_bar_rows = '<p class="card-subtitle">No vendor data found.</p>'
@@ -6606,8 +6608,8 @@ def pos_balances():
             po_rows += f"""
             <tr>
                 <td><a href="{po_url}">{h(row.PONumber)}</a></td>
-                <td>{h(row.VendorName)}</td>
-                <td>{h(row.ProjectName)}</td>
+                <td><a class="vendor-detail-link" href="/vendors?vendor={quote_plus(str(row.VendorName or ''))}">{h(row.VendorName)}</a></td>
+                <td><a class="vendor-detail-link" href="/projects?project={quote_plus(str(row.ProjectName or ''))}">{h(row.ProjectName)}</a></td>
                 <td>{h(row.Department)}</td>
                 <td>{status_chip(status_text)}</td>
                 <td>{h(row.PODate)}</td>
@@ -6628,8 +6630,8 @@ def pos_balances():
             line_rows += f"""
             <tr>
                 <td><a class="po-link" href="/po-packet/{quote_plus(str(row.PONumber or ''))}?type=internal">{h(row.PONumber)}</a></td>
-                <td>{h(row.VendorName)}</td>
-                <td>{h(row.ProjectName)}</td>
+                <td><a class="vendor-detail-link" href="/vendors?vendor={quote_plus(str(row.VendorName or ''))}">{h(row.VendorName)}</a></td>
+                <td><a class="vendor-detail-link" href="/projects?project={quote_plus(str(row.ProjectName or ''))}">{h(row.ProjectName)}</a></td>
                 <td>{h(row.Department)}</td>
                 <td>{h(row.LineDescription)}</td>
                 <td>{h(row.Unit)}</td>
@@ -6701,7 +6703,7 @@ def pos_balances():
         <div class="card">
             <h3>Recent PO Line Items</h3>
             <p class="card-subtitle">Line-level detail from issued PO imports. This brings PO Detail visibility into the combined page.</p>
-            <div class="table-wrap"><table><tr><th>PO</th><th>Vendor</th><th>Project</th><th>Department</th><th>Description</th><th>Unit</th><th class="right">Unit Cost</th><th class="right">Qty</th><th class="right">Line Amount</th></tr>{line_rows}</table></div>
+            <div class="table-wrap"><table id="posBalancesLineTable"><tr><th>PO</th><th>Vendor</th><th>Project</th><th>Department</th><th>Description</th><th>Unit</th><th class="right">Unit Cost</th><th class="right">Qty</th><th class="right">Line Amount</th></tr>{line_rows}</table></div>
         </div>
 
         <script>
