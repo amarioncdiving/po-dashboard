@@ -120,6 +120,7 @@ ROLE_GROUP_ADMIN_ONLY = ["Admin"]
 PAGE_ACCESS = {
     "Dashboard": ["Admin", "Executive", "Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving", "Purchaser - All Departments", "Bookkeeping - All Departments"],
     "My Dashboard": ["Admin", "Executive", "Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving", "Purchaser - All Departments", "Bookkeeping - All Departments"],
+    "Help Center": ["Admin", "Executive", "Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving", "Purchaser - All Departments", "Bookkeeping - All Departments"],
     "New Purchase Request": ROLE_GROUP_CAN_CREATE_REQUEST,
     "Purchase Requests": ["Admin", "Executive", "Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving", "Purchaser - All Departments"],
     "Approver Queue": ["Admin", "Executive", "Division Manager - Diving"],
@@ -4324,6 +4325,7 @@ def shell(title, subtitle, active, content):
 
     procurement_nav_items = [
         ("My Dashboard", "/my-dashboard", "🏠"),
+        ("Help Center", "/help-center", "❓"),
         ("New Purchase Request", "/purchase-request", "📝"),
         ("Purchase Requests", "/purchase-requests", "📋"),
         ("POs & Balances", "/pos-balances", "💳"),
@@ -5375,6 +5377,123 @@ def action_form(request_id, status, label, css_class="secondary", extra_fields="
 def home():
     return redirect("/my-dashboard")
 
+
+
+@app.route("/help-center")
+def help_center():
+    allowed, reason = require_page_access("Help Center")
+    if not allowed:
+        return access_denied_response("Help Center", reason)
+
+    access = get_effective_user_access()
+    role = access.get("role", "")
+    can_submit_requests = role_can_access(role, "New Purchase Request")
+
+    purchase_request_section = """
+        <div class="help-step">
+            <div class="step-number">1</div>
+            <div><strong>Open New Purchase Request.</strong><br>Use the left menu and click <strong>New Purchase Request</strong>.</div>
+        </div>
+        <div class="help-step">
+            <div class="step-number">2</div>
+            <div><strong>Enter what you need.</strong><br>Add a clear request title, description/scope, project, department, needed-by date, vendor if known, and estimated cost.</div>
+        </div>
+        <div class="help-step">
+            <div class="step-number">3</div>
+            <div><strong>Attach backup.</strong><br>Upload a quote, estimate, email backup, or other supporting document when available.</div>
+        </div>
+        <div class="help-step">
+            <div class="step-number">4</div>
+            <div><strong>Submit for review.</strong><br>After submitting, the request goes to the proper review queue. You can check status from <strong>Purchase Requests</strong>.</div>
+        </div>
+    """ if can_submit_requests else """
+        <div class="soft-alert">
+            Your current role does not include purchase request submission. You can still use this help center to look up POs and view project PO information if your role allows it.
+        </div>
+    """
+
+    content = f"""
+    <style>
+      .help-hero {{ background: linear-gradient(135deg, rgba(37,99,235,.12), rgba(14,165,233,.08)); border:1px solid rgba(37,99,235,.18); border-radius:20px; padding:24px; margin-bottom:18px; }}
+      .help-grid {{ display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap:16px; }}
+      .help-card {{ background:white; border:1px solid #dbe7f3; border-radius:18px; padding:20px; box-shadow:0 12px 28px rgba(15,23,42,.06); }}
+      .help-card h3 {{ margin-top:0; color:#0f172a; }}
+      .help-step {{ display:flex; gap:12px; padding:12px 0; border-top:1px solid #edf2f7; }}
+      .help-step:first-of-type {{ border-top:0; }}
+      .step-number {{ flex:0 0 30px; width:30px; height:30px; border-radius:999px; background:#2563eb; color:white; display:flex; align-items:center; justify-content:center; font-weight:800; }}
+      .quick-links {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }}
+      .soft-alert {{ background:#fff7ed; border:1px solid #fed7aa; color:#9a3412; border-radius:14px; padding:14px; margin:10px 0; font-weight:700; }}
+      .tip-list {{ margin:8px 0 0 18px; padding:0; color:#475569; line-height:1.55; }}
+      @media (max-width: 1100px) {{ .help-grid {{ grid-template-columns:1fr; }} }}
+    </style>
+
+    <div class="help-hero">
+      <h2 style="margin:0 0 8px;">Coastal Procurement Help Center</h2>
+      <p style="margin:0; color:#475569; max-width:900px;">Quick how-to guides for the most common July 1 rollout tasks: finding a PO, submitting a purchase request, and viewing PO information by project.</p>
+      <div class="quick-links">
+        <a class="button" href="/pos-balances">Find a PO</a>
+        {('<a class="button" href="/purchase-request">Submit Purchase Request</a>' if can_submit_requests else '')}
+        <a class="button" href="/projects">View by Project</a>
+      </div>
+    </div>
+
+    <div class="help-grid">
+      <div class="help-card" id="find-po">
+        <h3>🔎 How to find a PO</h3>
+        <div class="help-step">
+          <div class="step-number">1</div>
+          <div><strong>Open POs & Balances.</strong><br>Use the left menu and click <strong>POs & Balances</strong>.</div>
+        </div>
+        <div class="help-step">
+          <div class="step-number">2</div>
+          <div><strong>Use the filters/search.</strong><br>Search by PO number, vendor, project, department, or status.</div>
+        </div>
+        <div class="help-step">
+          <div class="step-number">3</div>
+          <div><strong>Open the PO packet.</strong><br>Click the PO number to view the full PO packet, line details, balance, vendor information, and related history.</div>
+        </div>
+        <ul class="tip-list">
+          <li>Your role may limit which POs appear.</li>
+          <li>Voided POs remain visible but show a $0.00 amount/balance.</li>
+        </ul>
+      </div>
+
+      <div class="help-card" id="submit-request">
+        <h3>📝 How to submit a purchase request</h3>
+        {purchase_request_section}
+        <ul class="tip-list">
+          <li>Use a specific request title so approvers understand what is needed.</li>
+          <li>Estimated cost is required for review routing.</li>
+          <li>The selected project must already exist in the app/project setup list.</li>
+        </ul>
+      </div>
+
+      <div class="help-card" id="project-info">
+        <h3>📁 How to view PO information by project</h3>
+        <div class="help-step">
+          <div class="step-number">1</div>
+          <div><strong>Open Projects.</strong><br>Use the left menu and click <strong>Projects</strong>.</div>
+        </div>
+        <div class="help-step">
+          <div class="step-number">2</div>
+          <div><strong>Select a project.</strong><br>Choose the project from the <strong>Select Project</strong> dropdown.</div>
+        </div>
+        <div class="help-step">
+          <div class="step-number">3</div>
+          <div><strong>Review the project PO summary.</strong><br>Use the project view to see project-level PO totals, open POs, vendors, and current balances.</div>
+        </div>
+        <div class="help-step">
+          <div class="step-number">4</div>
+          <div><strong>Drill into line items.</strong><br>Scroll to the PO line-item section to see what was uploaded for that project.</div>
+        </div>
+        <ul class="tip-list">
+          <li>Dredging-only users will only see Dredging projects.</li>
+          <li>Diving project managers may only see projects assigned to them.</li>
+        </ul>
+      </div>
+    </div>
+    """
+    return shell("Help Center", "How-to guides for common procurement app tasks.", "Help Center", content)
 
 @app.route("/purchase-request", methods=["GET", "POST"])
 def purchase_request():
