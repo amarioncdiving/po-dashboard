@@ -1214,7 +1214,7 @@ def send_po_upload_summary_email(import_result, filename, department, requestor_
     upload_url = app_url("/pos-balances")
     body = f"""
     <h2>Issued POs uploaded</h2>
-    <p>A new issued PO setup file was uploaded into the procurement app.</p>
+    <p>A new issued PO setup file was uploaded into the Command Center.</p>
     <table cellpadding="6" cellspacing="0" style="border-collapse:collapse;border:1px solid #e2e8f0;">
       <tr><th align="left">File</th><td>{h(filename)}</td></tr>
       <tr><th align="left">Import Batch</th><td>{h(import_result.get('import_batch_id'))}</td></tr>
@@ -4388,7 +4388,7 @@ def shell(title, subtitle, active, content):
             <div class="logo"><img src="{CE_LOGO_DATA_URI}" alt="Coastal Engineering logo"></div>
             <div>
                 <h1>Coastal Engineering</h1>
-                <p>Procurement App</p>
+                <p>Command Center</p>
             </div>
         </div>
         <button type="button" class="mobile-nav-close" onclick="closeMobileMenu()" aria-label="Close menu">&times;</button>
@@ -5428,7 +5428,7 @@ def help_center():
     </style>
 
     <div class="help-hero">
-      <h2 style="margin:0 0 8px;">Coastal Procurement Help Center</h2>
+      <h2 style="margin:0 0 8px;">Coastal Command Center Help Center</h2>
       <p style="margin:0; color:#475569; max-width:900px;">Quick how-to guides for the most common July 1 rollout tasks: finding a PO, submitting a purchase request, and viewing PO information by project.</p>
       <div class="quick-links">
         <a class="button" href="/pos-balances">Find a PO</a>
@@ -5493,7 +5493,7 @@ def help_center():
       </div>
     </div>
     """
-    return shell("Help Center", "How-to guides for common procurement app tasks.", "Help Center", content)
+    return shell("Help Center", "How-to guides for common Command Center tasks.", "Help Center", content)
 
 @app.route("/purchase-request", methods=["GET", "POST"])
 def purchase_request():
