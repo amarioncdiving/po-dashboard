@@ -7904,16 +7904,10 @@ def admin_clear_expense_data():
                     IF OBJECT_ID('dbo.ExpenseLines', 'U') IS NOT NULL
                         DELETE FROM dbo.ExpenseLines;
                 ''')
-                cursor.execute('''
-                    IF OBJECT_ID('dbo.ImportBatches', 'U') IS NOT NULL
-                       AND COL_LENGTH('dbo.ImportBatches', 'ImportType') IS NOT NULL
-                       AND COL_LENGTH('dbo.ImportBatches', 'BatchStatus') IS NOT NULL
-                    BEGIN
-                        UPDATE dbo.ImportBatches
-                        SET BatchStatus = 'Cleared - Expense Reset'
-                        WHERE LOWER(COALESCE(ImportType, '')) LIKE '%expense%';
-                    END
-                ''')
+                # Do not touch dbo.ImportBatches here. In the live database this table is
+                # used by issued PO uploads and does not always have an ImportType column.
+                # The expense reset is intentionally limited to the expense-specific tables
+                # below so issued PO/project setup history remains intact.
                 conn.commit()
                 counts = load_expense_reset_counts(cursor)
                 message_html = f'''
