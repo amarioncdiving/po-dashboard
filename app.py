@@ -114,7 +114,7 @@ ROLE_GROUP_CAN_CREATE_REQUEST = [
     "Division Manager - Diving",
     "Purchaser - All Departments",
 ]
-ROLE_GROUP_CAN_REVIEW_REQUESTS = ["Admin", "Executive", "Division Manager - Diving"]
+ROLE_GROUP_CAN_REVIEW_REQUESTS = ["Admin", "Executive"]
 ROLE_GROUP_ADMIN_ONLY = ["Admin"]
 
 PAGE_ACCESS = {
@@ -123,7 +123,7 @@ PAGE_ACCESS = {
     "Help Center": ["Admin", "Executive", "Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving", "Purchaser - All Departments", "Bookkeeping - All Departments"],
     "New Purchase Request": ROLE_GROUP_CAN_CREATE_REQUEST,
     "Purchase Requests": ["Admin", "Executive", "Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving", "Purchaser - All Departments"],
-    "Approver Queue": ["Admin", "Executive", "Division Manager - Diving"],
+    "Approver Queue": ["Admin", "Executive"],
     "POs & Balances": ["Admin", "Executive", "Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving", "Purchaser - All Departments", "Bookkeeping - All Departments"],
     "Projects": ["Admin", "Executive", "Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving", "Purchaser - All Departments", "Bookkeeping - All Departments"],
     "Forecasting": ["Admin", "Executive"],
@@ -1120,15 +1120,75 @@ def po_packet_pdf_attachment(po_number, packet_type="internal"):
     }
 
 
+
+APPROVAL_THRESHOLD_AMOUNT = Decimal("3000.00")
+
+
+def ensure_purchase_request_approval_columns(cursor):
+    """Add July 1 approval tracking columns if they do not already exist."""
+    cursor.execute("""
+    IF COL_LENGTH('dbo.PurchaseRequests', 'AdminApprovedBy') IS NULL
+        ALTER TABLE dbo.PurchaseRequests ADD AdminApprovedBy NVARCHAR(255) NULL;
+    IF COL_LENGTH('dbo.PurchaseRequests', 'AdminApprovedAt') IS NULL
+        ALTER TABLE dbo.PurchaseRequests ADD AdminApprovedAt DATETIME2 NULL;
+    IF COL_LENGTH('dbo.PurchaseRequests', 'ExecutiveApprovedBy') IS NULL
+        ALTER TABLE dbo.PurchaseRequests ADD ExecutiveApprovedBy NVARCHAR(255) NULL;
+    IF COL_LENGTH('dbo.PurchaseRequests', 'ExecutiveApprovedAt') IS NULL
+        ALTER TABLE dbo.PurchaseRequests ADD ExecutiveApprovedAt DATETIME2 NULL;
+    IF COL_LENGTH('dbo.PurchaseRequests', 'ApprovalRequirement') IS NULL
+        ALTER TABLE dbo.PurchaseRequests ADD ApprovalRequirement NVARCHAR(100) NULL;
+    """)
+
+
+def requires_executive_approval(amount):
+    return clean_decimal(amount) >= APPROVAL_THRESHOLD_AMOUNT
+
+
+def approval_requirement_label(amount):
+    if requires_executive_approval(amount):
+        return "Admin + Executive approval required"
+    return "Admin approval required"
+
+
+def purchase_request_approval_roles_for_amount(amount):
+    if requires_executive_approval(amount):
+        return ["Admin", "Executive"]
+    return ["Admin"]
+
+
+def load_purchase_request_approval_recipients(req):
+    return load_active_users_by_roles(purchase_request_approval_roles_for_amount(getattr(req, "EstimatedAmount", 0)))
+
+
+def send_purchase_request_pending_approval_email(purchase_request_id, remaining_role):
+    req = load_purchase_request_for_email(purchase_request_id)
+    if not req:
+        return
+    recipients = load_active_users_by_roles([remaining_role])
+    if not recipients:
+        return
+    review_url = app_url("/purchase-requests")
+    body = f"""
+    <h2>Purchase request still needs {h(remaining_role)} approval</h2>
+    <p>This request is $3,000 or more and requires both Admin and Executive approval. One approval has been recorded; the remaining approval is still needed before the PO is created.</p>
+    {purchase_request_summary_html(req)}
+    {html_button("Open Purchase Requests", review_url)}
+    """
+    send_email_notification(recipients, f"Approval still needed: {req.RequestNumber}", body)
+
 def load_purchase_request_for_email(purchase_request_id):
     conn = get_sql_connection()
     cursor = conn.cursor()
+    ensure_purchase_request_approval_columns(cursor)
+    conn.commit()
     cursor.execute(
         """
         SELECT TOP 1 PurchaseRequestId, RequestNumber, RequestedByEmail, RequestedByName,
                RequestedAt, NeededByDate, VendorName, ProjectCode, ProjectName, Department,
                RequestTitle, RequestDescription, EstimatedAmount, Priority, RequestStatus,
-               ReviewerEmail, ReviewedAt, ReviewNotes, ConvertedPONumber, UpdatedAt
+               ReviewerEmail, ReviewedAt, ReviewNotes, ConvertedPONumber, UpdatedAt,
+               AdminApprovedBy, AdminApprovedAt, ExecutiveApprovedBy, ExecutiveApprovedAt,
+               ApprovalRequirement
         FROM dbo.PurchaseRequests
         WHERE PurchaseRequestId = ?;
         """,
@@ -1137,7 +1197,6 @@ def load_purchase_request_for_email(purchase_request_id):
     row = cursor.fetchone()
     conn.close()
     return row
-
 
 def purchase_request_summary_html(req):
     return f"""
@@ -1148,6 +1207,7 @@ def purchase_request_summary_html(req):
       <tr><th align="left">Project</th><td>{h(req.ProjectName)}</td></tr>
       <tr><th align="left">Department</th><td>{h(req.Department)}</td></tr>
       <tr><th align="left">Amount</th><td>{currency(req.EstimatedAmount)}</td></tr>
+      <tr><th align="left">Approval Required</th><td>{h(approval_requirement_label(req.EstimatedAmount))}</td></tr>
       <tr><th align="left">Priority</th><td>{h(req.Priority)}</td></tr>
       <tr><th align="left">Needed By</th><td>{h(req.NeededByDate)}</td></tr>
       <tr><th align="left">Requested By</th><td>{h(req.RequestedByName or req.RequestedByEmail)}</td></tr>
@@ -1159,13 +1219,16 @@ def send_purchase_request_submitted_emails(purchase_request_id):
     req = load_purchase_request_for_email(purchase_request_id)
     if not req:
         return
-    approvers = load_active_users_by_roles(["Admin", "Executive", "Division Manager - Diving"])
-    approver_names = ", ".join(user_display_name(a) for a in approvers) or "Admin/Executive/Division Manager"
+
+    approvers = load_purchase_request_approval_recipients(req)
+    approver_names = ", ".join(user_display_name(a) for a in approvers) or approval_requirement_label(req.EstimatedAmount)
     review_url = app_url("/purchase-requests")
-    subject = f"Purchase request needs review: {req.RequestNumber}"
+    subject = f"Purchase request approval needed: {req.RequestNumber}"
     body = f"""
     <h2>Purchase request approval needed</h2>
     <p>A purchase request has been submitted and is ready for review.</p>
+    <p><strong>July 1 approval rule:</strong> {h(approval_requirement_label(req.EstimatedAmount))}.</p>
+    <p>For requests $3,000 and up, Admin and Executive can approve in any order. The PO is created only after both approvals are recorded.</p>
     {purchase_request_summary_html(req)}
     {html_button("Open Purchase Requests", review_url)}
     """
@@ -1175,13 +1238,14 @@ def send_purchase_request_submitted_emails(purchase_request_id):
     requester_subject = f"What happens now: {req.RequestNumber}"
     requester_body = f"""
     <h2>Your purchase request was submitted</h2>
-    <p>Your request is going to the following approver group for review: <strong>{h(approver_names)}</strong>.</p>
-    <p>You will receive another email after it is approved and converted to a PO.</p>
+    <p>Your request was submitted and routed for approval.</p>
+    <p><strong>Approval required:</strong> {h(approval_requirement_label(req.EstimatedAmount))}.</p>
+    <p>Approval email was sent to: <strong>{h(approver_names)}</strong>.</p>
+    <p>You will receive another email after it is fully approved and converted to a PO.</p>
     {purchase_request_summary_html(req)}
     {html_button("View Purchase Requests", review_url)}
     """
     send_email_notification([requester], requester_subject, requester_body)
-
 
 def send_purchase_request_approved_email(purchase_request_id, po_number):
     req = load_purchase_request_for_email(purchase_request_id)
@@ -2493,7 +2557,7 @@ def purchase_request_status_badge(status):
     status_lower = status.lower()
     badge_class = "blue"
 
-    if status_lower in ["submitted", "under review", "needs more info"]:
+    if status_lower in ["submitted", "under review", "needs more info", "pending admin approval", "pending executive approval"]:
         badge_class = "amber"
     elif status_lower in ["approved", "converted to po", "auto approved"]:
         badge_class = "green"
@@ -2553,6 +2617,8 @@ def load_purchase_request_stats():
             SUM(CASE WHEN RequestStatus = 'Submitted' THEN 1 ELSE 0 END) AS SubmittedRequests,
             SUM(CASE WHEN RequestStatus = 'Under Review' THEN 1 ELSE 0 END) AS UnderReviewRequests,
             SUM(CASE WHEN RequestStatus = 'Needs More Info' THEN 1 ELSE 0 END) AS NeedsMoreInfoRequests,
+            SUM(CASE WHEN RequestStatus = 'Pending Admin Approval' THEN 1 ELSE 0 END) AS PendingAdminRequests,
+            SUM(CASE WHEN RequestStatus = 'Pending Executive Approval' THEN 1 ELSE 0 END) AS PendingExecutiveRequests,
             SUM(CASE WHEN RequestStatus = 'Approved' THEN 1 ELSE 0 END) AS ApprovedRequests,
             SUM(CASE WHEN RequestStatus = 'Rejected' THEN 1 ELSE 0 END) AS RejectedRequests,
             SUM(CASE WHEN RequestStatus = 'Converted to PO' THEN 1 ELSE 0 END) AS ConvertedRequests,
@@ -2571,6 +2637,8 @@ def load_purchase_request_stats():
         "submitted_requests": row.SubmittedRequests or 0,
         "under_review_requests": row.UnderReviewRequests or 0,
         "needs_more_info_requests": row.NeedsMoreInfoRequests or 0,
+        "pending_admin_requests": row.PendingAdminRequests or 0,
+        "pending_executive_requests": row.PendingExecutiveRequests or 0,
         "approved_requests": row.ApprovedRequests or 0,
         "rejected_requests": row.RejectedRequests or 0,
         "converted_requests": row.ConvertedRequests or 0,
@@ -2582,6 +2650,7 @@ def load_purchase_requests(limit=100):
     conn = get_sql_connection()
     cursor = conn.cursor()
     ensure_purchase_request_project_code_column(cursor)
+    ensure_purchase_request_approval_columns(cursor)
     conn.commit()
 
     req_where, req_params = purchase_request_visibility_sql("pr")
@@ -2607,7 +2676,12 @@ def load_purchase_requests(limit=100):
             ReviewedAt,
             ReviewNotes,
             ConvertedPONumber,
-            UpdatedAt
+            UpdatedAt,
+            AdminApprovedBy,
+            AdminApprovedAt,
+            ExecutiveApprovedBy,
+            ExecutiveApprovedAt,
+            ApprovalRequirement
         FROM dbo.PurchaseRequests pr
         WHERE {req_where}
         ORDER BY RequestedAt DESC;
@@ -2672,6 +2746,7 @@ def create_purchase_request(form, files=None):
 
     try:
         ensure_purchase_request_project_code_column(cursor)
+        ensure_purchase_request_approval_columns(cursor)
         project_row = validate_selected_project(cursor, selected_project_value)
         project_code = clean_text(getattr(project_row, "ProjectCode", ""))
         project_name = clean_text(getattr(project_row, "ProjectName", ""))
@@ -2694,10 +2769,11 @@ def create_purchase_request(form, files=None):
                     RequestDescription,
                     EstimatedAmount,
                     Priority,
-                    RequestStatus
+                    RequestStatus,
+                    ApprovalRequirement
                 )
             OUTPUT INSERTED.PurchaseRequestId
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Submitted');
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Submitted', ?);
             """,
             request_number,
             user["email"],
@@ -2711,6 +2787,7 @@ def create_purchase_request(form, files=None):
             request_description,
             estimated_amount,
             priority,
+            approval_requirement_label(estimated_amount),
         )
 
         purchase_request_id = cursor.fetchone().PurchaseRequestId
@@ -2908,22 +2985,25 @@ def update_purchase_request_status(form):
     user = get_current_user()
 
     purchase_request_id = clean_text(form.get("purchase_request_id"))
-    request_status = clean_text(form.get("request_status"))
+    requested_status = clean_text(form.get("request_status"))
     reviewer_email = clean_text(form.get("reviewer_email")) or user["email"]
     review_notes = clean_text(form.get("review_notes"))
     converted_po_number = clean_text(form.get("converted_po_number"))
     created_or_converted_po = ""
+    pending_email_role = ""
 
     valid_statuses = [
         "Submitted",
         "Under Review",
         "Needs More Info",
+        "Pending Admin Approval",
+        "Pending Executive Approval",
         "Approved",
         "Rejected",
         "Converted to PO",
     ]
 
-    if request_status not in valid_statuses:
+    if requested_status not in valid_statuses:
         raise ValueError("Invalid request status.")
 
     if not purchase_request_id:
@@ -2933,24 +3013,94 @@ def update_purchase_request_status(form):
     cursor = conn.cursor()
 
     try:
-        cursor.execute("SELECT TOP 1 Department FROM dbo.PurchaseRequests WHERE PurchaseRequestId = ?;", purchase_request_id)
+        ensure_purchase_request_approval_columns(cursor)
+        conn.commit()
+        cursor.execute(
+            """
+            SELECT TOP 1 Department, EstimatedAmount, AdminApprovedBy, ExecutiveApprovedBy, ConvertedPONumber
+            FROM dbo.PurchaseRequests
+            WHERE PurchaseRequestId = ?;
+            """,
+            purchase_request_id,
+        )
         request_row = cursor.fetchone()
-        request_department = clean_text(getattr(request_row, "Department", "")) if request_row else ""
-        reviewer_role = normalize_role(get_user_access().get("role"))
-        if reviewer_role == "Division Manager - Diving" and request_department.lower() == "dredging":
-            raise ValueError("Division Manager - Diving cannot update Dredging purchase requests.")
+        if not request_row:
+            raise ValueError("Purchase request was not found.")
 
-        if request_status in ["Approved", "Converted to PO"]:
-            converted_po_number = create_or_update_po_from_purchase_request(cursor, purchase_request_id, converted_po_number)
-            created_or_converted_po = converted_po_number
-            request_status = "Converted to PO"
-            auto_note = f"Approved and auto-created PO {converted_po_number}."
-            if review_notes:
-                if auto_note not in review_notes:
-                    review_notes = review_notes + "\n" + auto_note
+        amount = clean_decimal(getattr(request_row, "EstimatedAmount", 0))
+        needs_exec = requires_executive_approval(amount)
+        reviewer_role = normalize_role(get_user_access().get("role"))
+
+        if requested_status in ["Approved", "Converted to PO"]:
+            if reviewer_role not in ["Admin", "Executive"]:
+                raise ValueError("Only Admin and Executive users can approve purchase requests under the July 1 approval workflow.")
+
+            admin_approved = bool(clean_text(getattr(request_row, "AdminApprovedBy", "")))
+            executive_approved = bool(clean_text(getattr(request_row, "ExecutiveApprovedBy", "")))
+
+            if reviewer_role == "Admin":
+                admin_approved = True
+                cursor.execute(
+                    """
+                    UPDATE dbo.PurchaseRequests
+                    SET AdminApprovedBy = ?,
+                        AdminApprovedAt = COALESCE(AdminApprovedAt, SYSUTCDATETIME()),
+                        ApprovalRequirement = ?
+                    WHERE PurchaseRequestId = ?;
+                    """,
+                    reviewer_email,
+                    approval_requirement_label(amount),
+                    purchase_request_id,
+                )
+            elif reviewer_role == "Executive":
+                if not needs_exec:
+                    raise ValueError("This request is below $3,000 and only requires Admin approval.")
+                executive_approved = True
+                cursor.execute(
+                    """
+                    UPDATE dbo.PurchaseRequests
+                    SET ExecutiveApprovedBy = ?,
+                        ExecutiveApprovedAt = COALESCE(ExecutiveApprovedAt, SYSUTCDATETIME()),
+                        ApprovalRequirement = ?
+                    WHERE PurchaseRequestId = ?;
+                    """,
+                    reviewer_email,
+                    approval_requirement_label(amount),
+                    purchase_request_id,
+                )
+
+            if needs_exec:
+                if not admin_approved:
+                    request_status = "Pending Admin Approval"
+                    converted_po_number = ""
+                    pending_email_role = "Admin"
+                elif not executive_approved:
+                    request_status = "Pending Executive Approval"
+                    converted_po_number = ""
+                    pending_email_role = "Executive"
+                else:
+                    converted_po_number = create_or_update_po_from_purchase_request(cursor, purchase_request_id, converted_po_number)
+                    created_or_converted_po = converted_po_number
+                    request_status = "Converted to PO"
             else:
-                review_notes = auto_note
+                if reviewer_role != "Admin":
+                    raise ValueError("Requests below $3,000 require Admin approval.")
+                converted_po_number = create_or_update_po_from_purchase_request(cursor, purchase_request_id, converted_po_number)
+                created_or_converted_po = converted_po_number
+                request_status = "Converted to PO"
+
+            approval_note = f"{reviewer_role} approval recorded by {reviewer_email}."
+            if created_or_converted_po:
+                approval_note += f" Fully approved and auto-created PO {created_or_converted_po}."
+            elif pending_email_role:
+                approval_note += f" Waiting for {pending_email_role} approval."
+            if review_notes:
+                if approval_note not in review_notes:
+                    review_notes = review_notes + "\n" + approval_note
+            else:
+                review_notes = approval_note
         else:
+            request_status = requested_status
             converted_po_number = ""
 
         cursor.execute(
@@ -2962,6 +3112,7 @@ def update_purchase_request_status(form):
                 ReviewedAt = SYSUTCDATETIME(),
                 ReviewNotes = ?,
                 ConvertedPONumber = ?,
+                ApprovalRequirement = ?,
                 UpdatedAt = SYSUTCDATETIME()
             WHERE PurchaseRequestId = ?;
             """,
@@ -2969,6 +3120,7 @@ def update_purchase_request_status(form):
             reviewer_email,
             review_notes,
             converted_po_number,
+            approval_requirement_label(amount),
             purchase_request_id,
         )
 
@@ -2980,6 +3132,12 @@ def update_purchase_request_status(form):
 
     finally:
         conn.close()
+
+    if pending_email_role:
+        try:
+            send_purchase_request_pending_approval_email(purchase_request_id, pending_email_role)
+        except Exception as email_error:
+            print(f"Purchase request pending approval email failed: {email_error}")
 
     if created_or_converted_po:
         try:
@@ -5665,9 +5823,8 @@ def purchase_request():
                     <table>
                         <tr><th>Estimated Cost</th><th>Likely Review</th></tr>
                         <tr><td>Under $500</td><td><span class="badge green">Quick review</span></td></tr>
-                        <tr><td>$500 - $3,000</td><td><span class="badge blue">PM / Accounting</span></td></tr>
-                        <tr><td>$3,000 - $10,000</td><td><span class="badge amber">PM + Accounting</span></td></tr>
-                        <tr><td>Over $10,000</td><td><span class="badge purple">Executive likely</span></td></tr>
+                        <tr><td>Under $3,000</td><td><span class="badge blue">Admin approval</span></td></tr>
+                        <tr><td>$3,000 and up</td><td><span class="badge purple">Admin + Executive approval</span></td></tr>
                     </table>
                 </div>
 
@@ -5723,6 +5880,8 @@ def purchase_requests():
             {status_card("Submitted", stats["submitted_requests"], "Submitted", "amber", "Waiting for action")}
             {status_card("Under Review", stats["under_review_requests"], "Under Review", "purple", "Currently being reviewed")}
             {status_card("Needs More Info", stats.get("needs_more_info_requests", 0), "Needs More Info", "amber", "Returned for clarification")}
+            {status_card("Pending Admin", stats.get("pending_admin_requests", 0), "Pending Admin Approval", "amber", "Admin approval needed")}
+            {status_card("Pending Executive", stats.get("pending_executive_requests", 0), "Pending Executive Approval", "purple", "Executive approval needed")}
             {status_card("Approved", stats["approved_requests"], "Approved", "green", "Ready for PO action")}
             {status_card("Converted", stats["converted_requests"], "Converted to PO", "green", "Linked to issued PO")}
         </div>
@@ -5737,7 +5896,7 @@ def purchase_requests():
                 description = description[:160] + "..."
 
             status_options = ""
-            for status in ["Submitted", "Under Review", "Needs More Info", "Approved", "Rejected", "Converted to PO"]:
+            for status in ["Submitted", "Under Review", "Needs More Info", "Pending Admin Approval", "Pending Executive Approval", "Approved", "Rejected", "Converted to PO"]:
                 selected = " selected" if status == row.RequestStatus else ""
                 status_options += f'<option value="{h(status)}"{selected}>{h(status)}</option>'
 
@@ -5873,171 +6032,269 @@ def my_dashboard():
         pr_stats = load_purchase_request_stats()
         po_setup_action_count = count_po_setup_actions_for_current_user()
 
-        po_setup_action_card = ""
-        if po_setup_action_count:
-            po_setup_action_card = f"""
-            <div class="card action-required-card">
-                <h3>Actions Required</h3>
-                <p class="card-subtitle">You have <strong>{po_setup_action_count}</strong> PO information item(s) that need payment schedule or planning details.</p>
-                <p><a class="button primary" href="/project-po-setup?mine=1">Open My PO Info Tasks</a></p>
-            </div>
-            """
+        def safe_num(value):
+            try:
+                return float(value or 0)
+            except Exception:
+                return 0.0
+
+        total_value = safe_num(overall.get("total_po_value"))
+        total_line = safe_num(overall.get("total_line_amount"))
+        total_remaining = safe_num(overall.get("total_remaining_amount"))
+        committed_amount = max(total_line - total_remaining, 0)
+        utilization = (committed_amount / total_line * 100) if total_line else 0
+        open_ratio = (safe_num(overall.get("open_pos")) / safe_num(overall.get("total_pos")) * 100) if safe_num(overall.get("total_pos")) else 0
+        avg_po_size = (total_value / safe_num(overall.get("total_pos"))) if safe_num(overall.get("total_pos")) else 0
 
         vendor_rows = ""
+        max_vendor_amount = max([safe_num(getattr(row, "TotalLineAmount", 0)) for row in data["top_vendors"]] + [1])
         for row in data["top_vendors"]:
             vendor_name = clean_text(row.VendorName) or "Missing Vendor"
             vendor_url = "/vendors?vendor=" + quote_plus(vendor_name)
-            vendor_rows += f'<tr><td><a class="vendor-detail-link" href="{vendor_url}">{h(vendor_name)}</a></td><td class="right">{row.POCount}</td><td class="right">{currency(row.TotalLineAmount)}</td></tr>' 
+            amount = safe_num(row.TotalLineAmount)
+            pct = min(100, int((amount / max_vendor_amount) * 100)) if max_vendor_amount else 0
+            vendor_rows += f"""
+            <tr onclick=\"window.location='{vendor_url}'\" class=\"click-row\">
+                <td><a href=\"{vendor_url}\">{h(vendor_name)}</a><div class=\"mini-track\"><span style=\"width:{pct}%\"></span></div></td>
+                <td class=\"right\">{row.POCount}</td>
+                <td class=\"right strong\">{currency(amount)}</td>
+            </tr>"""
         if not vendor_rows:
             vendor_rows = '<tr><td colspan="3">No vendor data found.</td></tr>'
 
         project_rows = ""
-        for row in data["top_projects"]:
+        project_cards = ""
+        max_project_amount = max([safe_num(getattr(row, "TotalLineAmount", 0)) for row in data["top_projects"]] + [1])
+        donut_colors = ["#16a34a", "#84cc16", "#f59e0b", "#f97316", "#ef4444"]
+        for idx, row in enumerate(data["top_projects"]):
             project_name = clean_text(row.ProjectName) or "Unnamed Project"
             project_url = "/projects?project=" + quote_plus(project_name)
-            project_rows += f'<tr><td><a class="vendor-detail-link" href="{project_url}">{h(project_name)}</a></td><td class="right">{row.POCount}</td><td class="right">{currency(row.TotalLineAmount)}</td></tr>' 
+            amount = safe_num(row.TotalLineAmount)
+            pct = min(100, int((amount / max_project_amount) * 100)) if max_project_amount else 0
+            util_pct = min(100, max(6, pct))
+            color = donut_colors[idx % len(donut_colors)]
+            project_rows += f"""
+            <tr onclick=\"window.location='{project_url}'\" class=\"click-row\">
+                <td><a href=\"{project_url}\">{h(project_name)}</a><div class=\"mini-track\"><span style=\"width:{pct}%\"></span></div></td>
+                <td class=\"right\">{row.POCount}</td>
+                <td class=\"right strong\">{currency(amount)}</td>
+            </tr>"""
+            project_cards += f"""
+            <a class=\"util-card\" href=\"{project_url}\">
+                <div class=\"donut\" style=\"--p:{util_pct}; --c:{color};\"><span>{row.POCount}<small>POs</small></span></div>
+                <div class=\"util-name\">{h(project_name)}</div>
+                <div class=\"util-amount\">{currency(amount)}</div>
+            </a>"""
         if not project_rows:
             project_rows = '<tr><td colspan="3">No project data found.</td></tr>'
+        if not project_cards:
+            project_cards = '<div class="empty-state">No project data found.</div>'
 
-        import_rows = ""
-        for row in data["recent_imports"]:
-            badge_class = "green"
-            if row.ErrorCount and row.ErrorCount > 0:
-                badge_class = "amber"
-            if row.ImportStatus and "fail" in row.ImportStatus.lower():
-                badge_class = "red"
-            import_rows += f"<tr><td>{row.ImportBatchId}</td><td>{h(row.FileName)}</td><td>{h(row.UploadedAt)}</td><td>{row.TotalRows}</td><td>{row.SuccessCount}</td><td>{row.ErrorCount}</td><td><span class=\"badge {badge_class}\">{h(row.ImportStatus)}</span></td></tr>"
-        if not import_rows:
-            import_rows = '<tr><td colspan="7">No imports found.</td></tr>'
+        approval_pending = pr_stats.get("pending_admin_requests", 0) + pr_stats.get("pending_executive_requests", 0)
 
-        common_kpis = f"""
-        <div class="grid kpis">
-            <a class="card kpi action-card blue" href="/pos-balances#posBalancesPOListTable"><div class="label">Total POs</div><div class="value">{overall["total_pos"]}</div><div class="trend">PO list drilldown</div></a>
-            <a class="card kpi action-card green" href="/pos-balances#posBalancesPOListTable"><div class="label">Open POs</div><div class="value">{overall["open_pos"]}</div><div class="trend">Open PO drilldown</div></a>
-            <a class="card kpi action-card blue" href="/pos-balances#posBalancesPOListTable"><div class="label">Total PO Value</div><div class="value">{currency(overall["total_po_value"])}</div><div class="trend">PO value drilldown</div></a>
-            <a class="card kpi action-card blue" href="/pos-balances#posBalancesLineTable"><div class="label">Line Item Total</div><div class="value">{currency(overall["total_line_amount"])}</div><div class="trend">Line-item drilldown</div></a>
-            <a class="card kpi action-card amber" href="/pos-balances#posBalancesPOListTable"><div class="label">Remaining</div><div class="value">{currency(overall["total_remaining_amount"])}</div><div class="trend">Balance drilldown</div></a>
-            <a class="card kpi action-card blue" href="/purchase-requests?status=Submitted"><div class="label">Purchase Requests</div><div class="value">{pr_stats["submitted_requests"]}</div><div class="trend">Submitted request drilldown</div></a>
+        dashboard_css = """
+        <style>
+            .dash-hero{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;margin-bottom:18px;}
+            .dash-title h2{margin:0 0 6px 0;font-size:30px;letter-spacing:-.02em;}
+            .dash-title p{margin:0;color:#64748b;}
+            .dash-actions{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end;}
+            .exec-kpis{display:grid;grid-template-columns:repeat(6,minmax(150px,1fr));gap:14px;margin-bottom:16px;}
+            .exec-kpi{display:block;text-decoration:none;color:inherit;border:1px solid #e2e8f0;background:rgba(255,255,255,.9);border-radius:16px;padding:16px;box-shadow:0 10px 24px rgba(15,23,42,.05);transition:.15s ease;}
+            .exec-kpi:hover,.click-row:hover,.util-card:hover,.assignment-card:hover,.status-item:hover{transform:translateY(-2px);box-shadow:0 12px 30px rgba(15,23,42,.10);}
+            .kpi-top{display:flex;gap:10px;align-items:center;margin-bottom:8px;}
+            .kpi-icon{width:38px;height:38px;border-radius:13px;display:grid;place-items:center;color:white;font-weight:800;}
+            .kpi-icon.blue{background:#2563eb}.kpi-icon.green{background:#16a34a}.kpi-icon.purple{background:#7c3aed}.kpi-icon.amber{background:#f59e0b}.kpi-icon.red{background:#ef4444}.kpi-icon.slate{background:#475569}
+            .exec-kpi .label{font-size:13px;color:#475569;font-weight:700;}.exec-kpi .value{font-size:25px;font-weight:850;color:#0f172a;line-height:1.2;}.exec-kpi .hint{font-size:12px;color:#64748b;margin-top:6px;}
+            .dash-grid{display:grid;grid-template-columns:1.1fr 1fr;gap:16px;margin-bottom:16px;}.dash-grid.three{grid-template-columns:1fr 1fr 1fr;}.dash-grid.wide-left{grid-template-columns:1.35fr .85fr;}
+            .dashboard-panel{background:rgba(255,255,255,.92);border:1px solid #e2e8f0;border-radius:18px;padding:18px;box-shadow:0 10px 28px rgba(15,23,42,.05);}
+            .panel-head{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:12px;}.panel-head h3{margin:0;font-size:18px;}.panel-head a{font-size:13px;text-decoration:none;font-weight:700;}
+            .forecast-strip{display:grid;grid-template-columns:repeat(5,1fr);border:1px solid #e2e8f0;border-radius:14px;overflow:hidden;}.forecast-box{padding:14px;text-align:center;border-right:1px solid #e2e8f0;}.forecast-box:last-child{border-right:0}.forecast-box b{display:block;color:#0f172a;margin-bottom:8px}.forecast-box .money{font-size:18px;font-weight:850;color:#1d4ed8}.spark{height:54px;display:flex;align-items:end;gap:5px;justify-content:center;margin-top:10px}.spark span{width:10px;background:linear-gradient(#60a5fa,#2563eb);border-radius:4px 4px 0 0;opacity:.85}
+            .util-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;}.util-card{text-align:center;text-decoration:none;color:inherit;border:1px solid #e2e8f0;border-radius:16px;padding:14px;background:#fff;}.donut{width:86px;height:86px;margin:0 auto 8px;border-radius:50%;background:conic-gradient(var(--c) calc(var(--p)*1%),#e5e7eb 0);display:grid;place-items:center;}.donut span{width:58px;height:58px;border-radius:50%;background:white;display:grid;place-items:center;font-weight:850;line-height:1.0}.donut small{display:block;font-size:10px;color:#64748b;font-weight:600}.util-name{font-size:12px;font-weight:700;color:#334155;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.util-amount{font-size:14px;font-weight:850;color:#0f172a;margin-top:4px;}
+            .click-row{cursor:pointer;transition:.15s ease;}.click-row a{text-decoration:none;font-weight:750}.strong{font-weight:800}.mini-track{height:6px;background:#e2e8f0;border-radius:999px;margin-top:7px;overflow:hidden}.mini-track span{display:block;height:100%;background:linear-gradient(90deg,#60a5fa,#2563eb);border-radius:999px;}
+            .status-list{display:grid;gap:10px}.status-item{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:12px;border:1px solid #e2e8f0;border-radius:13px;background:#fff;text-decoration:none;color:inherit}.status-item b{font-size:22px}.status-item .red{color:#dc2626}.status-item .amber{color:#d97706}.status-item .green{color:#16a34a}.status-item .blue{color:#2563eb}
+            .assignment-list{display:grid;gap:10px}.assignment-card{display:flex;justify-content:space-between;gap:14px;align-items:center;padding:13px;border-radius:14px;border:1px solid #e2e8f0;background:#fff;text-decoration:none;color:inherit;transition:.15s ease}.assignment-card .title{font-weight:800}.assignment-card .sub{font-size:13px;color:#64748b}.empty-state{padding:22px;text-align:center;color:#64748b;border:1px dashed #cbd5e1;border-radius:14px;}
+            @media(max-width:1300px){.exec-kpis{grid-template-columns:repeat(3,1fr)}.dash-grid,.dash-grid.three,.dash-grid.wide-left{grid-template-columns:1fr}.util-grid{grid-template-columns:repeat(2,1fr)}}
+        </style>
+        """
+
+        def kpi(label, value, icon, color, href, hint):
+            return f"""
+            <a class=\"exec-kpi\" href=\"{href}\">
+                <div class=\"kpi-top\"><div class=\"kpi-icon {color}\">{icon}</div><div class=\"label\">{label}</div></div>
+                <div class=\"value\">{value}</div>
+                <div class=\"hint\">{hint}</div>
+            </a>"""
+
+        kpis = f"""
+        <div class=\"exec-kpis\">
+            {kpi("Total Open PO Amount", currency(total_remaining), "$", "blue", "/pos-balances#posBalancesPOListTable", "Click for balance drilldown")}
+            {kpi("Total Committed", currency(committed_amount), "✓", "purple", "/pos-balances#posBalancesLineTable", "Posted/spent line activity")}
+            {kpi("Total PO Value", currency(total_value), "Σ", "green", "/pos-balances#posBalancesPOListTable", "All visible POs")}
+            {kpi("POs Outstanding", overall["open_pos"], "PO", "amber", "/pos-balances#posBalancesPOListTable", f"{overall['total_pos']} total visible POs")}
+            {kpi("Avg. PO Size", currency(avg_po_size), "Ø", "slate", "/pos-balances#posBalancesPOListTable", "Average visible PO value")}
+            {kpi("Open Utilization", f"{utilization:.0f}%", "%", "red" if utilization >= 80 else "green", "/projects", "Committed vs line total")}
         </div>
         """
 
-        if role == "Admin":
-            role_content = f"""
-            {common_kpis}
-            <div class="grid two">
-                <div class="card">
-                    <h3>Admin Control Center</h3>
-                    <p class="card-subtitle">Security, user access, uploads, purchase requests, and exports.</p>
-                    <p><a class="button primary" href="/user-access">Manage User Access</a></p>
-                    <p><a class="button" href="/purchase-requests">Review Purchase Requests</a></p>
-                    <p><a class="button" href="/purchase-request">Create Purchase Request</a></p>
-                    <p><a class="button" href="/upload-po">Upload Issued POs</a></p>
-                    <p><a class="button" href="/import-history">Review Import History</a></p>
-                    <p><a class="button" href="/exports">Download CSV Exports</a></p>
-                </div>
-                <div class="card">
-                    <h3>Admin Health Snapshot</h3>
-                    <table>
-                        <tr><th>Active Dashboard Users</th><td>{data["active_user_count"]}</td></tr>
-                        <tr><th>Import Errors</th><td>{data["import_error_count"]}</td></tr>
-                        <tr><th>Submitted Purchase Requests</th><td>{pr_stats["submitted_requests"]}</td></tr>
-                        <tr><th>Amount Mismatch Flags</th><td>{overall["amount_mismatch_count"]}</td></tr>
-                    </table>
-                </div>
+        forecast = f"""
+        <div class=\"dashboard-panel\">
+            <div class=\"panel-head\"><h3>Cash Out Forecast / Open PO Exposure</h3><a href=\"/pos-balances\">View PO balances ›</a></div>
+            <div class=\"forecast-strip\">
+                <div class=\"forecast-box\"><b>Open Now</b><span class=\"money\">{currency(total_remaining)}</span><div class=\"spark\"><span style=\"height:25%\"></span><span style=\"height:42%\"></span><span style=\"height:35%\"></span><span style=\"height:55%\"></span></div></div>
+                <div class=\"forecast-box\"><b>Committed</b><span class=\"money\">{currency(committed_amount)}</span><div class=\"spark\"><span style=\"height:45%\"></span><span style=\"height:34%\"></span><span style=\"height:60%\"></span><span style=\"height:72%\"></span></div></div>
+                <div class=\"forecast-box\"><b>Line Total</b><span class=\"money\">{currency(total_line)}</span><div class=\"spark\"><span style=\"height:55%\"></span><span style=\"height:68%\"></span><span style=\"height:80%\"></span><span style=\"height:62%\"></span></div></div>
+                <div class=\"forecast-box\"><b>Open Ratio</b><span class=\"money\">{open_ratio:.0f}%</span><div class=\"spark\"><span style=\"height:34%\"></span><span style=\"height:48%\"></span><span style=\"height:77%\"></span><span style=\"height:41%\"></span></div></div>
+                <div class=\"forecast-box\"><b>Requests</b><span class=\"money\">{pr_stats['total_requests']}</span><div class=\"spark\"><span style=\"height:38%\"></span><span style=\"height:58%\"></span><span style=\"height:46%\"></span><span style=\"height:66%\"></span></div></div>
+            </div>
+            <p class=\"card-subtitle\" style=\"text-align:center;margin-top:18px;\">Total visible open balance: <strong>{currency(total_remaining)}</strong></p>
+        </div>
+        """
+
+        project_utilization = f"""
+        <div class=\"dashboard-panel\">
+            <div class=\"panel-head\"><h3>PO Activity by Project</h3><a href=\"/projects\">View all projects ›</a></div>
+            <div class=\"util-grid\">{project_cards}</div>
+        </div>
+        """
+
+        request_summary = f"""
+        <div class=\"dashboard-panel\">
+            <div class=\"panel-head\"><h3>Purchase Requests Summary</h3><a href=\"/purchase-requests\">View requests ›</a></div>
+            <div class=\"status-list\">
+                <a class=\"status-item\" href=\"/purchase-requests?status=Submitted\"><span>New / Submitted</span><b class=\"blue\">{pr_stats['submitted_requests']}</b></a>
+                <a class=\"status-item\" href=\"/purchase-requests?status=Pending Admin Approval\"><span>Pending Admin Approval</span><b class=\"amber\">{pr_stats['pending_admin_requests']}</b></a>
+                <a class=\"status-item\" href=\"/purchase-requests?status=Pending Executive Approval\"><span>Pending Executive Approval</span><b class=\"amber\">{pr_stats['pending_executive_requests']}</b></a>
+                <a class=\"status-item\" href=\"/purchase-requests?status=Converted to PO\"><span>Converted to PO</span><b class=\"green\">{pr_stats['converted_requests']}</b></a>
+                <a class=\"status-item\" href=\"/purchase-requests?status=Rejected\"><span>Rejected</span><b class=\"red\">{pr_stats['rejected_requests']}</b></a>
+            </div>
+        </div>
+        """
+
+        top_vendor_panel = f"""
+        <div class=\"dashboard-panel\">
+            <div class=\"panel-head\"><h3>Top Vendors by PO Amount</h3><a href=\"/vendors\">View all vendors ›</a></div>
+            <div class=\"table-wrap\"><table><tr><th>Vendor</th><th class=\"right\">POs</th><th class=\"right\">Amount</th></tr>{vendor_rows}</table></div>
+        </div>
+        """
+
+        top_project_panel = f"""
+        <div class=\"dashboard-panel\">
+            <div class=\"panel-head\"><h3>Top Projects by PO Amount</h3><a href=\"/projects\">View all projects ›</a></div>
+            <div class=\"table-wrap\"><table><tr><th>Project</th><th class=\"right\">POs</th><th class=\"right\">Amount</th></tr>{project_rows}</table></div>
+        </div>
+        """
+
+        admin_assignments = f"""
+        <div class=\"dashboard-panel\">
+            <div class=\"panel-head\"><h3>Admin Assignments & Controls</h3><a href=\"/user-access\">User access ›</a></div>
+            <div class=\"assignment-list\">
+                <a class=\"assignment-card\" href=\"/purchase-requests\"><div><div class=\"title\">Approval queue</div><div class=\"sub\">Admin and Executive approval work</div></div><strong>{approval_pending}</strong></a>
+                <a class=\"assignment-card\" href=\"/project-po-setup?mine=1\"><div><div class=\"title\">PO setup items</div><div class=\"sub\">Payment schedule / planning details</div></div><strong>{po_setup_action_count}</strong></a>
+                <a class=\"assignment-card\" href=\"/pos-balances#posBalancesPOListTable\"><div><div class=\"title\">Amount mismatch flags</div><div class=\"sub\">PO header vs line total review</div></div><strong>{overall['amount_mismatch_count']}</strong></a>
+                <a class=\"assignment-card\" href=\"/user-access\"><div><div class=\"title\">Active users</div><div class=\"sub\">Users enabled in Command Center</div></div><strong>{data['active_user_count']}</strong></a>
+                <a class=\"assignment-card\" href=\"/admin/clear-expense-data\"><div><div class=\"title\">Expense reset tool</div><div class=\"sub\">Admin-only clean upload support</div></div><strong>Open</strong></a>
+            </div>
+        </div>
+        """
+
+        manager_assignments = f"""
+        <div class=\"dashboard-panel\">
+            <div class=\"panel-head\"><h3>My Assignment Snapshot</h3><a href=\"/purchase-request\">New request ›</a></div>
+            <div class=\"assignment-list\">
+                <a class=\"assignment-card\" href=\"/purchase-request\"><div><div class=\"title\">Submit a purchase request</div><div class=\"sub\">Start a new request for your visible projects</div></div><strong>New</strong></a>
+                <a class=\"assignment-card\" href=\"/purchase-requests\"><div><div class=\"title\">Visible request queue</div><div class=\"sub\">Role-filtered requests</div></div><strong>{pr_stats['total_requests']}</strong></a>
+                <a class=\"assignment-card\" href=\"/projects\"><div><div class=\"title\">Visible projects</div><div class=\"sub\">Open project PO information</div></div><strong>{len(data['top_projects'])}</strong></a>
+                <a class=\"assignment-card\" href=\"/pos-balances\"><div><div class=\"title\">Visible open POs</div><div class=\"sub\">Role-filtered PO balances</div></div><strong>{overall['open_pos']}</strong></a>
+            </div>
+        </div>
+        """
+
+        bookkeeping_lookup = f"""
+        <div class=\"dashboard-panel\">
+            <div class=\"panel-head\"><h3>PO Lookup Tools</h3><a href=\"/pos-balances\">Open PO lookup ›</a></div>
+            <div class=\"assignment-list\">
+                <a class=\"assignment-card\" href=\"/pos-balances\"><div><div class=\"title\">Search POs & balances</div><div class=\"sub\">Amounts, balances, and packet links</div></div><strong>{overall['total_pos']}</strong></a>
+                <a class=\"assignment-card\" href=\"/vendors\"><div><div class=\"title\">Vendor lookup</div><div class=\"sub\">Find POs by vendor</div></div><strong>{len(data['top_vendors'])}</strong></a>
+                <a class=\"assignment-card\" href=\"/projects\"><div><div class=\"title\">Project lookup</div><div class=\"sub\">View PO information by project</div></div><strong>{len(data['top_projects'])}</strong></a>
+            </div>
+        </div>
+        """
+
+        executive_summary = f"""
+        <div class=\"dashboard-panel\">
+            <div class=\"panel-head\"><h3>Executive Summary</h3><a href=\"/purchase-requests\">Open approvals ›</a></div>
+            <p>Total visible open PO balance is <strong>{currency(total_remaining)}</strong> across <strong>{overall['open_pos']}</strong> open POs.</p>
+            <p>Current approval queue contains <strong>{approval_pending}</strong> request(s), with <strong>{pr_stats['pending_executive_requests']}</strong> awaiting Executive approval.</p>
+            <p>Top project and vendor rows are clickable for drilldown.</p>
+            <div class=\"notice warning\" style=\"margin-top:12px;\">Recommendation: review high-utilization projects and any pending approval items before approving additional spend.</div>
+        </div>
+        """
+
+        title_by_role = {
+            "Admin": "Admin Command Center Dashboard",
+            "Executive": "Executive Command Center Dashboard",
+            "Project Manager - Dredging Only": "Dredging Project Manager Dashboard",
+            "Project Manager - Diving": "Diving Project Manager Dashboard",
+            "Division Manager - Diving": "Diving Division Manager Dashboard",
+            "Purchaser - All Departments": "Purchasing Dashboard",
+            "Bookkeeping - All Departments": "Bookkeeping PO Lookup Dashboard",
+        }
+        dashboard_title = title_by_role.get(role, "Command Center Dashboard")
+
+        po_setup_action_card = ""
+        if po_setup_action_count:
+            po_setup_action_card = f"""
+            <div class=\"dashboard-panel\" style=\"border-color:#f59e0b;background:#fffbeb;margin-bottom:16px;\">
+                <div class=\"panel-head\"><h3>Actions Required</h3><a href=\"/project-po-setup?mine=1\">Open tasks ›</a></div>
+                <p>You have <strong>{po_setup_action_count}</strong> PO information item(s) that need payment schedule or planning details.</p>
             </div>
             """
-        elif role == "Executive":
-            role_content = f"""
-            {common_kpis}
-            <div class="grid two">
-                <div class="card">
-                    <h3>Executive Actions</h3>
-                    <p class="card-subtitle">High-level procurement and request review tools.</p>
-                    <p><a class="button primary" href="/po-summary">Open PO Summary</a></p>
-                    <p><a class="button" href="/purchase-requests">Review Purchase Requests</a></p>
-                    <p><a class="button" href="/purchase-request">Create Purchase Request</a></p>
-                    <p><a class="button" href="/project-po-setup">PO Info Review</a></p>
-                    <p><a class="button" href="/exceptions">Review Data Exceptions</a></p>
-                    <p><a class="button" href="/exports">Download Exports</a></p>
-                </div>
-                <div class="card">
-                    <h3>Risk Snapshot</h3>
-                    <table>
-                        <tr><th>Submitted Requests</th><td>{pr_stats["submitted_requests"]}</td></tr>
-                        <tr><th>Amount Mismatch Flags</th><td>{overall["amount_mismatch_count"]}</td></tr>
-                        <tr><th>Import Errors</th><td>{data["import_error_count"]}</td></tr>
-                        <tr><th>Open POs</th><td>{overall["open_pos"]}</td></tr>
-                    </table>
-                </div>
-            </div>
+
+        if role == "Executive":
+            main_content = f"""
+            {kpis}
+            <div class=\"dash-grid wide-left\">{forecast}{project_utilization}</div>
+            <div class=\"dash-grid three\">{top_vendor_panel}{request_summary}{executive_summary}</div>
+            <div class=\"dash-grid two\">{top_project_panel}{project_utilization}</div>
             """
-        elif role == "Purchaser - All Departments":
-            role_content = f"""
-            {common_kpis}
-            <div class="grid two">
-                <div class="card">
-                    <h3>Purchaser Workspace</h3>
-                    <p class="card-subtitle">Submit and view purchase requests and look up POs across all departments.</p>
-                    <p><a class="button primary" href="/purchase-request">Create Purchase Request</a></p>
-                    <p><a class="button" href="/purchase-requests">View Purchase Requests</a></p>
-                    <p><a class="button" href="/pos-balances">Open POs & Balances</a></p>
-                    <p><a class="button" href="/projects">Open Projects</a></p>
-                    <p><a class="button" href="/vendors">Open Vendors</a></p>
-                    <p><a class="button" href="/import-history">Review Import History</a></p>
-                </div>
-                <div class="card">
-                    <h3>Import / Request Snapshot</h3>
-                    <table>
-                        <tr><th>Submitted Requests</th><td>{pr_stats["submitted_requests"]}</td></tr>
-                        <tr><th>Import Errors</th><td>{data["import_error_count"]}</td></tr>
-                        <tr><th>Amount Mismatch Flags</th><td>{overall["amount_mismatch_count"]}</td></tr>
-                        <tr><th>Total POs</th><td>{overall["total_pos"]}</td></tr>
-                    </table>
-                </div>
-            </div>
+        elif role == "Admin":
+            main_content = f"""
+            {kpis}
+            <div class=\"dash-grid wide-left\">{admin_assignments}{request_summary}</div>
+            <div class=\"dash-grid two\">{forecast}{project_utilization}</div>
+            <div class=\"dash-grid two\">{top_vendor_panel}{top_project_panel}</div>
             """
         elif role in ["Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving"]:
-            role_content = f"""
-            {common_kpis}
-            <div class="grid two">
-                <div class="card">
-                    <h3>Project Manager Workspace</h3>
-                    <p class="card-subtitle">Submit purchase requests and review issued POs.</p>
-                    <p><a class="button primary" href="/purchase-request">Create Purchase Request</a></p>
-                    <p><a class="button" href="/po-list">Browse PO List</a></p>
-                    <p><a class="button" href="/po-detail">Search PO Detail</a></p>
-                    <p><a class="button" href="/pos-balances">Open POs & Balances</a></p>
-                </div>
-                <div class="card"><h3>Top Projects</h3><div class="table-wrap"><table><tr><th>Project</th><th class="right">POs</th><th class="right">Line Total</th></tr>{project_rows}</table></div></div>
-            </div>
+            main_content = f"""
+            {kpis}
+            <div class=\"dash-grid wide-left\">{manager_assignments}{request_summary}</div>
+            <div class=\"dash-grid two\">{top_project_panel}{project_utilization}</div>
+            <div class=\"dash-grid two\">{forecast}{top_vendor_panel}</div>
+            """
+        elif role == "Purchaser - All Departments":
+            main_content = f"""
+            {kpis}
+            <div class=\"dash-grid wide-left\">{manager_assignments}{request_summary}</div>
+            <div class=\"dash-grid two\">{top_vendor_panel}{top_project_panel}</div>
             """
         else:
-            role_content = f"""
-            {common_kpis}
-            <div class="grid two">
-                <div class="card">
-                    <h3>Bookkeeping Lookup</h3>
-                    <p class="card-subtitle">Read-only PO lookup across all departments, including amounts, balances, and packets.</p>
-                    <p><a class="button primary" href="/pos-balances">Open POs & Balances</a></p>
-                    <p><a class="button" href="/projects">Open Projects</a></p>
-                    <p><a class="button" href="/vendors">Open Vendors</a></p>
-                    <p><a class="button" href="/po-detail">Search PO Detail</a></p>
-                </div>
-                <div class="card"><h3>Top Vendors</h3><div class="table-wrap"><table><tr><th>Vendor</th><th class="right">POs</th><th class="right">Line Total</th></tr>{vendor_rows}</table></div></div>
-            </div>
+            main_content = f"""
+            {kpis}
+            <div class=\"dash-grid wide-left\">{bookkeeping_lookup}{top_vendor_panel}</div>
+            <div class=\"dash-grid two\">{top_project_panel}{forecast}</div>
             """
 
         content = f"""
-        <div class="card"><h3>Welcome, {h(display_name)}</h3><p class="card-subtitle">This dashboard is customized for your role: <strong>{h(role)}</strong>.</p></div>
-        {po_setup_action_card}
-        {role_content}
-        <div class="grid two">
-            <div class="card"><h3>Top Vendors</h3><div class="table-wrap"><table><tr><th>Vendor</th><th class="right">POs</th><th class="right">Line Total</th></tr>{vendor_rows}</table></div></div>
-            <div class="card"><h3>Top Projects</h3><div class="table-wrap"><table><tr><th>Project</th><th class="right">POs</th><th class="right">Line Total</th></tr>{project_rows}</table></div></div>
+        {dashboard_css}
+        <div class=\"dash-hero\">
+            <div class=\"dash-title\"><h2>{h(dashboard_title)}</h2><p>Welcome, {h(display_name)}. This view is filtered for <strong>{h(role)}</strong>.</p></div>
+            <div class=\"dash-actions\"><a class=\"button\" href=\"/help-center\">Help Center</a><a class=\"button primary\" href=\"/pos-balances\">Open PO Drilldown</a></div>
         </div>
+        {po_setup_action_card}
+        {main_content}
         """
 
-        return shell("My Dashboard", f"Personalized procurement dashboard for {role}.", "My Dashboard", content)
+        return shell("My Dashboard", f"Personalized Command Center dashboard for {role}.", "My Dashboard", content)
 
     except Exception as e:
         content = f'<div class="notice error">Error loading personal dashboard: {h(e)}</div>'
@@ -6857,7 +7114,7 @@ def approver_queue():
             return redirect("/approver-queue?toast=" + quote_plus("Error updating approval item: " + str(e)) + "&toast_type=error")
 
     try:
-        rows = [row for row in load_purchase_requests(200) if (row.RequestStatus or "Submitted") in ["Submitted", "Under Review", "Needs More Info"]]
+        rows = [row for row in load_purchase_requests(200) if (row.RequestStatus or "Submitted") in ["Submitted", "Under Review", "Needs More Info", "Pending Admin Approval", "Pending Executive Approval"]]
         selected_id = clean_text(request.args.get("request_id"))
         selected = None
         if selected_id:
@@ -6886,7 +7143,7 @@ def approver_queue():
         detail_html = ""
         if selected:
             status_options = ""
-            for status in ["Submitted", "Under Review", "Needs More Info", "Approved", "Rejected", "Converted to PO"]:
+            for status in ["Submitted", "Under Review", "Needs More Info", "Pending Admin Approval", "Pending Executive Approval", "Approved", "Rejected", "Converted to PO"]:
                 selected_option = " selected" if status == selected.RequestStatus else ""
                 status_options += f'<option value="{h(status)}"{selected_option}>{h(status)}</option>'
             approve_form = action_form(selected.PurchaseRequestId, "Approved", "Approve", "primary")
