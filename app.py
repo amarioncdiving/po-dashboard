@@ -144,6 +144,7 @@ PAGE_ACCESS = {
     "Exceptions": ["Admin", "Executive"],
     "Exports": ["Admin", "Executive"],
     "User Access": ["Admin", "Executive"],
+    "Future Pages": ["Admin"],
     "Who Am I": ["Admin", "Executive", "Project Manager - Dredging Only", "Project Manager - Diving", "Division Manager - Diving", "Purchaser - All Departments", "Bookkeeping - All Departments"],
 }
 
@@ -4590,6 +4591,7 @@ def shell(title, subtitle, active, content):
 
     admin_nav_items = [
         ("User Access", "/user-access", "🔐"),
+        ("Future Pages", "/future-pages", "🧭"),
         ("Who Am I", "/whoami", "👤"),
     ]
 
@@ -9558,6 +9560,93 @@ def po_maintenance():
     </div>
     """
     return shell("PO Maintenance", "Safely edit PO numbers and project codes with an audit trail.", "PO Maintenance", content)
+
+
+@app.route("/future-pages")
+def future_pages():
+    allowed, reason = require_page_access("Future Pages")
+    if not allowed:
+        return access_denied_response("Future Pages", reason)
+
+    future_page_rows = [
+        {
+            "name": "Approver Queue",
+            "url": "/approver-queue",
+            "status": "Hidden for July 1",
+            "phase": "Phase 2 candidate",
+            "purpose": "Separate approval workspace. For July 1, approvals are handled from Purchase Requests so users have one place to review requests.",
+        },
+        {
+            "name": "Forecasting",
+            "url": "/forecasting",
+            "status": "Hidden for July 1",
+            "phase": "Phase 2 / Command Center expansion",
+            "purpose": "Future cash-out, backlog, AP/AR, labor, and project forecasting views once the underlying data model is ready.",
+        },
+        {
+            "name": "POs in PM Comments",
+            "url": "/pos-in-pm-comments",
+            "status": "Hidden from sidebar",
+            "phase": "Audit / research tool",
+            "purpose": "Read-only audit view for expenses where PO numbers were found in PM comments. Kept by direct URL to reduce overlap with Expense Upload / PO Matching.",
+        },
+        {
+            "name": "Exceptions",
+            "url": "/exceptions",
+            "status": "Hidden for July 1",
+            "phase": "Phase 2 candidate",
+            "purpose": "Future issue/exception center for over-budget POs, expired dates, unmatched transactions, and other cleanup queues.",
+        },
+        {
+            "name": "Exports",
+            "url": "/exports",
+            "status": "Hidden for July 1",
+            "phase": "Phase 2 candidate",
+            "purpose": "Export center for PO lists and issued line data. Kept out of the main navigation until export rules and permissions are finalized.",
+        },
+    ]
+
+    rows = "".join(
+        f"""
+        <tr>
+            <td><strong>{h(item['name'])}</strong><br><span class=\"muted\">{h(item['url'])}</span></td>
+            <td><span class=\"badge gray\">{h(item['status'])}</span></td>
+            <td>{h(item['phase'])}</td>
+            <td>{h(item['purpose'])}</td>
+            <td><a class=\"button secondary\" href=\"{h(item['url'])}\">Open Direct URL</a></td>
+        </tr>
+        """
+        for item in future_page_rows
+    )
+
+    content = f"""
+    <div class=\"page-heading\">
+        <div>
+            <h2 style=\"margin:0 0 8px;\">Future Pages</h2>
+            <p class=\"muted\">Admin-only parking lot for pages that exist in the app but are hidden from the main July 1 rollout navigation.</p>
+        </div>
+    </div>
+
+    <div class=\"notice info\">
+        <strong>Admin only:</strong> This page is a safe place to keep track of dormant, hidden, or future Command Center pages without exposing them to the broader team.
+    </div>
+
+    <div class=\"card\">
+        <h3>Hidden / Future Pages</h3>
+        <div class=\"table-wrap\">
+            <table>
+                <tr><th>Page</th><th>Status</th><th>Planned Phase</th><th>Why it is hidden</th><th>Admin Link</th></tr>
+                {rows}
+            </table>
+        </div>
+    </div>
+
+    <div class=\"card\">
+        <h3>Recommended Rule</h3>
+        <p>Pages should stay here until the workflow, permissions, training material, and data source are ready. When a page is ready, we can move it into the normal sidebar for the roles that should use it.</p>
+    </div>
+    """
+    return shell("Future Pages", "Admin-only list of hidden and future Command Center pages.", "Future Pages", content)
 
 @app.route("/user-access", methods=["GET", "POST"])
 def user_access():
