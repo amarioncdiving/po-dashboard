@@ -4312,13 +4312,17 @@ def load_existing_project_options():
         return []
 
 def validate_selected_project(cursor, selected_project_value):
-    """Validate a selected project from the New Purchase Request dropdown.
+    """Validate/link a project selected on a purchase request.
 
-    The dropdown now uses the same value as the Projects tab: ProjectCode when
-    available, otherwise ProjectName. This validator accepts that same value and
-    links it to the normalized Projects row. If the Projects row is missing but
-    the uploaded issued PO setup line exists, it creates only the normalized
-    Projects record from already-uploaded setup data.
+    The New Purchase Request dropdown stores values as either:
+      - ProjectCode
+      - ProjectName
+      - ProjectCode||ProjectName
+
+    Approval/PO creation also calls this validator from the saved request values,
+    so it must accept all three shapes.  The prior version treated
+    "ProjectCode||ProjectName" as one literal value, which meant the approval
+    step could fail before changing the request to Converted to PO.
     """
     selected_project = clean_text(selected_project_value)
     if not selected_project:
@@ -4326,58 +4330,94 @@ def validate_selected_project(cursor, selected_project_value):
 
     ensure_project_code_columns(cursor)
 
-    cursor.execute(
-        """
-        SELECT TOP 1 ProjectId, ProjectCode, ProjectName, Department
-        FROM dbo.Projects
-        WHERE ProjectCode = ? OR ProjectName = ?
-        ORDER BY ProjectId;
-        """,
-        selected_project,
-        selected_project,
-    )
-    project = cursor.fetchone()
-    if project:
-        return project
+    project_code = ""
+    project_name = ""
+    if "||" in selected_project:
+        parts = selected_project.split("||", 1)
+        project_code = clean_text(parts[0])
+        project_name = clean_text(parts[1])
+    else:
+        project_code = selected_project
+        project_name = selected_project
 
-    cursor.execute(
-        """
-        SELECT TOP 1
-            COALESCE(pr.ProjectCode, l.ProjectCode, '') AS ProjectCode,
-            COALESCE(pr.ProjectName, l.ProjectName, '') AS ProjectName,
-            COALESCE(NULLIF(l.Department, ''), NULLIF(pr.Department, ''), '') AS Department
-        FROM dbo.IssuedPOLines l
-        LEFT JOIN dbo.PurchaseOrders po ON l.PurchaseOrderId = po.PurchaseOrderId
-        LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
-        WHERE COALESCE(pr.ProjectCode, l.ProjectCode, '') = ?
-           OR COALESCE(pr.ProjectName, l.ProjectName, '') = ?
-        ORDER BY l.IssuedPOLineId;
-        """,
-        selected_project,
-        selected_project,
-    )
-    line_project = cursor.fetchone()
-    if not line_project:
-        raise ValueError("Selected project was not found in the same project setup data used by the Projects tab.")
+    search_values = []
+    for value in [project_code, project_name, selected_project]:
+        value = clean_text(value)
+        if value and value.lower() not in [v.lower() for v in search_values]:
+            search_values.append(value)
 
-    project_id = get_or_create_project(
-        cursor,
-        clean_text(line_project.ProjectName),
-        clean_text(line_project.Department),
-        clean_text(line_project.ProjectCode),
-    )
-    cursor.execute(
-        """
-        SELECT TOP 1 ProjectId, ProjectCode, ProjectName, Department
-        FROM dbo.Projects
-        WHERE ProjectId = ?;
-        """,
-        project_id,
-    )
-    project = cursor.fetchone()
-    if not project:
-        raise ValueError("Selected project was found in PO setup, but could not be linked to the project table.")
-    return project
+    for value in search_values:
+        cursor.execute(
+            """
+            SELECT TOP 1 ProjectId, ProjectCode, ProjectName, Department
+            FROM dbo.Projects
+            WHERE ProjectCode = ? OR ProjectName = ?
+            ORDER BY ProjectId;
+            """,
+            value,
+            value,
+        )
+        project = cursor.fetchone()
+        if project:
+            return project
+
+    for value in search_values:
+        cursor.execute(
+            """
+            SELECT TOP 1
+                COALESCE(pr.ProjectCode, l.ProjectCode, '') AS ProjectCode,
+                COALESCE(pr.ProjectName, l.ProjectName, '') AS ProjectName,
+                COALESCE(NULLIF(l.Department, ''), NULLIF(pr.Department, ''), '') AS Department
+            FROM dbo.IssuedPOLines l
+            LEFT JOIN dbo.PurchaseOrders po ON l.PurchaseOrderId = po.PurchaseOrderId
+            LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
+            WHERE COALESCE(pr.ProjectCode, l.ProjectCode, '') = ?
+               OR COALESCE(pr.ProjectName, l.ProjectName, '') = ?
+            ORDER BY l.IssuedPOLineId;
+            """,
+            value,
+            value,
+        )
+        line_project = cursor.fetchone()
+        if line_project:
+            project_id = get_or_create_project(
+                cursor,
+                clean_text(line_project.ProjectName) or project_name,
+                clean_text(line_project.Department),
+                clean_text(line_project.ProjectCode) or project_code,
+            )
+            cursor.execute(
+                """
+                SELECT TOP 1 ProjectId, ProjectCode, ProjectName, Department
+                FROM dbo.Projects
+                WHERE ProjectId = ?;
+                """,
+                project_id,
+            )
+            project = cursor.fetchone()
+            if project:
+                return project
+
+    # Last safe fallback: if the request already contains a saved project code/name,
+    # create the normalized project record from that saved request data so approval
+    # does not get stuck after a valid request was submitted.
+    fallback_name = project_name if project_name != selected_project else ""
+    fallback_code = project_code if project_code != selected_project else ""
+    if fallback_name or fallback_code:
+        project_id = get_or_create_project(cursor, fallback_name or fallback_code, "", fallback_code)
+        cursor.execute(
+            """
+            SELECT TOP 1 ProjectId, ProjectCode, ProjectName, Department
+            FROM dbo.Projects
+            WHERE ProjectId = ?;
+            """,
+            project_id,
+        )
+        project = cursor.fetchone()
+        if project:
+            return project
+
+    raise ValueError("Selected project was not found in the same project setup data used by the Projects tab.")
 
 
 
@@ -5966,7 +6006,7 @@ def purchase_requests():
                     <input type="hidden" name="purchase_request_id" value="{h(row.PurchaseRequestId)}">
                     <label>Status</label>
                     <select name="request_status" onchange="toggleConvertedPOField(this)">{status_options}</select>
-                    <small class="field-help">Selecting Approved will automatically create and link an internal app PO.</small>
+                    <small class="field-help">Selecting Approved records your approval. Under $3,000 converts after Admin approval; $3,000+ converts after both Admin and Executive approvals.</small>
                     <label>Reviewer</label>
                     <select name="reviewer_email">{reviewer_options}</select>
                     <div class="converted-po-field" style="display:{converted_display};">
