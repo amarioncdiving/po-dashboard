@@ -4379,6 +4379,49 @@ def validate_selected_project(cursor, selected_project_value):
         raise ValueError("Selected project was found in PO setup, but could not be linked to the project table.")
     return project
 
+
+
+def allowed_attachment(filename):
+    if not filename or "." not in filename:
+        return False
+    ext = filename.rsplit(".", 1)[1].lower()
+    return ext in ALLOWED_ATTACHMENT_EXTENSIONS
+
+
+def ensure_request_attachment_table(cursor):
+    cursor.execute(
+        """
+        IF OBJECT_ID('dbo.PurchaseRequestAttachments', 'U') IS NULL
+        BEGIN
+            CREATE TABLE dbo.PurchaseRequestAttachments (
+                AttachmentId INT IDENTITY(1,1) PRIMARY KEY,
+                PurchaseRequestId INT NOT NULL,
+                RequestNumber NVARCHAR(100) NULL,
+                PONumber NVARCHAR(100) NULL,
+                OriginalFileName NVARCHAR(260) NOT NULL,
+                StoredFileName NVARCHAR(260) NOT NULL,
+                StoragePath NVARCHAR(1000) NOT NULL,
+                ContentType NVARCHAR(200) NULL,
+                FileSize BIGINT NULL,
+                UploadedBy NVARCHAR(255) NULL,
+                UploadedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+            );
+        END;
+
+        IF OBJECT_ID('dbo.PurchaseRequestAttachments', 'U') IS NOT NULL
+        BEGIN
+            IF COL_LENGTH('dbo.PurchaseRequestAttachments', 'PONumber') IS NULL
+                ALTER TABLE dbo.PurchaseRequestAttachments ADD PONumber NVARCHAR(100) NULL;
+            IF COL_LENGTH('dbo.PurchaseRequestAttachments', 'RequestNumber') IS NULL
+                ALTER TABLE dbo.PurchaseRequestAttachments ADD RequestNumber NVARCHAR(100) NULL;
+            IF COL_LENGTH('dbo.PurchaseRequestAttachments', 'UploadedBy') IS NULL
+                ALTER TABLE dbo.PurchaseRequestAttachments ADD UploadedBy NVARCHAR(255) NULL;
+            IF COL_LENGTH('dbo.PurchaseRequestAttachments', 'UploadedAt') IS NULL
+                ALTER TABLE dbo.PurchaseRequestAttachments ADD UploadedAt DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME();
+        END;
+        """
+    )
+
 def save_purchase_request_attachments(cursor, purchase_request_id, request_number, files):
     files = files or []
     saved = []
