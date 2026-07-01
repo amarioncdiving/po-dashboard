@@ -7996,6 +7996,7 @@ def missing_po_review():
         return shell("Missing PO Review", "Unable to load missing PO review.", "Missing PO Review", f'<div class="notice error">Error loading Missing PO Review: {h(e)}</div>'), 500
 
 
+
 @app.route("/vendors")
 def vendors_page():
     allowed, reason = require_page_access("Vendors")
@@ -8006,68 +8007,290 @@ def vendors_page():
         conn = get_sql_connection()
         cursor = conn.cursor()
         req_where_po, req_params_po = requestor_filter_sql("po")
+        req_where_line, req_params_line = requestor_filter_sql("l")
+
+        selected_vendor = clean_text(request.args.get("vendor")) or ""
+        selected_vendor_param = selected_vendor
+
+        # Vendor rollup is the top-level vendor directory. It uses visible PO data and
+        # expense rows tied to visible posted PO numbers so role restrictions still apply.
         cursor.execute(
             f"""
-            WITH POVendors AS (
-                SELECT COALESCE(v.VendorName, 'Missing Vendor') AS VendorName,
-                       COUNT(DISTINCT po.PONumber) AS POCount,
-                       SUM(COALESCE(po.RevisedAmount, po.OriginalAmount, 0)) AS POAmount,
-                       SUM(COALESCE(po.RemainingAmount, COALESCE(po.RevisedAmount, po.OriginalAmount, 0))) AS RemainingAmount
+            WITH VisiblePOs AS (
+                SELECT
+                    po.PurchaseOrderId,
+                    po.PONumber,
+                    COALESCE(v.VendorName, 'Missing Vendor') AS VendorName,
+                    COALESCE(po.RevisedAmount, po.OriginalAmount, 0) AS POAmount,
+                    COALESCE(po.RemainingAmount, COALESCE(po.RevisedAmount, po.OriginalAmount, 0)) AS RemainingAmount,
+                    COALESCE(po.POStatus, 'Open') AS POStatus
                 FROM dbo.PurchaseOrders po
                 LEFT JOIN dbo.Vendors v ON po.VendorId = v.VendorId
                 WHERE {req_where_po}
-                GROUP BY COALESCE(v.VendorName, 'Missing Vendor')
-            ), ExpenseVendors AS (
-                SELECT COALESCE(NULLIF(LTRIM(RTRIM(VendorName)), ''), 'Missing Vendor') AS VendorName,
-                       COUNT(*) AS ExpenseRows,
-                       SUM(COALESCE(Amount,0)) AS ExpenseAmount
-                FROM dbo.ExpenseReviewItems
-                GROUP BY COALESCE(NULLIF(LTRIM(RTRIM(VendorName)), ''), 'Missing Vendor')
+            ), PostedExpenses AS (
+                SELECT
+                    COALESCE(NULLIF(LTRIM(RTRIM(e.VendorName)), ''), 'Missing Vendor') AS VendorName,
+                    COUNT(*) AS ExpenseRows,
+                    SUM(COALESCE(e.PostedAmount, e.Amount, 0)) AS ExpenseAmount,
+                    MAX(e.PostedAt) AS LastPostedAt
+                FROM dbo.ExpenseReviewItems e
+                INNER JOIN VisiblePOs vp ON vp.PONumber = e.PostedPONumber
+                WHERE COALESCE(e.PostedToPO, 0) = 1
+                GROUP BY COALESCE(NULLIF(LTRIM(RTRIM(e.VendorName)), ''), 'Missing Vendor')
+            ), POVendors AS (
+                SELECT
+                    VendorName,
+                    COUNT(DISTINCT PONumber) AS POCount,
+                    SUM(COALESCE(POAmount, 0)) AS POAmount,
+                    SUM(COALESCE(RemainingAmount, 0)) AS RemainingAmount,
+                    SUM(CASE WHEN LOWER(COALESCE(POStatus,'')) IN ('open','issued','active') THEN 1 ELSE 0 END) AS OpenPOCount,
+                    SUM(CASE WHEN LOWER(COALESCE(POStatus,'')) = 'voided' THEN 1 ELSE 0 END) AS VoidedPOCount
+                FROM VisiblePOs
+                GROUP BY VendorName
             )
-            SELECT COALESCE(p.VendorName, e.VendorName) AS VendorName,
-                   COALESCE(p.POCount, 0) AS POCount,
-                   COALESCE(p.POAmount, 0) AS POAmount,
-                   COALESCE(p.RemainingAmount, 0) AS RemainingAmount,
-                   COALESCE(e.ExpenseRows, 0) AS ExpenseRows,
-                   COALESCE(e.ExpenseAmount, 0) AS ExpenseAmount
+            SELECT
+                COALESCE(p.VendorName, e.VendorName) AS VendorName,
+                COALESCE(p.POCount, 0) AS POCount,
+                COALESCE(p.OpenPOCount, 0) AS OpenPOCount,
+                COALESCE(p.VoidedPOCount, 0) AS VoidedPOCount,
+                COALESCE(p.POAmount, 0) AS POAmount,
+                COALESCE(p.RemainingAmount, 0) AS RemainingAmount,
+                COALESCE(e.ExpenseRows, 0) AS ExpenseRows,
+                COALESCE(e.ExpenseAmount, 0) AS ExpenseAmount,
+                e.LastPostedAt
             FROM POVendors p
-            FULL OUTER JOIN ExpenseVendors e ON p.VendorName = e.VendorName
-            ORDER BY COALESCE(p.POAmount, 0) DESC, COALESCE(e.ExpenseAmount, 0) DESC;
+            FULL OUTER JOIN PostedExpenses e ON p.VendorName = e.VendorName
+            ORDER BY COALESCE(p.POAmount, 0) DESC, COALESCE(e.ExpenseAmount, 0) DESC, COALESCE(p.VendorName, e.VendorName);
             """,
             *req_params_po,
         )
         rows = cursor.fetchall()
 
-        selected_vendor = clean_text(request.args.get("vendor")) or ""
-        vendor_line_rows = ""
+        # Default to the largest visible vendor so the page immediately feels like a vendor profile.
+        if not selected_vendor and rows:
+            selected_vendor = clean_text(rows[0].VendorName)
+            selected_vendor_param = selected_vendor
+
+        vendor_options = ""
+        for r in rows:
+            name = clean_text(r.VendorName) or "Missing Vendor"
+            sel = " selected" if selected_vendor and name.lower() == selected_vendor.lower() else ""
+            vendor_options += f'<option value="{h(name)}"{sel}>{h(name)}</option>'
+
+        vendor_po_rows = []
+        vendor_project_rows = []
+        vendor_line_rows = []
+        vendor_tx_rows = []
+        vendor_profile = None
+
         if selected_vendor:
             cursor.execute(
-                """
-                SELECT TOP 500
+                f"""
+                WITH PostedExpenses AS (
+                    SELECT PostedPONumber AS PONumber,
+                           SUM(COALESCE(PostedAmount, Amount, 0)) AS PostedExpenseAmount,
+                           COUNT(*) AS PostedExpenseRows,
+                           MAX(PostedAt) AS LastPostedAt
+                    FROM dbo.ExpenseReviewItems
+                    WHERE COALESCE(PostedToPO, 0) = 1 AND COALESCE(PostedPONumber, '') <> ''
+                    GROUP BY PostedPONumber
+                ), LineRollup AS (
+                    SELECT PurchaseOrderId,
+                           PONumber,
+                           COUNT(*) AS LineCount,
+                           SUM(COALESCE(LineAmount, 0)) AS LineAmount
+                    FROM dbo.IssuedPOLines
+                    GROUP BY PurchaseOrderId, PONumber
+                )
+                SELECT
                     po.PONumber,
-                    COALESCE(pr.ProjectName, '') AS ProjectName,
-                    po.Department,
+                    COALESCE(pr.ProjectCode, '') AS ProjectCode,
+                    COALESCE(pr.ProjectName, (SELECT TOP 1 l2.ProjectName FROM dbo.IssuedPOLines l2 WHERE l2.PONumber = po.PONumber AND COALESCE(l2.ProjectName,'') <> '' ORDER BY l2.IssuedPOLineId), '') AS ProjectName,
+                    COALESCE(NULLIF(po.Department, ''), (SELECT TOP 1 l3.Department FROM dbo.IssuedPOLines l3 WHERE l3.PONumber = po.PONumber AND COALESCE(l3.Department,'') <> '' ORDER BY l3.IssuedPOLineId), '') AS Department,
+                    COALESCE(po.POStatus, 'Open') AS POStatus,
+                    po.PODate,
+                    po.Requestor,
+                    COALESCE(po.RevisedAmount, po.OriginalAmount, lr.LineAmount, 0) AS POValue,
+                    COALESCE(pe.PostedExpenseAmount, 0) AS PostedExpenseAmount,
+                    CASE WHEN COALESCE(po.RevisedAmount, po.OriginalAmount, lr.LineAmount, 0) - COALESCE(pe.PostedExpenseAmount, 0) < 0 THEN 0 ELSE COALESCE(po.RevisedAmount, po.OriginalAmount, lr.LineAmount, 0) - COALESCE(pe.PostedExpenseAmount, 0) END AS CurrentAppBalance,
+                    COALESCE(lr.LineCount, 0) AS LineCount,
+                    COALESCE(pe.PostedExpenseRows, 0) AS PostedExpenseRows,
+                    pe.LastPostedAt
+                FROM dbo.PurchaseOrders po
+                LEFT JOIN dbo.Vendors v ON po.VendorId = v.VendorId
+                LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
+                LEFT JOIN LineRollup lr ON lr.PurchaseOrderId = po.PurchaseOrderId OR lr.PONumber = po.PONumber
+                LEFT JOIN PostedExpenses pe ON pe.PONumber = po.PONumber
+                WHERE LOWER(COALESCE(v.VendorName, 'Missing Vendor')) = LOWER(?) AND {req_where_po}
+                GROUP BY po.PONumber, pr.ProjectCode, pr.ProjectName, po.Department, po.POStatus, po.PODate, po.Requestor, po.RevisedAmount, po.OriginalAmount, lr.LineAmount, lr.LineCount, pe.PostedExpenseAmount, pe.PostedExpenseRows, pe.LastPostedAt
+                ORDER BY CurrentAppBalance DESC, POValue DESC, po.PONumber;
+                """,
+                selected_vendor_param,
+                *req_params_po,
+            )
+            vendor_po_rows = cursor.fetchall()
+
+            cursor.execute(
+                f"""
+                SELECT TOP 500
+                    l.PONumber,
+                    COALESCE(pr.ProjectCode, '') AS ProjectCode,
+                    COALESCE(pr.ProjectName, l.ProjectName, '') AS ProjectName,
+                    l.Department,
                     l.LineDescription,
                     l.Unit,
                     l.UnitCost,
                     l.Qty,
                     l.LineAmount
                 FROM dbo.IssuedPOLines l
-                INNER JOIN dbo.PurchaseOrders po ON l.PurchaseOrderId = po.PurchaseOrderId
+                LEFT JOIN dbo.PurchaseOrders po ON l.PurchaseOrderId = po.PurchaseOrderId
                 LEFT JOIN dbo.Vendors v ON po.VendorId = v.VendorId
                 LEFT JOIN dbo.Projects pr ON po.ProjectId = pr.ProjectId
-                WHERE LOWER(COALESCE(v.VendorName, 'Missing Vendor')) = LOWER(?) AND {req_where_po}
-                ORDER BY po.PONumber, l.IssuedPOLineId;
-                """.format(req_where_po=req_where_po),
-                selected_vendor,
+                WHERE LOWER(COALESCE(v.VendorName, l.VendorName, 'Missing Vendor')) = LOWER(?) AND {req_where_line}
+                ORDER BY l.PONumber, l.IssuedPOLineId;
+                """,
+                selected_vendor_param,
+                *req_params_line,
+            )
+            vendor_line_rows = cursor.fetchall()
+
+            cursor.execute(
+                f"""
+                WITH VisibleVendorPOs AS (
+                    SELECT po.PONumber
+                    FROM dbo.PurchaseOrders po
+                    LEFT JOIN dbo.Vendors v ON po.VendorId = v.VendorId
+                    WHERE LOWER(COALESCE(v.VendorName, 'Missing Vendor')) = LOWER(?) AND {req_where_po}
+                )
+                SELECT TOP 100
+                    e.TxDate,
+                    e.TxType,
+                    e.ProjectName,
+                    e.Description,
+                    e.PMComments,
+                    e.Amount,
+                    e.PostedAmount,
+                    e.PostedPONumber,
+                    e.PostedAt,
+                    e.PostedBy,
+                    e.ReviewDecision,
+                    e.MatchStatus
+                FROM dbo.ExpenseReviewItems e
+                INNER JOIN VisibleVendorPOs vp ON vp.PONumber = e.PostedPONumber
+                WHERE COALESCE(e.PostedToPO, 0) = 1
+                ORDER BY COALESCE(e.PostedAt, e.TxDate) DESC, e.ExpenseReviewItemId DESC;
+                """,
+                selected_vendor_param,
                 *req_params_po,
             )
-            vendor_lines = cursor.fetchall()
-            for line in vendor_lines:
-                vendor_line_rows += f"""
+            vendor_tx_rows = cursor.fetchall()
+
+            # Project rollup is built from the selected vendor POs to avoid repeating
+            # visibility logic in a second complex SQL query.
+            project_rollup = {}
+            for p in vendor_po_rows:
+                pcode = clean_text(getattr(p, "ProjectCode", ""))
+                pname = clean_text(getattr(p, "ProjectName", "")) or "Missing Project"
+                key = pcode or pname
+                if key not in project_rollup:
+                    project_rollup[key] = {"code": pcode, "name": pname, "po_count": 0, "po_value": 0.0, "posted": 0.0, "balance": 0.0}
+                project_rollup[key]["po_count"] += 1
+                project_rollup[key]["po_value"] += float(getattr(p, "POValue", 0) or 0)
+                project_rollup[key]["posted"] += float(getattr(p, "PostedExpenseAmount", 0) or 0)
+                project_rollup[key]["balance"] += float(getattr(p, "CurrentAppBalance", 0) or 0)
+            vendor_project_rows = sorted(project_rollup.values(), key=lambda x: x["po_value"], reverse=True)
+
+            vendor_profile = {
+                "po_count": len(vendor_po_rows),
+                "open_po_count": sum(1 for p in vendor_po_rows if str(getattr(p, "POStatus", "") or "").lower() in ["open", "issued", "active"]),
+                "voided_po_count": sum(1 for p in vendor_po_rows if str(getattr(p, "POStatus", "") or "").lower() == "voided"),
+                "po_value": sum(float(getattr(p, "POValue", 0) or 0) for p in vendor_po_rows),
+                "posted": sum(float(getattr(p, "PostedExpenseAmount", 0) or 0) for p in vendor_po_rows),
+                "balance": sum(float(getattr(p, "CurrentAppBalance", 0) or 0) for p in vendor_po_rows),
+                "projects": len(vendor_project_rows),
+                "line_count": sum(int(getattr(p, "LineCount", 0) or 0) for p in vendor_po_rows),
+                "last_posted": max([clean_text(getattr(p, "LastPostedAt", "")) for p in vendor_po_rows if clean_text(getattr(p, "LastPostedAt", ""))] or [""]),
+            }
+
+        conn.close()
+
+        total_vendors = len(rows)
+        total_po_amount = sum(float(r.POAmount or 0) for r in rows)
+        total_remaining = sum(float(r.RemainingAmount or 0) for r in rows)
+        total_expense_amount = sum(float(r.ExpenseAmount or 0) for r in rows)
+        total_open_pos = sum(int(r.OpenPOCount or 0) for r in rows)
+
+        table_rows = ""
+        top_rows = ""
+        max_po = max([float(r.POAmount or 0) for r in rows] or [1])
+        for idx, r in enumerate(rows):
+            vendor_name = clean_text(r.VendorName) or "Missing Vendor"
+            table_rows += f"""
+            <tr>
+                <td><a class="vendor-detail-link" href="/vendors?vendor={quote_plus(vendor_name)}">{h(vendor_name)}</a></td>
+                <td class="right">{int(r.POCount or 0)}</td>
+                <td class="right">{int(r.OpenPOCount or 0)}</td>
+                <td class="right">{currency(r.POAmount)}</td>
+                <td class="right">{currency(r.RemainingAmount)}</td>
+                <td class="right">{int(r.ExpenseRows or 0)}</td>
+                <td class="right">{currency(r.ExpenseAmount)}</td>
+            </tr>
+            """
+            if idx < 8:
+                width = 0 if max_po == 0 else max(5, float(r.POAmount or 0) / max_po * 100)
+                top_rows += f"<a class='bar-row clickable-row' href='/vendors?vendor={quote_plus(vendor_name)}'><strong>{h(vendor_name)}</strong><div class='bar-track'><div class='bar-fill' style='width:{width:.1f}%'></div></div><div class='right'>{currency(r.POAmount)}</div></a>"
+        if not table_rows:
+            table_rows = '<tr><td colspan="7"><div class="empty-state"><strong>No vendor data found.</strong><span>Vendors will appear after PO or expense uploads.</span></div></td></tr>'
+            top_rows = '<p class="card-subtitle">No vendor data found.</p>'
+
+        vendor_po_html = ""
+        vendor_project_html = ""
+        vendor_line_html = ""
+        vendor_tx_html = ""
+        selected_vendor_section = ""
+
+        if selected_vendor:
+            for p in vendor_po_rows:
+                project_value = clean_text(getattr(p, "ProjectCode", "")) or clean_text(getattr(p, "ProjectName", ""))
+                project_label = (clean_text(getattr(p, "ProjectCode", "")) + " - " if clean_text(getattr(p, "ProjectCode", "")) else "") + (clean_text(getattr(p, "ProjectName", "")) or "Missing Project")
+                vendor_po_html += f"""
+                <tr>
+                    <td><a class="po-link" href="/po-packet/{quote_plus(str(p.PONumber or ''))}?type=internal">{h(p.PONumber)}</a></td>
+                    <td><a class="project-link" href="/projects?project={quote_plus(project_value)}">{h(project_label)}</a></td>
+                    <td>{h(p.Department)}</td>
+                    <td>{status_chip(p.POStatus or 'Open')}</td>
+                    <td class="right">{currency(p.POValue)}</td>
+                    <td class="right">{currency(p.PostedExpenseAmount)}</td>
+                    <td class="right">{currency(p.CurrentAppBalance)}</td>
+                    <td class="right">{int(p.LineCount or 0)}</td>
+                    <td><a class="pill-link" href="/po-packet-pdf/{quote_plus(str(p.PONumber or ''))}?type=vendor">Vendor PDF</a></td>
+                </tr>
+                """
+            if not vendor_po_html:
+                vendor_po_html = '<tr><td colspan="9"><div class="empty-state"><strong>No visible POs found for this vendor.</strong></div></td></tr>'
+
+            max_project_value = max([float(p["po_value"] or 0) for p in vendor_project_rows] or [1])
+            for prj in vendor_project_rows[:12]:
+                value = prj["code"] or prj["name"]
+                label = (prj["code"] + " - " if prj["code"] else "") + prj["name"]
+                pct = 0 if max_project_value == 0 else max(5, float(prj["po_value"] or 0) / max_project_value * 100)
+                vendor_project_html += f"""
+                <a class="vendor-project-card" href="/projects?project={quote_plus(value)}">
+                    <div><strong>{h(label)}</strong><span>{int(prj['po_count'])} PO(s)</span></div>
+                    <div class="mini-meter"><div style="width:{pct:.1f}%"></div></div>
+                    <div class="vendor-project-amounts"><span>PO {currency(prj['po_value'])}</span><span>Balance {currency(prj['balance'])}</span></div>
+                </a>
+                """
+            if not vendor_project_html:
+                vendor_project_html = '<p class="card-subtitle">No project activity found for this vendor.</p>'
+
+            for line in vendor_line_rows:
+                project_value = clean_text(getattr(line, "ProjectCode", "")) or clean_text(getattr(line, "ProjectName", ""))
+                project_label = (clean_text(getattr(line, "ProjectCode", "")) + " - " if clean_text(getattr(line, "ProjectCode", "")) else "") + (clean_text(getattr(line, "ProjectName", "")) or "Missing Project")
+                vendor_line_html += f"""
                 <tr>
                     <td><a class="po-link" href="/po-packet/{quote_plus(str(line.PONumber or ''))}?type=internal">{h(line.PONumber)}</a></td>
-                    <td>{h(line.ProjectName)}</td>
+                    <td><a class="project-link" href="/projects?project={quote_plus(project_value)}">{h(project_label)}</a></td>
                     <td>{h(line.Department)}</td>
                     <td>{h(line.LineDescription)}</td>
                     <td>{h(line.Unit)}</td>
@@ -8076,42 +8299,82 @@ def vendors_page():
                     <td class="right">{currency(line.LineAmount)}</td>
                 </tr>
                 """
-            if not vendor_line_rows:
-                vendor_line_rows = '<tr><td colspan="8"><div class="empty-state"><strong>No PO line items found for this vendor.</strong></div></td></tr>'
+            if not vendor_line_html:
+                vendor_line_html = '<tr><td colspan="8"><div class="empty-state"><strong>No line items found for this vendor.</strong></div></td></tr>'
 
-        conn.close()
+            for tx in vendor_tx_rows:
+                amount = tx.PostedAmount if tx.PostedAmount is not None else tx.Amount
+                vendor_tx_html += f"""
+                <tr>
+                    <td>{h(tx.TxDate)}</td>
+                    <td><a class="po-link" href="/po-packet/{quote_plus(str(tx.PostedPONumber or ''))}?type=internal">{h(tx.PostedPONumber)}</a></td>
+                    <td>{h(tx.ProjectName)}</td>
+                    <td>{h(tx.TxType)}</td>
+                    <td>{h(tx.Description or tx.PMComments)}</td>
+                    <td class="right">{currency(amount)}</td>
+                    <td>{h(tx.PostedAt)}</td>
+                </tr>
+                """
+            if not vendor_tx_html:
+                vendor_tx_html = '<tr><td colspan="7"><div class="empty-state"><strong>No posted transactions found for this vendor.</strong><span>Posted expense activity will appear after expense uploads are matched to POs.</span></div></td></tr>'
 
-        total_vendors = len(rows)
-        total_po_amount = sum(float(r.POAmount or 0) for r in rows)
-        total_expense_amount = sum(float(r.ExpenseAmount or 0) for r in rows)
-        table_rows = ""
-        top_rows = ""
-        max_po = max([float(r.POAmount or 0) for r in rows] or [1])
-        for idx, r in enumerate(rows):
-            table_rows += f"""
-            <tr><td><a class="vendor-detail-link" href="/vendors?vendor={quote_plus(str(r.VendorName or ''))}">{h(r.VendorName)}</a></td><td class="right">{int(r.POCount or 0)}</td><td class="right">{currency(r.POAmount)}</td><td class="right">{currency(r.RemainingAmount)}</td><td class="right">{int(r.ExpenseRows or 0)}</td><td class="right">{currency(r.ExpenseAmount)}</td></tr>
+            vp = vendor_profile or {}
+            selected_vendor_section = f"""
+            <div class="vendor-profile-hero card">
+                <div>
+                    <div class="eyebrow">Vendor View</div>
+                    <h2>{h(selected_vendor)}</h2>
+                    <p class="card-subtitle">A consolidated view of visible purchase orders, projects, balances, line items, and posted transactions for this vendor.</p>
+                </div>
+                <div class="vendor-hero-actions">
+                    <a class="button-secondary" href="/vendors">All Vendors</a>
+                    <a class="button-secondary" href="/pos-balances?vendor={quote_plus(selected_vendor)}">PO Drilldown</a>
+                </div>
+            </div>
+            <div class="grid kpis vendor-kpis">
+                <a class="card kpi status-card" href="#vendor-pos"><div class="label">Visible POs</div><div class="value">{int(vp.get('po_count',0))}</div><div class="trend">{int(vp.get('open_po_count',0))} open / {int(vp.get('voided_po_count',0))} voided</div></a>
+                <a class="card kpi status-card" href="#vendor-pos"><div class="label">PO Value</div><div class="value">{currency(vp.get('po_value',0))}</div><div class="trend">Issued/committed vendor amount</div></a>
+                <a class="card kpi status-card" href="#vendor-transactions"><div class="label">Posted Spend</div><div class="value">{currency(vp.get('posted',0))}</div><div class="trend">Matched transactions against POs</div></a>
+                <a class="card kpi status-card" href="#vendor-pos"><div class="label">Current Balance</div><div class="value">{currency(vp.get('balance',0))}</div><div class="trend">Remaining visible PO balance</div></a>
+                <a class="card kpi status-card" href="#vendor-projects"><div class="label">Projects</div><div class="value">{int(vp.get('projects',0))}</div><div class="trend">Projects with vendor POs</div></a>
+                <a class="card kpi status-card" href="#vendor-lines"><div class="label">Line Items</div><div class="value">{int(vp.get('line_count',0))}</div><div class="trend">Detailed PO scope rows</div></a>
+            </div>
+            <div class="grid two">
+                <div class="card" id="vendor-projects"><h3>Projects Using This Vendor</h3><p class="card-subtitle">Click a project to open the project view.</p><div class="vendor-project-grid">{vendor_project_html}</div></div>
+                <div class="card"><h3>Vendor Snapshot</h3><div class="snapshot-list">
+                    <div><span>Vendor</span><strong>{h(selected_vendor)}</strong></div>
+                    <div><span>Open POs</span><strong>{int(vp.get('open_po_count',0))}</strong></div>
+                    <div><span>Posted Spend</span><strong>{currency(vp.get('posted',0))}</strong></div>
+                    <div><span>Last Posted Transaction</span><strong>{h(vp.get('last_posted') or 'Not posted yet')}</strong></div>
+                </div><p class="card-subtitle">Use this page when you know the vendor and need to see related POs, projects, and transaction history.</p></div>
+            </div>
+            <div class="card" id="vendor-pos"><h3>Vendor Purchase Orders</h3><p class="card-subtitle">Click a PO number to open the full PO packet, or download the vendor-facing PDF.</p><div class="table-wrap"><table><tr><th>PO</th><th>Project</th><th>Department</th><th>Status</th><th class="right">PO Value</th><th class="right">Posted</th><th class="right">Balance</th><th class="right">Lines</th><th>Packet</th></tr>{vendor_po_html}</table></div></div>
+            <div class="card" id="vendor-transactions"><h3>Posted Transactions Against This Vendor's POs</h3><p class="card-subtitle">These are uploaded expenses that have been posted against the vendor's visible POs.</p><div class="table-wrap"><table><tr><th>Date</th><th>PO</th><th>Project</th><th>Type</th><th>Description / Comments</th><th class="right">Amount</th><th>Posted At</th></tr>{vendor_tx_html}</table></div></div>
+            <div class="card" id="vendor-lines"><h3>Vendor PO Line Items</h3><p class="card-subtitle">Detailed scope/line item rows for visible POs tied to this vendor.</p><div class="table-wrap"><table><tr><th>PO</th><th>Project</th><th>Department</th><th>Description</th><th>Unit</th><th class="right">Unit Cost</th><th class="right">Qty</th><th class="right">Line Amount</th></tr>{vendor_line_html}</table></div></div>
             """
-            if idx < 8:
-                width = 0 if max_po == 0 else max(5, float(r.POAmount or 0) / max_po * 100)
-                top_rows += f"<div class='bar-row'><strong>{h(r.VendorName)}</strong><div class='bar-track'><div class='bar-fill' style='width:{width:.1f}%'></div></div><div class='right'>{currency(r.POAmount)}</div></div>"
-        if not table_rows:
-            table_rows = '<tr><td colspan="6"><div class="empty-state"><strong>No vendor data found.</strong><span>Vendors will appear after PO or expense uploads.</span></div></td></tr>'
-            top_rows = '<p class="card-subtitle">No vendor data found.</p>'
 
         content = f"""
         <div class="grid kpis">
-            <div class="card kpi"><div class="label">Vendors</div><div class="value">{total_vendors}</div><div class="trend">Across POs and expenses</div></div>
-            <div class="card kpi"><div class="label">Issued PO Amount</div><div class="value">{currency(total_po_amount)}</div><div class="trend">Vendor commitment value</div></div>
-            <div class="card kpi"><div class="label">Expense Amount</div><div class="value">{currency(total_expense_amount)}</div><div class="trend">Uploaded expense value</div></div>
-            <a class="card kpi status-card" href="/pos-balances"><div class="label">POs & Balances</div><div class="value">View</div><div class="trend">Open PO detail</div></a>
+            <div class="card kpi"><div class="label">Vendors</div><div class="value">{total_vendors}</div><div class="trend">Visible vendors across POs and posted expenses</div></div>
+            <a class="card kpi status-card" href="/pos-balances"><div class="label">Open POs</div><div class="value">{int(total_open_pos)}</div><div class="trend">Vendor PO lookup</div></a>
+            <div class="card kpi"><div class="label">Issued PO Amount</div><div class="value">{currency(total_po_amount)}</div><div class="trend">Visible vendor commitment value</div></div>
+            <div class="card kpi"><div class="label">Remaining Balance</div><div class="value">{currency(total_remaining)}</div><div class="trend">Visible vendor balance</div></div>
+            <div class="card kpi"><div class="label">Posted Spend</div><div class="value">{currency(total_expense_amount)}</div><div class="trend">Posted expense value</div></div>
         </div>
+        <div class="card vendor-search-card">
+            <form method="get" action="/vendors" class="inline-form vendor-select-form">
+                <label><strong>Select Vendor</strong><select name="vendor"><option value="">Choose vendor...</option>{vendor_options}</select></label>
+                <button class="primary" type="submit">Open Vendor View</button>
+                <a class="button-secondary" href="/vendors">Reset</a>
+            </form>
+        </div>
+        {selected_vendor_section}
         <div class="grid two">
-            <div class="card"><h3>Top Vendors by PO Amount</h3><div class="bar-chart">{top_rows}</div></div>
-            <div class="card"><h3>Vendor Summary</h3><p class="card-subtitle">Click a vendor name to view all PO line items for that vendor.</p><div class="table-wrap"><table><tr><th>Vendor / Purchaser</th><th class="right">POs</th><th class="right">PO Amount</th><th class="right">Remaining</th><th class="right">Expense Rows</th><th class="right">Expense Amount</th></tr>{table_rows}</table></div></div>
+            <div class="card"><h3>Top Vendors by PO Amount</h3><p class="card-subtitle">Click a vendor to open its vendor view.</p><div class="bar-chart vendor-bar-chart">{top_rows}</div></div>
+            <div class="card"><h3>Vendor Directory</h3><p class="card-subtitle">Vendor-level totals across visible POs and posted expenses.</p><div class="table-wrap"><table><tr><th>Vendor / Purchaser</th><th class="right">POs</th><th class="right">Open</th><th class="right">PO Amount</th><th class="right">Remaining</th><th class="right">Posted Rows</th><th class="right">Posted Spend</th></tr>{table_rows}</table></div></div>
         </div>
-        {f'<div class="card"><h3>PO Line Items for {h(selected_vendor)}</h3><p class="card-subtitle">Click a PO number to open the full PO packet.</p><div class="table-wrap"><table><tr><th>PO</th><th>Project</th><th>Department</th><th>Description</th><th>Unit</th><th class="right">Unit Cost</th><th class="right">Qty</th><th class="right">Line Amount</th></tr>{vendor_line_rows}</table></div></div>' if selected_vendor else ''}
         """
-        return shell("Vendors", "Vendor and purchaser totals across POs and expenses.", "Vendors", content)
+        return shell("Vendors", "Vendor view with PO balances, projects, line items, and posted transactions.", "Vendors", content)
     except Exception as e:
         return shell("Vendors", "Unable to load vendors.", "Vendors", f'<div class="notice error">Error loading Vendors: {h(e)}</div>'), 500
 
